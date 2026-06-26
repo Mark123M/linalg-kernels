@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/python_packages",
+    "${workspaceFolder}/cutlass/python/CuTeDSL",
+    "${workspaceFolder}/cutlass/examples/python/CuTeDSL"
+  ]
+}
