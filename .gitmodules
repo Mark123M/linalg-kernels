@@ -1,3 +1,6 @@
 [submodule "quack"]
 	path = quack
 	url = https://github.com/Dao-AILab/quack.git
+[submodule "magma"]
+	path = magma
+	url = https://github.com/icl-utk-edu/magma.git
