@@ -1,6 +1,7 @@
 import math
+from collections import namedtuple
 from typing import Type, Tuple, Optional
-from functools import partial
+from functools import wraps
 
 import torch
 import cutlass
@@ -14,9 +15,43 @@ import cutlass.pipeline
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
-from quack.cache import jit_cache
 import cuda.bindings.driver as cuda
 from task import input_t, output_t
+
+
+CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+
+
+def jit_cache(fn):
+    cache = {}
+    hits = 0
+    misses = 0
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal hits, misses
+        cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
+        if cache_key in cache:
+            hits += 1
+            return cache[cache_key]
+        misses += 1
+        compiled_fn = fn(*args, **kwargs)
+        cache[cache_key] = compiled_fn
+        return compiled_fn
+
+    def cache_clear():
+        nonlocal hits, misses
+        cache.clear()
+        hits = 0
+        misses = 0
+
+    def cache_info():
+        return CacheInfo(hits=hits, misses=misses, maxsize=None, currsize=len(cache))
+
+    wrapper.cache = cache
+    wrapper.cache_clear = cache_clear
+    wrapper.cache_info = cache_info
+    return wrapper
 
 torch2cute_dtype_map = {
     torch.float16: Float16,
@@ -27,9 +62,16 @@ torch2cute_dtype_map = {
 }
 
 class Eigh:
-    def __init__(self, dtype: Type[cutlass.Numeric], N: int, reduction_dtype=Float32):
+    def __init__(
+        self,
+        dtype: Type[cutlass.Numeric],
+        N: int,
+        stage: int = 1,
+        reduction_dtype=Float32,
+    ):
         self.dtype = dtype
         self.N = N
+        self.stage = stage
         self.reduction_dtype = reduction_dtype
 
     def _threads_per_row(self):
@@ -168,6 +210,7 @@ class Eigh:
     def kernel(
         self,
         mData: cute.Tensor,
+        mTri: cute.Tensor,
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -180,16 +223,19 @@ class Eigh:
     def __call__(
         self,
         mData: cute.Tensor,
+        mTri: cute.Tensor,
         stream: cuda.CUstream,
     ):
         assert mData.element_type == self.dtype
+        assert mTri.element_type == self.dtype
         self._set_cluster_n()
+        largest_dtype_width = const_expr(max(t.element_type.width for t in [mData, mTri]))
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // mData.element_type.width
+            vecsize=128 // largest_dtype_width
         )
         num_threads = tiled_copy.size
-        self.kernel(mData, tiler_mn, tiled_copy, threads_per_row).launch(
-            grid=[cute.ceil_div(mData.shape[0], tiler_mn[0]), self.cluster_n, 1],
+        self.kernel(mData, mTri, tiler_mn, tiled_copy, threads_per_row).launch(
+            grid=[mData.shape[0], self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
@@ -200,11 +246,13 @@ class Eigh:
     def compile(data_dtype, N):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
-        data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N), div)
+        data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
+        tri_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         
         return cute.compile(
             Eigh(data_dtype, N),
             data_cute,
+            tri_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
