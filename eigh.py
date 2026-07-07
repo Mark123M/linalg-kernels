@@ -1,7 +1,16 @@
+import fcntl
+import hashlib
 import math
+import os
+import pickle
+import sys
+import tempfile
+import time
 from collections import namedtuple
+from getpass import getuser
+from pathlib import Path
 from typing import Type, Tuple, Optional
-from functools import wraps
+from functools import lru_cache, wraps
 
 import torch
 import cutlass
@@ -19,7 +28,83 @@ import cuda.bindings.driver as cuda
 from task import input_t, output_t
 
 
+EXPORT_FUNC_NAME = "func"
+LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def disk_cache_enabled() -> bool:
+    return _env_flag("EIGH_ENABLE_DISK_CACHE")
+
+
+def get_cache_path() -> Path:
+    cache_dir = os.environ.get("EIGH_CUTE_CACHE_DIR")
+    path = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / getuser() / "eigh_cute_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@lru_cache(maxsize=1)
+def _compute_source_fingerprint() -> str:
+    h = hashlib.sha256()
+    h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
+    h.update(f"cutlass={getattr(cutlass, '__version__', 'unknown')}".encode())
+    try:
+        import tvm_ffi
+
+        h.update(f"tvm_ffi={getattr(tvm_ffi, '__version__', 'unknown')}".encode())
+    except ModuleNotFoundError:
+        h.update(b"tvm_ffi=missing")
+    src = Path(__file__).resolve()
+    h.update(src.name.encode())
+    content = src.read_bytes()
+    h.update(len(content).to_bytes(8, "little"))
+    h.update(content)
+    return h.hexdigest()
+
+
+def _key_to_hash(key: tuple) -> str:
+    try:
+        payload = pickle.dumps(key)
+    except Exception:
+        payload = repr(key).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+class FileLock:
+    def __init__(self, lock_path: Path, exclusive: bool, timeout: float = LOCK_TIMEOUT):
+        self.lock_path = lock_path
+        self.exclusive = exclusive
+        self.timeout = timeout
+        self._fd = -1
+
+    def __enter__(self):
+        flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        self._fd = os.open(str(self.lock_path), flags)
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(self._fd, lock_type | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                time.sleep(0.1)
+        os.close(self._fd)
+        self._fd = -1
+        raise RuntimeError(f"Timed out waiting for lock: {self.lock_path}")
+
+    def __exit__(self, *exc):
+        if self._fd >= 0:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = -1
 
 
 def jit_cache(fn):
@@ -34,10 +119,62 @@ def jit_cache(fn):
         if cache_key in cache:
             hits += 1
             return cache[cache_key]
-        misses += 1
-        compiled_fn = fn(*args, **kwargs)
-        cache[cache_key] = compiled_fn
-        return compiled_fn
+
+        if not disk_cache_enabled():
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            cache[cache_key] = compiled_fn
+            return compiled_fn
+
+        sha = _key_to_hash((fn.__qualname__,) + cache_key)
+        cache_path = get_cache_path() / _compute_source_fingerprint()
+        cache_path.mkdir(parents=True, exist_ok=True)
+        o_path = cache_path / f"{sha}.o"
+        lock_path = cache_path / f"{sha}.lock"
+
+        def load_cached():
+            module = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
+            return module[EXPORT_FUNC_NAME]
+
+        if o_path.exists():
+            try:
+                with FileLock(lock_path, exclusive=False):
+                    if o_path.exists():
+                        loaded = load_cached()
+                        cache[cache_key] = loaded
+                        hits += 1
+                        return loaded
+            except RuntimeError:
+                pass
+
+        try:
+            with FileLock(lock_path, exclusive=True):
+                if o_path.exists():
+                    loaded = load_cached()
+                    cache[cache_key] = loaded
+                    hits += 1
+                    return loaded
+
+                misses += 1
+                compiled_fn = fn(*args, **kwargs)
+                try:
+                    compiled_fn.export_to_c(
+                        object_file_path=str(o_path),
+                        function_name=EXPORT_FUNC_NAME,
+                    )
+                except Exception as exc:
+                    print(f"eigh cache: export failed for key {sha}: {exc}")
+                cache[cache_key] = compiled_fn
+                return compiled_fn
+        except RuntimeError as exc:
+            print(
+                f"eigh cache: lock timeout for key {sha}: {exc}; "
+                "falling back to in-process compile without disk cache"
+            )
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            cache[cache_key] = compiled_fn
+            return compiled_fn
 
     def cache_clear():
         nonlocal hits, misses
@@ -270,4 +407,4 @@ def custom_kernel(data: input_t) -> output_t:
     N = data.size(1)
     Eigh.compile(data_dtype, N)(data, tri)
     
-    return tri
+    return torch.linalg.eigh(data)
