@@ -1,6 +1,7 @@
 import fcntl
 import hashlib
 import math
+import operator
 import os
 import pickle
 import sys
@@ -15,7 +16,7 @@ from functools import lru_cache, wraps
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float16, BFloat16, Float32, const_expr
+from cutlass import Int32, Int64, Float16, BFloat16, Float32, Boolean, const_expr
 from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
@@ -198,6 +199,43 @@ torch2cute_dtype_map = {
     torch.int64: Int64,
 }
 
+
+@cute.jit
+def block_sum(val: cute.Numeric, reduction_buffer: cute.Tensor) -> cute.Numeric:
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    cute.arch.barrier()
+    block_reduce_val = Float32(0.0)
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return cute.arch.warp_reduction(block_reduce_val, operator.add)
+
+
+@cute.jit
+def row_sum(
+    x: cute.TensorSSA | cute.Numeric,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: Optional[cute.Tensor] = None,
+) -> cute.Numeric:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        val = x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+    else:
+        val = x
+    val = cute.arch.warp_reduction(
+        val,
+        operator.add,
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
+    )
+    if const_expr(reduction_buffer is not None):
+        warps_per_row, cluster_n = reduction_buffer.shape[1]
+        assert cluster_n == 1, "row_sum is CTA-local; cluster reductions are not inlined yet"
+        if const_expr(warps_per_row > 1):
+            val = block_sum(val, reduction_buffer)
+    return val
+
 class Eigh:
     def __init__(
         self,
@@ -227,21 +265,7 @@ class Eigh:
         if arch < Arch.sm_90:
             self.cluster_n = 1
             return
-        # SM12x supports cluster up to 8
-        max_cluster = 8 if arch.major == 12 else 16
-        N = self.N
-        if arch.major == 12 and const_expr(self.dtype.width >= 32):
-            # SM12x 99 KB SMEM: fp32 bwd has 2 SMEM tensors, needs tighter clustering
-            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
-        elif const_expr(self.dtype.width == 16):
-            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
-        else:
-            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
-        for limit, cluster in thresholds:
-            if N <= limit:
-                self.cluster_n = cluster
-                return
-        self.cluster_n = max_cluster
+        self.cluster_n = 8
 
     def _cap_cluster_n(self, vecsize: int) -> None:
         """Cap ``cluster_n`` so every peer CTA owns a distinct, non-empty N-tile.
@@ -276,6 +300,20 @@ class Eigh:
         val_layout = cute.make_layout((1, num_copy_elems))
         return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
+    def tiled_copy_1d(
+        self,
+        dtype: Type[cutlass.Numeric],
+        num_threads: int,
+        num_copy_elems: int = 1,
+        is_async: bool = False,
+    ) -> cute.TiledCopy:
+        num_copy_bits = num_copy_elems * dtype.width
+        copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+        thr_layout = cute.make_layout(num_threads)
+        val_layout = cute.make_layout(num_copy_elems)
+        return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
     def _get_tiled_copy(self, vecsize: int = 1):
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
         threads_per_row = self._threads_per_row()
@@ -285,6 +323,13 @@ class Eigh:
         tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
         tiled_copy = self.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
         return tiled_copy, tiler_mn, threads_per_row
+
+    def _get_column_tiled_copy(self):
+        num_threads = self._num_threads()
+        assert num_threads % cute.arch.WARP_SIZE == 0
+        tiler_n = cute.ceil_div(self.N, num_threads) * num_threads
+        tiled_copy = self.tiled_copy_1d(self.dtype, num_threads, is_async=True)
+        return tiled_copy, tiler_n, num_threads
 
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -348,13 +393,87 @@ class Eigh:
         self,
         mData: cute.Tensor,
         mTri: cute.Tensor,
-        tiler_mn: cute.Shape,
+        tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+        cta_rank = (
+            const_expr(0)
+            if const_expr(self.cluster_n == 1)
+            else cute.arch.block_idx_in_cluster()
+        )
+        tv_layout = tiled_copy.layout_tv_tiled
+
+        smem = cutlass.utils.SmemAllocator()
+        sCol = smem.allocate_tensor(
+            mData.element_type,
+            cute.make_layout(tiler_n),
+            byte_alignment=16,
+        )
+        reduction_buffer = smem.allocate_tensor(
+            self.reduction_dtype,
+            self._get_reduction_buffer_layout(tv_layout, 1),
+            byte_alignment=8,
+        )
+
+        if cta_rank == 0:
+            mCol = mData[0, None, 0]
+            gCol = cute.local_tile(mCol, (tiler_n,), (0,))
+
+            thr_copy = tiled_copy.get_slice(tidx)
+            tCgCol = thr_copy.partition_S(gCol)
+            tCsCol = thr_copy.partition_D(sCol)
+
+            pred = cute.make_rmem_tensor((1, cute.size(tCsCol, mode=[1])), Boolean)
+            for m in cutlass.range(cute.size(tCsCol, mode=[1]), unroll_full=True):
+                col_idx = tidx + m * tiled_copy.size
+                pred[0, m] = col_idx < self.N
+
+            cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+
+            tCrCol = cute.make_rmem_tensor_like(tCgCol)
+            cute.autovec_copy(tCsCol, tCrCol)
+            col = tCrCol.load().to(Float32)
+            norm_sq = row_sum(
+                col * col,
+                threads_per_row,
+                reduction_buffer[None, None, 0],
+            )
+
+            alpha = Float32(mData[0, 0, 0])
+            norm = Float32(0.0)
+            if norm_sq > 0.0:
+                norm = cute.math.sqrt(norm_sq)
+
+            beta = -norm
+            if alpha < 0.0:
+                beta = norm
+
+            tau = Float32(0.0)
+            if beta != 0.0:
+                tau = (beta - alpha) / beta
+
+            denom = alpha - beta
+            inv_denom = Float32(0.0)
+            if denom != 0.0:
+                inv_denom = Float32(1.0) / denom
+
+            vi = col * inv_denom
+            tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
+            tCrVi.store(vi)
+
+            if tidx == 0:
+                cute.printf(
+                    "eigh tridiag debug: norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
+                    norm,
+                    norm_sq,
+                    alpha,
+                    beta,
+                    tau,
+                )
     
     @cute.jit
     def __call__(
@@ -366,13 +485,10 @@ class Eigh:
         assert mData.element_type == self.dtype
         assert mTri.element_type == self.dtype
         self._set_cluster_n()
-        largest_dtype_width = const_expr(max(t.element_type.width for t in [mData, mTri]))
-        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // largest_dtype_width
-        )
+        tiled_copy, tiler_n, threads_per_row = self._get_column_tiled_copy()
         num_threads = tiled_copy.size
-        self.kernel(mData, mTri, tiler_mn, tiled_copy, threads_per_row).launch(
-            grid=[mData.shape[0], self.cluster_n, 1],
+        self.kernel(mData, mTri, tiler_n, tiled_copy, threads_per_row).launch(
+            grid=[1, self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
