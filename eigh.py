@@ -267,12 +267,19 @@ class Eigh:
         self,
         dtype: Type[cutlass.Numeric],
         N: int,
+        k: int = 0,
+        panel_size: int = 1,
         stage: int = 1,
         reduction_dtype=Float32,
         debug_printf: bool = True,
     ):
+        assert k >= 0
+        assert panel_size > 0
+        assert k * panel_size + panel_size < N
         self.dtype = dtype
         self.N = N
+        self.k = k
+        self.panel_size = panel_size
         self.stage = stage
         self.reduction_dtype = reduction_dtype
         self.debug_printf = debug_printf
@@ -334,7 +341,9 @@ class Eigh:
         num_threads = self._num_threads()
         threads_per_row = self._threads_per_row()
         assert threads_per_row <= num_threads
-        tiler_n = cute.ceil_div(self.N, num_threads) * num_threads
+        panel_start = self.k * self.panel_size
+        max_panel_n = self.N - panel_start - 1
+        tiler_n = cute.ceil_div(max_panel_n, num_threads) * num_threads
         tiled_copy = self.tiled_copy_1d(self.dtype, num_threads, is_async=True)
         reduction_tiled_copy = self.tiled_copy_1d(self.dtype, threads_per_row)
         return tiled_copy, reduction_tiled_copy, tiler_n, threads_per_row
@@ -379,8 +388,9 @@ class Eigh:
         bidx, _, _ = cute.arch.block_idx()
         tv_layout = tiled_copy.layout_tv_tiled
 
-        mCol = mData[bidx, None, 0]
-        gCol = cute.local_tile(mCol, (tiler_n,), (0,))
+        panel_start = const_expr(self.k * self.panel_size)
+        panel_row_base = const_expr(panel_start + 1)
+        panel_n = self.N - panel_row_base
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -395,76 +405,83 @@ class Eigh:
         )
 
         thr_copy = tiled_copy.get_slice(tidx)
-        tCgCol = thr_copy.partition_S(gCol)
         tCsCol = thr_copy.partition_D(sCol)
-
-        pred = cute.make_rmem_tensor((1, cute.size(tCsCol, mode=[1])), Boolean)
-        for m in cutlass.range(cute.size(tCsCol, mode=[1]), unroll_full=True):
-            col_idx = tidx + m * tiled_copy.size
-            pred[0, m] = col_idx < self.N
-
-        cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-
-        alpha = Float32(sCol[0])
-
         reduction_tidx = tidx % threads_per_row
         thr_reduction = reduction_tiled_copy.get_slice(reduction_tidx)
         tRsCol = thr_reduction.partition_S(sCol)
         tRrCol = cute.make_rmem_tensor_like(tRsCol)
 
-        partial = Float32(0.0)
-        if tidx < threads_per_row:
-            cute.autovec_copy(tRsCol, tRrCol)
-            reduction_values = tRrCol.load().to(Float32)
-            partial = (reduction_values * reduction_values).reduce(
-                cute.ReductionOp.ADD,
-                init_val=0.0,
-                reduction_profile=0,
+        for i in cutlass.range(self.panel_size, unroll_full=True):
+            col = panel_start + i
+            mCol = cute.domain_offset((panel_row_base,), mData[bidx, None, col])
+            gCol = cute.local_tile(mCol, (tiler_n,), (0,))
+            tCgCol = thr_copy.partition_S(gCol)
+
+            pred = cute.make_rmem_tensor((1, cute.size(tCsCol, mode=[1])), Boolean)
+            for m in cutlass.range(cute.size(tCsCol, mode=[1]), unroll_full=True):
+                col_idx = tidx + m * tiled_copy.size
+                pred[0, m] = col_idx >= i and col_idx < panel_n
+
+            cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            alpha = Float32(sCol[i])
+
+            partial = Float32(0.0)
+            if tidx < threads_per_row:
+                cute.autovec_copy(tRsCol, tRrCol)
+                reduction_values = tRrCol.load().to(Float32)
+                partial = (reduction_values * reduction_values).reduce(
+                    cute.ReductionOp.ADD,
+                    init_val=0.0,
+                    reduction_profile=0,
+                )
+
+            norm_sq = cta_sum(
+                partial,
+                threads_per_row,
+                reduction_buffer[None, None, 0],
             )
 
-        norm_sq = cta_sum(
-            partial,
-            threads_per_row,
-            reduction_buffer[None, None, 0],
-        )
+            tCrCol = cute.make_rmem_tensor_like(tCgCol)
+            cute.autovec_copy(tCsCol, tCrCol)
+            col_values = tCrCol.load().to(Float32)
 
-        tCrCol = cute.make_rmem_tensor_like(tCgCol)
-        cute.autovec_copy(tCsCol, tCrCol)
-        col = tCrCol.load().to(Float32)
+            norm = Float32(0.0)
+            if norm_sq > 0.0:
+                norm = cute.math.sqrt(norm_sq)
 
-        norm = Float32(0.0)
-        if norm_sq > 0.0:
-            norm = cute.math.sqrt(norm_sq)
+            beta = -norm
+            if alpha < 0.0:
+                beta = norm
 
-        beta = -norm
-        if alpha < 0.0:
-            beta = norm
+            tau = Float32(0.0)
+            if beta != 0.0:
+                tau = (beta - alpha) / beta
 
-        tau = Float32(0.0)
-        if beta != 0.0:
-            tau = (beta - alpha) / beta
+            denom = alpha - beta
+            inv_denom = Float32(0.0)
+            if denom != 0.0:
+                inv_denom = Float32(1.0) / denom
 
-        denom = alpha - beta
-        inv_denom = Float32(0.0)
-        if denom != 0.0:
-            inv_denom = Float32(1.0) / denom
+            vi = col_values * inv_denom
+            tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
+            tCrVi.store(vi)
 
-        vi = col * inv_denom
-        tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
-        tCrVi.store(vi)
-
-        if const_expr(self.debug_printf):
-            if bidx == 0 and tidx == 0:
-                cute.printf(
-                    "eigh tridiag debug: norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
-                    norm,
-                    norm_sq,
-                    alpha,
-                    beta,
-                    tau,
-                )
+            if const_expr(self.debug_printf):
+                if bidx == 0 and tidx == 0:
+                    cute.printf(
+                        "eigh tridiag debug: k=%d i=%d norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
+                        self.k,
+                        i,
+                        norm,
+                        norm_sq,
+                        alpha,
+                        beta,
+                        tau,
+                    )
     
     @cute.jit
     def __call__(
@@ -494,14 +511,14 @@ class Eigh:
         
     @staticmethod
     @jit_cache
-    def compile(data_dtype, N, debug_printf: bool = True):
+    def compile(data_dtype, N, debug_printf: bool = True, k: int = 0, panel_size: int = 1):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         tri_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         
         return cute.compile(
-            Eigh(data_dtype, N, debug_printf=debug_printf),
+            Eigh(data_dtype, N, k=k, panel_size=panel_size, debug_printf=debug_printf),
             data_cute,
             tri_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),

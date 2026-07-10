@@ -30,6 +30,7 @@ DTYPES = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+PANEL_SIZE = 1
 
 
 def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -38,23 +39,30 @@ def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> 
     return data.contiguous()
 
 
-def run_direct(data: torch.Tensor) -> torch.Tensor:
+def run_direct(data: torch.Tensor, k: int = 0) -> torch.Tensor:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
     tri = torch.full_like(data, float("nan"))
-    compiled = eigh.Eigh.compile(data_dtype, data.size(1))
+    compiled = eigh.Eigh.compile(data_dtype, data.size(1), k=k, panel_size=PANEL_SIZE)
     compiled(data, tri)
     return tri
 
 
 def benchmark_direct(
     data: torch.Tensor,
+    k: int,
     n_sets: int,
     n_timed_calls: int,
     warmup_target_ms: float,
     repeats: int,
 ) -> tuple[list[float], int]:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
-    compiled = eigh.Eigh.compile(data_dtype, data.size(1), debug_printf=False)
+    compiled = eigh.Eigh.compile(
+        data_dtype,
+        data.size(1),
+        debug_printf=False,
+        k=k,
+        panel_size=PANEL_SIZE,
+    )
     base_args = (data, torch.empty_like(data))
     base_kwargs = {}
     if n_sets == 0:
@@ -88,8 +96,11 @@ def select_sample(samples: list[float], stat: str) -> float:
     raise ValueError(f"Unsupported benchmark stat: {stat}")
 
 
-def first_column_householder_reference(data: torch.Tensor):
-    col = data[0, :, 0].float().cpu()
+def first_column_householder_reference(data: torch.Tensor, k: int, i: int = 0):
+    panel_start = k * PANEL_SIZE
+    col_idx = panel_start + i
+    row_start = panel_start + i + 1
+    col = data[0, row_start:, col_idx].float().cpu()
     alpha = col[0]
     norm_sq = torch.dot(col, col)
     norm = torch.sqrt(norm_sq)
@@ -101,14 +112,25 @@ def first_column_householder_reference(data: torch.Tensor):
     vi = torch.zeros_like(col)
     if denom != 0:
         vi = col / denom
-    return alpha, beta, tau, norm_sq, vi
+    return alpha, beta, tau, norm_sq, vi, row_start, col_idx
 
 
-def print_householder_reference(data: torch.Tensor, preview: int, full: bool, print_vi: bool) -> None:
-    alpha, beta, tau, norm_sq, vi = first_column_householder_reference(data)
+def print_householder_reference(
+    data: torch.Tensor,
+    k: int,
+    preview: int,
+    full: bool,
+    print_vi: bool,
+) -> None:
+    i = 0
+    alpha, beta, tau, norm_sq, vi, row_start, col_idx = first_column_householder_reference(
+        data,
+        k,
+        i,
+    )
     norm = torch.sqrt(norm_sq)
     print(
-        "expected first-column reflector: "
+        f"expected subcolumn reflector k={k} i={i} A[{row_start}:N,{col_idx}]: "
         f"norm={norm.item():.9g} norm_sq={norm_sq.item():.9g} "
         f"alpha={alpha.item():.9g} beta={beta.item():.9g} tau={tau.item():.9g}",
         flush=True,
@@ -116,7 +138,7 @@ def print_householder_reference(data: torch.Tensor, preview: int, full: bool, pr
     if not print_vi and not full:
         return
     limit = vi.numel() if full else min(preview, vi.numel())
-    print(f"expected vi preview ({limit}/{vi.numel()}):", flush=True)
+    print(f"expected vi preview for A[{row_start}:N,{col_idx}] ({limit}/{vi.numel()}):", flush=True)
     for idx in range(limit):
         print(f"  vi[{idx}]={vi[idx].item():.9g}", flush=True)
     if not full and limit < vi.numel():
@@ -129,6 +151,12 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=512)
     parser.add_argument("--dtype", choices=DTYPES, default="float32")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=0,
+        help="Compile-time panel index. The panel starts at k * PANEL_SIZE.",
+    )
     parser.add_argument(
         "--expected-preview",
         type=int,
@@ -197,6 +225,12 @@ def main() -> None:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
     if args.bench_warmup_ms < 0:
         parser.error("--bench-warmup-ms must be non-negative")
+    if args.k < 0:
+        parser.error("--k must be non-negative")
+
+    panel_start = args.k * PANEL_SIZE
+    if panel_start + PANEL_SIZE >= args.n:
+        parser.error("k * PANEL_SIZE + PANEL_SIZE must be less than n")
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -207,11 +241,13 @@ def main() -> None:
     data = make_input(args.batch, args.n, DTYPES[args.dtype], device)
 
     print(f"input: shape={tuple(data.shape)} dtype={data.dtype} device={data.device}", flush=True)
+    print(f"panel debug: k={args.k} panel_size={PANEL_SIZE} panel_start={panel_start}", flush=True)
     if args.batch != 1:
         print("note: current debug kernel prints only the reflector for mData[0]", flush=True)
     if not args.skip_expected:
         print_householder_reference(
             data,
+            args.k,
             args.expected_preview,
             args.expected_full,
             args.print_vi,
@@ -226,6 +262,7 @@ def main() -> None:
         )
         samples, bench_sets = benchmark_direct(
             data,
+            args.k,
             args.bench_sets,
             args.bench_calls,
             args.bench_warmup_ms,
@@ -242,7 +279,7 @@ def main() -> None:
     if args.custom:
         out = eigh.custom_kernel(data)
     else:
-        out = run_direct(data)
+        out = run_direct(data, args.k)
     torch.cuda.synchronize()
 
     if isinstance(out, tuple):
