@@ -12,6 +12,11 @@ Build an efficient eigendecomposition algorithm for the B200 GPU in eigh.py for 
 - magma/ directory has linalg algorithm examples
 - popcorn-cli contains the full evaluation infrastructure, **DO NOT CHEAT**.
 
+## Kernel Writing Tips
+- Don't add synchronization unless it's needed for correctness
+- Ensure static code are optimized for compiler (ex. using cutlass.Constexpr, unrolling etc.)
+- Use type annotations as much as possible
+
 ## Problem Description
 Implement batched real symmetric eigendecomposition.
 
