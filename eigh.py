@@ -10,14 +10,13 @@ import time
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
-from typing import Type, Tuple, Optional
+from typing import Type, Optional
 from functools import lru_cache, wraps
 
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float16, BFloat16, Float32, Boolean, const_expr
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
@@ -230,11 +229,38 @@ def row_sum(
         threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if const_expr(reduction_buffer is not None):
-        warps_per_row, cluster_n = reduction_buffer.shape[1]
-        assert cluster_n == 1, "row_sum is CTA-local; cluster reductions are not inlined yet"
+        warps_per_row = cute.size(reduction_buffer.shape[1])
         if const_expr(warps_per_row > 1):
             val = block_sum(val, reduction_buffer)
     return val
+
+
+@cute.jit
+def cta_sum(
+    partial: cute.Numeric,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: cute.Tensor,
+) -> cute.Numeric:
+    """Combine active reduction-warp partials and broadcast the CTA-wide sum."""
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+
+    partial = cute.arch.warp_reduction(
+        partial,
+        operator.add,
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
+    )
+
+    active_warps = cute.ceil_div(threads_per_row, cute.arch.WARP_SIZE)
+    if warp_idx < active_warps:
+        if lane_idx == 0:
+            reduction_buffer[0, warp_idx] = partial
+    cute.arch.barrier()
+
+    total = Float32(0.0)
+    if lane_idx < active_warps:
+        total = reduction_buffer[0, lane_idx]
+    return cute.arch.warp_reduction(total, operator.add)
+
 
 class Eigh:
     def __init__(
@@ -243,11 +269,13 @@ class Eigh:
         N: int,
         stage: int = 1,
         reduction_dtype=Float32,
+        debug_printf: bool = True,
     ):
         self.dtype = dtype
         self.N = N
         self.stage = stage
         self.reduction_dtype = reduction_dtype
+        self.debug_printf = debug_printf
 
     def _threads_per_row(self):
         N = self.N
@@ -258,28 +286,6 @@ class Eigh:
 
     def _num_threads(self):
         return 128 if self.N <= 16384 else 256
-
-    def _set_cluster_n(self):
-        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        # SM8x (Ampere/Ada) lacks cluster support
-        if arch < Arch.sm_90:
-            self.cluster_n = 1
-            return
-        self.cluster_n = 8
-
-    def _cap_cluster_n(self, vecsize: int) -> None:
-        """Cap ``cluster_n`` so every peer CTA owns a distinct, non-empty N-tile.
-
-        A clustered launch splits the row across ``cluster_n`` CTAs. If
-        ``threads_per_row * cluster_n`` exceeds the number of vector blocks in the
-        row (``N // vecsize``), one CTA tile already spans the whole row
-        (``tiler_mn[1] >= N``); local_tile then collapses every peer onto tile 0,
-        so the peers re-reduce the same columns and double-count in the cluster
-        reduction. Capping to ``(N // vecsize) // threads_per_row`` guarantees
-        ``tiler_mn[1] < N`` whenever the resulting ``cluster_n > 1``.
-        """
-        max_cluster_n = max(1, (self.N // vecsize) // self._threads_per_row())
-        self.cluster_n = min(self.cluster_n, max_cluster_n)
 
     def tiled_copy_2d(
         self,
@@ -319,60 +325,31 @@ class Eigh:
         threads_per_row = self._threads_per_row()
         num_threads = self._num_threads()
         assert num_threads % cute.arch.WARP_SIZE == 0
-        num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
+        num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row)
         tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
         tiled_copy = self.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
         return tiled_copy, tiler_mn, threads_per_row
 
     def _get_column_tiled_copy(self):
         num_threads = self._num_threads()
-        assert num_threads % cute.arch.WARP_SIZE == 0
+        threads_per_row = self._threads_per_row()
+        assert threads_per_row <= num_threads
         tiler_n = cute.ceil_div(self.N, num_threads) * num_threads
         tiled_copy = self.tiled_copy_1d(self.dtype, num_threads, is_async=True)
-        return tiled_copy, tiler_n, num_threads
+        reduction_tiled_copy = self.tiled_copy_1d(self.dtype, threads_per_row)
+        return tiled_copy, reduction_tiled_copy, tiler_n, threads_per_row
 
-    def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+    def _get_reduction_buffer_layout(self, tv_layout: cute.Layout):
+        num_warps = cute.ceil_div(cute.size(tv_layout, mode=[0]), cute.arch.WARP_SIZE)
         warps_per_row = (
             num_warps
             if cute.rank(tv_layout.shape[0]) == 1
             else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
         )
         return cute.make_ordered_layout(
-            (num_warps // warps_per_row, (warps_per_row, cluster_n), self.stage),
+            (num_warps // warps_per_row, warps_per_row, self.stage),
             order=(1, 0, 2),
         )
-
-    def _allocate_reduction_buffer_and_mbar(
-        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout, is_persistent: bool = False
-    ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
-        reduction_buffer = smem.allocate_tensor(
-            self.reduction_dtype,
-            self._get_reduction_buffer_layout(tv_layout, self.cluster_n),
-            byte_alignment=8,
-        )
-        if const_expr(self.cluster_n > 1):
-            mbar_ptr = smem.allocate_array(
-                Int64, num_elems=self.stage if not is_persistent else self.stage * 2
-            )
-        else:
-            mbar_ptr = None
-        return reduction_buffer, mbar_ptr
-
-    @cute.jit
-    def _initialize_cluster(
-        self,
-        tidx: Int32,
-        mbar_ptr: cute.Pointer,
-        num_warps: int
-    ):
-        if const_expr(self.cluster_n > 1):
-            if tidx == 0:  # Initialize full barrier
-                cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
-                
-            cute.arch.mbarrier_init_fence()
-            # Cluster arrive after barrier init
-            cute.arch.cluster_arrive_relaxed()
             
     @staticmethod
     def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1) -> Optional[cute.Tensor]:
@@ -395,15 +372,15 @@ class Eigh:
         mTri: cute.Tensor,
         tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
+        reduction_tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        cta_rank = (
-            const_expr(0)
-            if const_expr(self.cluster_n == 1)
-            else cute.arch.block_idx_in_cluster()
-        )
+        bidx, _, _ = cute.arch.block_idx()
         tv_layout = tiled_copy.layout_tv_tiled
+
+        mCol = mData[bidx, None, 0]
+        gCol = cute.local_tile(mCol, (tiler_n,), (0,))
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -413,59 +390,73 @@ class Eigh:
         )
         reduction_buffer = smem.allocate_tensor(
             self.reduction_dtype,
-            self._get_reduction_buffer_layout(tv_layout, 1),
+            self._get_reduction_buffer_layout(tv_layout),
             byte_alignment=8,
         )
 
-        if cta_rank == 0:
-            mCol = mData[0, None, 0]
-            gCol = cute.local_tile(mCol, (tiler_n,), (0,))
+        thr_copy = tiled_copy.get_slice(tidx)
+        tCgCol = thr_copy.partition_S(gCol)
+        tCsCol = thr_copy.partition_D(sCol)
 
-            thr_copy = tiled_copy.get_slice(tidx)
-            tCgCol = thr_copy.partition_S(gCol)
-            tCsCol = thr_copy.partition_D(sCol)
+        pred = cute.make_rmem_tensor((1, cute.size(tCsCol, mode=[1])), Boolean)
+        for m in cutlass.range(cute.size(tCsCol, mode=[1]), unroll_full=True):
+            col_idx = tidx + m * tiled_copy.size
+            pred[0, m] = col_idx < self.N
 
-            pred = cute.make_rmem_tensor((1, cute.size(tCsCol, mode=[1])), Boolean)
-            for m in cutlass.range(cute.size(tCsCol, mode=[1]), unroll_full=True):
-                col_idx = tidx + m * tiled_copy.size
-                pred[0, m] = col_idx < self.N
+        cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
 
-            cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
+        alpha = Float32(sCol[0])
 
-            tCrCol = cute.make_rmem_tensor_like(tCgCol)
-            cute.autovec_copy(tCsCol, tCrCol)
-            col = tCrCol.load().to(Float32)
-            norm_sq = row_sum(
-                col * col,
-                threads_per_row,
-                reduction_buffer[None, None, 0],
+        reduction_tidx = tidx % threads_per_row
+        thr_reduction = reduction_tiled_copy.get_slice(reduction_tidx)
+        tRsCol = thr_reduction.partition_S(sCol)
+        tRrCol = cute.make_rmem_tensor_like(tRsCol)
+
+        partial = Float32(0.0)
+        if tidx < threads_per_row:
+            cute.autovec_copy(tRsCol, tRrCol)
+            reduction_values = tRrCol.load().to(Float32)
+            partial = (reduction_values * reduction_values).reduce(
+                cute.ReductionOp.ADD,
+                init_val=0.0,
+                reduction_profile=0,
             )
 
-            alpha = Float32(mData[0, 0, 0])
-            norm = Float32(0.0)
-            if norm_sq > 0.0:
-                norm = cute.math.sqrt(norm_sq)
+        norm_sq = cta_sum(
+            partial,
+            threads_per_row,
+            reduction_buffer[None, None, 0],
+        )
 
-            beta = -norm
-            if alpha < 0.0:
-                beta = norm
+        tCrCol = cute.make_rmem_tensor_like(tCgCol)
+        cute.autovec_copy(tCsCol, tCrCol)
+        col = tCrCol.load().to(Float32)
 
-            tau = Float32(0.0)
-            if beta != 0.0:
-                tau = (beta - alpha) / beta
+        norm = Float32(0.0)
+        if norm_sq > 0.0:
+            norm = cute.math.sqrt(norm_sq)
 
-            denom = alpha - beta
-            inv_denom = Float32(0.0)
-            if denom != 0.0:
-                inv_denom = Float32(1.0) / denom
+        beta = -norm
+        if alpha < 0.0:
+            beta = norm
 
-            vi = col * inv_denom
-            tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
-            tCrVi.store(vi)
+        tau = Float32(0.0)
+        if beta != 0.0:
+            tau = (beta - alpha) / beta
 
-            if tidx == 0:
+        denom = alpha - beta
+        inv_denom = Float32(0.0)
+        if denom != 0.0:
+            inv_denom = Float32(1.0) / denom
+
+        vi = col * inv_denom
+        tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
+        tCrVi.store(vi)
+
+        if const_expr(self.debug_printf):
+            if bidx == 0 and tidx == 0:
                 cute.printf(
                     "eigh tridiag debug: norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
                     norm,
@@ -484,26 +475,33 @@ class Eigh:
     ):
         assert mData.element_type == self.dtype
         assert mTri.element_type == self.dtype
-        self._set_cluster_n()
-        tiled_copy, tiler_n, threads_per_row = self._get_column_tiled_copy()
+        tiled_copy, reduction_tiled_copy, tiler_n, threads_per_row = (
+            self._get_column_tiled_copy()
+        )
         num_threads = tiled_copy.size
-        self.kernel(mData, mTri, tiler_n, tiled_copy, threads_per_row).launch(
-            grid=[1, self.cluster_n, 1],
+        self.kernel(
+            mData,
+            mTri,
+            tiler_n,
+            tiled_copy,
+            reduction_tiled_copy,
+            threads_per_row,
+        ).launch(
+            grid=[mData.shape[0], 1, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
         )
         
     @staticmethod
     @jit_cache
-    def compile(data_dtype, N):
+    def compile(data_dtype, N, debug_printf: bool = True):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         tri_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         
         return cute.compile(
-            Eigh(data_dtype, N),
+            Eigh(data_dtype, N, debug_printf=debug_printf),
             data_cute,
             tri_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),

@@ -1,9 +1,16 @@
 import argparse
+from pathlib import Path
+from statistics import mean, median
 import sys
 import types
 
 import torch
 
+
+REPO_ROOT = Path(__file__).resolve().parent
+QUACK_ROOT = REPO_ROOT / "quack"
+if QUACK_ROOT.is_dir():
+    sys.path.insert(0, str(QUACK_ROOT))
 
 task = types.ModuleType("task")
 task.input_t = torch.Tensor
@@ -11,6 +18,11 @@ task.output_t = object
 sys.modules.setdefault("task", task)
 
 import eigh  # noqa: E402
+from quack.bench.bench_utils import (  # noqa: E402
+    _bench_cuda_graph_l2_rotate,
+    _clone_l2_rotate_inputs,
+    _pick_l2_rotate_count,
+)
 
 
 DTYPES = {
@@ -29,8 +41,51 @@ def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> 
 def run_direct(data: torch.Tensor) -> torch.Tensor:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
     tri = torch.full_like(data, float("nan"))
-    eigh.Eigh.compile(data_dtype, data.size(1))(data, tri)
+    compiled = eigh.Eigh.compile(data_dtype, data.size(1))
+    compiled(data, tri)
     return tri
+
+
+def benchmark_direct(
+    data: torch.Tensor,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    data_dtype = eigh.torch2cute_dtype_map[data.dtype]
+    compiled = eigh.Eigh.compile(data_dtype, data.size(1), debug_printf=False)
+    base_args = (data, torch.empty_like(data))
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(bench_data: torch.Tensor, bench_tri: torch.Tensor) -> None:
+        compiled(bench_data, bench_tri)
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def select_sample(samples: list[float], stat: str) -> float:
+    if stat == "min":
+        return min(samples)
+    if stat == "mean":
+        return mean(samples)
+    if stat == "median":
+        return median(samples)
+    raise ValueError(f"Unsupported benchmark stat: {stat}")
 
 
 def first_column_householder_reference(data: torch.Tensor):
@@ -100,7 +155,48 @@ def main() -> None:
         action="store_true",
         help="Call eigh.custom_kernel(data) instead of the direct CuTe kernel path.",
     )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Benchmark the direct CuTe kernel with CUDA graph replay and L2-rotated tensors.",
+    )
+    parser.add_argument(
+        "--bench-sets",
+        type=int,
+        default=0,
+        help="Number of cloned input/output tensor sets to rotate through; 0 uses QuACK's heuristic.",
+    )
+    parser.add_argument(
+        "--bench-calls",
+        type=int,
+        default=200,
+        help="Approximate number of kernel calls captured in the timed CUDA graph.",
+    )
+    parser.add_argument(
+        "--bench-warmup-ms",
+        type=float,
+        default=200.0,
+        help="Target GPU warmup time before each timed graph capture.",
+    )
+    parser.add_argument(
+        "--bench-repeats",
+        type=int,
+        default=1,
+        help="Number of full benchmark samples to collect.",
+    )
+    parser.add_argument(
+        "--bench-stat",
+        choices=("min", "mean", "median"),
+        default="median",
+        help="Statistic to report when --bench-repeats is greater than one.",
+    )
     args = parser.parse_args()
+    if args.bench and args.custom:
+        parser.error("--bench currently supports the direct CuTe kernel path, not --custom")
+    if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
+        parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
+    if args.bench_warmup_ms < 0:
+        parser.error("--bench-warmup-ms must be non-negative")
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -112,7 +208,7 @@ def main() -> None:
 
     print(f"input: shape={tuple(data.shape)} dtype={data.dtype} device={data.device}", flush=True)
     if args.batch != 1:
-        print("note: current debug kernel reads only mData[0]", flush=True)
+        print("note: current debug kernel prints only the reflector for mData[0]", flush=True)
     if not args.skip_expected:
         print_householder_reference(
             data,
@@ -120,6 +216,28 @@ def main() -> None:
             args.expected_full,
             args.print_vi,
         )
+
+    if args.bench:
+        print(
+            "bench: CUDA graph replay with L2-rotated tensor sets "
+            f"(sets={args.bench_sets or 'auto'}, calls={args.bench_calls}, "
+            f"warmup_ms={args.bench_warmup_ms:g}, repeats={args.bench_repeats})",
+            flush=True,
+        )
+        samples, bench_sets = benchmark_direct(
+            data,
+            args.bench_sets,
+            args.bench_calls,
+            args.bench_warmup_ms,
+            args.bench_repeats,
+        )
+        selected = select_sample(samples, args.bench_stat)
+        sample_text = ", ".join(f"{sample:.6f}" for sample in samples)
+        print(f"bench sets={bench_sets}", flush=True)
+        print(f"bench samples_ms=[{sample_text}]", flush=True)
+        print(f"bench {args.bench_stat}_ms={selected:.6f}", flush=True)
+        print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
+        return
 
     if args.custom:
         out = eigh.custom_kernel(data)

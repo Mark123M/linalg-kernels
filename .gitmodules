@@ -7,3 +7,6 @@
 [submodule "popcorn-cli"]
 	path = popcorn-cli
 	url = https://github.com/gpu-mode/popcorn-cli.git
+[submodule "lapack"]
+	path = lapack
+	url = https://github.com/Reference-LAPACK/lapack.git
