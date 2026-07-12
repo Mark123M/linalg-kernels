@@ -42,13 +42,19 @@ Solution plan:
 Panel tridiagonalization kernel, one CTA per batch matrix, `num_threads` (128/256) split into row groups of `threads_per_row` (N-dependent, 8→256). Per panel column `i` (loop `cutlass.range(panel_size, unroll_full=True)`):
 
 1. **Column load**: 1D async tiled copy of the panel subcolumn into smem `sCol`, predicated `col_idx >= i and col_idx < panel_n` (cp.async zero-fills masked lanes, so `v` is zero below `i` for free).
-2. **Reflector (every row group redundantly)**: `sColBcast` = broadcast view of `sCol` with layout `(rows_per_tile, tiler_n) stride (0,1)`, partitioned by the 2D matvec tiled copy — so each row group's register copy of the column lines up elementwise with its A-tile rows. `norm_sq` via `row_sum` (warp reduction, `block_sum` through `reduction_buffer` when `warps_per_row > 1`). Semantics: `x` includes alpha at index `i`; `beta = -sign(alpha)*||x||`; `tau = (beta-alpha)/beta`; `v = x/(alpha-beta)` (so `v[i] = alpha/denom`, *not* the conventional 1).
+2. **Reflector (every row group redundantly)**: `sColBcast` = broadcast view of `sCol` with layout `(rows_per_tile, tiler_n) stride (0,1)`, partitioned by the 2D matvec tiled copy — so each row group's register copy of the column lines up elementwise with its A-tile rows. `norm_sq` via `row_sum` (warp reduction, `block_sum` through `reduction_buffer` when `warps_per_row > 1`). Semantics (LAPACK `dlarfg` convention): `x` includes alpha at index `i`; `beta = -sign(alpha)*||x||`; `tau = (beta-alpha)/beta`; `v` tail `= x/(alpha-beta)` with `v[i] = 1` forced via a dynamic-`if` element loop. Zero-tail columns take the `tau=2` sign-flip reflector (valid under residual gating) instead of LAPACK's `xnorm==0 => H=I` shortcut — deliberate, per input restrictions.
 3. **Pipelined GEMV** `b = A' @ v`: double-buffered smem tile `sA (rows_per_tile, tiler_n, 2)`; prefetch tile `t+1` (one `cp_async_commit_group` per iteration, `cp_async_wait_group(1)`), reduce tile `t` with `row_sum(a * v)`; lane 0 of each row group stores into smem `sB`. Column bound via static `predicate_k(limit=panel_n)`; row bound via scalar `if` (quack convention). No barrier around `sA` — each thread reads back exactly what it copied.
 4. Barriers: inside the GEMV loop only when `warps_per_row > 1` (protects `reduction_buffer` reuse); unconditional at end of each `i` iteration (`sCol`/`sB` reuse).
 
 Under `debug_printf=True`, `b` is stored to `mTri[:, panel_row_base+j, col]` for host-side verification (throwaway hook).
 
-Next step: the rank-2 update consuming `sB` (LAPACK `dsytd2`: `w = tau*b - (tau^2/2)(b.v) v`, then `A -= v w^T + w v^T`).
+Next step — the blocked DLATRD column flow (`lapack/SRC/dlatrd.f`, lower variant), NOT an immediate trailing rank-2 update. Within a panel, V and W columns are accumulated and the trailing matrix stays stale; per column `i`:
+1. `i>0`: refresh the panel column before the reflector: `a_i -= V·W(i,:)^T + W·V(i,:)^T` (two skinny GEMVs, dlatrd.f:297).
+2. Reflector (switch to LAPACK `dlarfg` convention: `v[i]=1`; zero tail => `beta=alpha, tau=0`).
+3. `b = A'·v` (done — the DSYMV at dlatrd.f:314, computed against the panel-start A).
+4. Deferred-update corrections, no-op at `i=0`: `b -= V·(W^T v) + W·(V^T v)` (four skinny GEMVs vs the `i-1` accumulated columns, dlatrd.f:316-325). These exist precisely because step 3 used stale A; the unblocked `dsytd2` has no such terms because it DSYR2-updates the whole trailing matrix after every column.
+5. `w_i = tau*b`, then `w_i += (-tau/2)(w^T v)·v` (dlatrd.f:328-331); append `v_i`, `w_i` to the panels (needs smem for V and W, `panel_size` columns each).
+6. After the panel: one block rank-2 update `A -= V W^T + W V^T` (DSYR2K, called from `dsytrd.f`). `panel_size=1` collapses this flow to `dsytd2`.
 
 Status: GEMV verified vs float64 torch for N ∈ {8, 33, 128, 1000, 4096} and panel_size up to 4 (rel err ≤ 2.5e-7); benchmark parity with cuBLAS `bmm` (1.03x at N=1024, 0.97x at N=4096 on local GPU, DRAM-bound both).
 
@@ -62,6 +68,7 @@ Status: GEMV verified vs float64 torch for N ∈ {8, 33, 128, 1000, 4096} and pa
 - Don't add synchronization unless needed for correctness; document why each barrier exists.
 - Use `cutlass.Constexpr` / `const_expr` type annotations aggressively so the compiler sees static structure.
 - The DSL warns at ≥64 iterations of a static loop; treat that as a hard smell.
+- **Never use a ternary expression with a dynamic condition** (`x if dyn_cond else y`): the condition is resolved at trace time and one branch is silently baked in (trace-time-arbitrary — can even differ between compiles). Use a dynamic `if` statement, which the preprocessor lowers correctly. Cost of a masked scalar update this way is negligible.
 
 ## Verify & bench
 
