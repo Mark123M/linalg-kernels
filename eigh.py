@@ -261,6 +261,7 @@ class Eigh:
         stage: int = 1,
         reduction_dtype=Float32,
         debug_printf: bool = True,
+        threads_per_row: Optional[int] = None,
     ):
         assert k >= 0
         assert panel_size > 0
@@ -272,8 +273,11 @@ class Eigh:
         self.stage = stage
         self.reduction_dtype = reduction_dtype
         self.debug_printf = debug_printf
+        self.threads_per_row_override = threads_per_row
 
     def _threads_per_row(self):
+        if self.threads_per_row_override is not None:
+            return self.threads_per_row_override
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (8192, 128)]:
             if N <= limit:
@@ -366,11 +370,28 @@ class Eigh:
             dtype, shape, stride=stride, assumed_align=divisibility * dtype.width // 8
         )
     
+    def workspace_shape(self):
+        """Per-batch (rows, cols) of the V/W gmem workspace tensors.
+
+        Rows are padded to a multiple of rows_per_tile (the inner-GEMV tile height)
+        and cols to tiler_n. Callers must allocate with torch.zeros: the kernel reads
+        not-yet-written rows/pad columns under masks and relies on them being finite
+        (it only ever writes valid data, so the invariant survives graph replays).
+        """
+        num_threads = self._num_threads()
+        rows_per_tile = num_threads // self._threads_per_row()
+        max_panel_n = self.N - self.k * self.panel_size - 1
+        tiler_n = -(-max_panel_n // num_threads) * num_threads
+        rows = -(-self.panel_size // rows_per_tile) * rows_per_tile
+        return rows, tiler_n
+
     @cute.kernel
     def kernel(
         self,
         mData: cute.Tensor,
         mTri: cute.Tensor,
+        mV: cute.Tensor,
+        mW: cute.Tensor,
         tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
         matvec_tiled_copy: cute.TiledCopy,
@@ -387,6 +408,9 @@ class Eigh:
         rows_per_tile = const_expr(num_threads // threads_per_row)
         warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
         num_tiles = const_expr(cute.ceil_div(panel_n, rows_per_tile))
+        num_warps = const_expr(num_threads // cute.arch.WARP_SIZE)
+        # Panel columns owned per warp lane in the outer correction (j = lane + 32*m).
+        jw_per_lane = const_expr(cute.ceil_div(self.panel_size, cute.arch.WARP_SIZE))
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -410,6 +434,18 @@ class Eigh:
             self._get_reduction_buffer_layout(tv_layout),
             byte_alignment=8,
         )
+        # Inner-GEMV results s_w = W^T v, s_v = V^T v: the layout crossover between
+        # row-group-per-column producers and warp-lane-per-column consumers.
+        sSw = smem.allocate_tensor(
+            self.reduction_dtype,
+            cute.make_layout(self.panel_size),
+            byte_alignment=8,
+        )
+        sSv = smem.allocate_tensor(
+            self.reduction_dtype,
+            cute.make_layout(self.panel_size),
+            byte_alignment=8,
+        )
 
         thr_copy = tiled_copy.get_slice(tidx)
         tCsCol = thr_copy.partition_D(sCol)
@@ -426,6 +462,19 @@ class Eigh:
         tVrV = cute.make_rmem_tensor(tVsV.shape, Float32)
         tAsA = thr_matvec.partition_D(sA)
         tArA = cute.make_rmem_tensor_like(tAsA[None, None, None, 0])
+        # Broadcast view of sB for the w^T v reduction, aligned with tVrV like sColBcast.
+        sBBcast = cute.make_tensor(
+            sB.iterator, cute.make_layout((rows_per_tile, tiler_n), stride=(0, 1))
+        )
+        tBsB = thr_matvec.partition_S(sBBcast)
+        tBrB = cute.make_rmem_tensor_like(tBsB)
+        # V/W column fragment for the inner GEMVs.
+        tPrP = cute.make_rmem_tensor(tVsV.shape, Float32)
+        # Per-lane outer-correction coefficients s_w[j], s_v[j] for j = lane + 32*m.
+        # Note the cross-pairing downstream: coef_sw multiplies V, coef_sv multiplies W.
+        coef_sw = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
+        coef_sv = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
+        lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
 
         cA = cute.make_identity_tensor((rows_per_tile, tiler_n))
         tAcA = thr_matvec.partition_S(cA)
@@ -433,6 +482,18 @@ class Eigh:
         local_row = tAcA[0][0]
 
         mA = cute.domain_offset((panel_row_base, panel_row_base), mData[bidx, None, None])
+        # Per-batch V/W workspace views, (rows_alloc, tiler_n) row-major in gmem.
+        # Callers must zero-allocate: rows >= i and row-i pad columns are read masked
+        # before their first write, and 0 * NaN = NaN would poison the reductions.
+        # The kernel only ever writes valid data, so the invariant survives replays.
+        mVb = mV[bidx, None, None]
+        mWb = mW[bidx, None, None]
+
+        # sB's pad tail is read via sBBcast (masked by v's zeros) before it is ever
+        # written, so it must start finite. No barrier needed here: the first
+        # cross-thread read is beyond column 0's sCol-load barrier.
+        for m in cutlass.range(tiler_n // num_threads):
+            sB[tidx + m * num_threads] = self.reduction_dtype(0.0)
 
         for i in cutlass.range(self.panel_size, unroll_full=True):
             col = panel_start + i
@@ -508,6 +569,44 @@ class Eigh:
                 cute.copy(thr_matvec, tAgA0, tAsA[None, None, None, 0], pred=tApA)
             cute.arch.cp_async_commit_group()
 
+            # Deferred-update corrections, inner GEMVs (dlatrd.f:316-318, 322-324):
+            # s_w = W^T v, s_v = V^T v over the i accumulated panel columns, placed
+            # here so the panel work hides the tile-0 fetch. Row group r owns panel
+            # column j = jt*rows_per_tile + r (a row of the gmem workspace), so
+            # fragments line up elementwise with tVrV exactly like sColBcast. j >= i is
+            # masked, not branched: a group-divergent branch around row_sum would break
+            # block_sum's CTA barrier when warps_per_row > 1. Reads past column i land
+            # in the workspace's zero rows and are zeroed by the mask anyway.
+            inner_tiles = (i + rows_per_tile - 1) // rows_per_tile
+            for jt in cutlass.range(inner_tiles):
+                j = jt * rows_per_tile + local_row
+                mask = Float32(0.0)
+                if j < i:
+                    mask = Float32(1.0)
+                gWp = cute.local_tile(mWb, (rows_per_tile, tiler_n), (jt, 0))
+                gVp = cute.local_tile(mVb, (rows_per_tile, tiler_n), (jt, 0))
+                if const_expr(warps_per_row > 1):
+                    # reduction_buffer WAR vs the previous reduction (norm or prior jt).
+                    cute.arch.barrier()
+                cute.autovec_copy(thr_matvec.partition_S(gWp), tPrP)
+                dot_w = row_sum(
+                    tPrP.load() * tVrV.load() * mask,
+                    threads_per_row,
+                    reduction_buffer[None, None, 0],
+                )
+                if reduction_tidx == 0 and j < i:
+                    sSw[j] = dot_w
+                if const_expr(warps_per_row > 1):
+                    cute.arch.barrier()
+                cute.autovec_copy(thr_matvec.partition_S(gVp), tPrP)
+                dot_v = row_sum(
+                    tPrP.load() * tVrV.load() * mask,
+                    threads_per_row,
+                    reduction_buffer[None, None, 0],
+                )
+                if reduction_tidx == 0 and j < i:
+                    sSv[j] = dot_v
+
             for t in cutlass.range(num_tiles):
                 if t + 1 < num_tiles:
                     gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (t + 1, 0))
@@ -538,25 +637,81 @@ class Eigh:
                     if row_global < panel_n:
                         sB[row_global] = b
 
-            # All threads read sCol/reduction_buffer during the matvec; sync before the next
-            # column overwrites them (and before reading sB below).
+            # All threads read sCol/reduction_buffer during the matvec; sync so the
+            # outer correction below sees the complete sB and this column's sSw/sSv.
             cute.arch.barrier()
 
-            if const_expr(self.debug_printf):
-                for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
-                    j = tidx + m * num_threads
-                    if j < panel_n:
-                        mTri[bidx, panel_row_base + j, col] = self.dtype(sB[j])
+            # Deferred-update corrections, outer GEMVs (dlatrd.f:319-321, 325-327):
+            # b -= V s_w + W s_v. One warp per output row; lanes split the panel
+            # dimension: lane l owns panel column j_lane = l + 32*m with its
+            # coefficient in a register, then a warp-shuffle reduction per row. The
+            # j_lane < i guard also bounds the workspace reads (rows_alloc can be
+            # < 32). Warp-uniform/lane-local guards only — no CTA barrier inside.
+            if i > 0:
+                for m in cutlass.range(jw_per_lane, unroll_full=True):
+                    j_lane = lane_idx + m * cute.arch.WARP_SIZE
+                    sw_val = Float32(0.0)
+                    sv_val = Float32(0.0)
+                    if j_lane < i:
+                        sw_val = Float32(sSw[j_lane])
+                        sv_val = Float32(sSv[j_lane])
+                    coef_sw[m] = sw_val
+                    coef_sv[m] = sv_val
+                for row_tile in cutlass.range(cute.ceil_div(panel_n, num_warps)):
+                    row = row_tile * num_warps + warp_idx
+                    if row < panel_n:
+                        partial = Float32(0.0)
+                        for m in cutlass.range(jw_per_lane, unroll_full=True):
+                            j_lane = lane_idx + m * cute.arch.WARP_SIZE
+                            if j_lane < i:
+                                partial += (
+                                    Float32(mVb[j_lane, row]) * coef_sw[m]
+                                    + Float32(mWb[j_lane, row]) * coef_sv[m]
+                                )
+                        corr = cute.arch.warp_reduction(partial, operator.add)
+                        if lane_idx == 0:
+                            sB[row] = Float32(sB[row]) - corr
+            # Warp lane 0s rewrote sB; the w formation below reads every row.
+            cute.arch.barrier()
+
+            # w_i = tau*b + (-tau/2)(w^T v) v (dlatrd.f:328-331), using w^T v = tau*(b^T v).
+            # sB's pad tail is zero-initialized and never written, so v's zeros mask it.
+            cute.autovec_copy(tBsB, tBrB)
+            dot_bv = row_sum(
+                tBrB.load() * tVrV.load(),
+                threads_per_row,
+                reduction_buffer[None, None, 0],
+            )
+            alpha_w = Float32(-0.5) * tau * tau * dot_bv
+            for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                p = tidx + m * num_threads
+                if p < panel_n:
+                    vp = Float32(sCol[p]) * inv_denom
+                    if p == i:
+                        vp = Float32(1.0)
+                    wp = tau * Float32(sB[p]) + alpha_w * vp
+                    mVb[i, p] = vp
+                    mWb[i, p] = wp
+                    if const_expr(self.debug_printf):
+                        mTri[bidx, panel_row_base + p, col] = self.dtype(wp)
+            # The w store reads sCol/sB and appends the V/W rows consumed by the next
+            # column's inner GEMVs (CTA barrier orders the gmem writes for this CTA —
+            # all its threads share one SM's L1); sync before cp.async reuses sCol.
+            cute.arch.barrier()
     
     @cute.jit
     def __call__(
         self,
         mData: cute.Tensor,
         mTri: cute.Tensor,
+        mV: cute.Tensor,
+        mW: cute.Tensor,
         stream: cuda.CUstream,
     ):
         assert mData.element_type == self.dtype
         assert mTri.element_type == self.dtype
+        assert mV.element_type == self.reduction_dtype
+        assert mW.element_type == self.reduction_dtype
         tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row = (
             self._get_column_tiled_copy()
         )
@@ -564,6 +719,8 @@ class Eigh:
         self.kernel(
             mData,
             mTri,
+            mV,
+            mW,
             tiler_n,
             tiled_copy,
             matvec_tiled_copy,
@@ -576,16 +733,36 @@ class Eigh:
         
     @staticmethod
     @jit_cache
-    def compile(data_dtype, N, debug_printf: bool = True, k: int = 0, panel_size: int = 1):
+    def compile(
+        data_dtype,
+        N,
+        debug_printf: bool = True,
+        k: int = 0,
+        panel_size: int = 1,
+        threads_per_row: Optional[int] = None,
+    ):
+        obj = Eigh(
+            data_dtype,
+            N,
+            k=k,
+            panel_size=panel_size,
+            debug_printf=debug_printf,
+            threads_per_row=threads_per_row,
+        )
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         tri_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
-        
+        ws_rows, ws_cols = obj.workspace_shape()
+        v_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
+        w_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
+
         return cute.compile(
-            Eigh(data_dtype, N, k=k, panel_size=panel_size, debug_printf=debug_printf),
+            obj,
             data_cute,
             tri_cute,
+            v_cute,
+            w_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
@@ -601,6 +778,10 @@ def custom_kernel(data: input_t) -> output_t:
     data_dtype = torch2cute_dtype_map[data.dtype]
     tri = torch.empty_like(data)
     N = data.size(1)
-    Eigh.compile(data_dtype, N)(data, tri)
-    
+    ws_rows, ws_cols = Eigh(data_dtype, N).workspace_shape()
+    # Must be zeros, not empty: see workspace_shape.
+    v_ws = torch.zeros(data.size(0), ws_rows, ws_cols, device=data.device, dtype=torch.float32)
+    w_ws = torch.zeros_like(v_ws)
+    Eigh.compile(data_dtype, N)(data, tri, v_ws, w_ws)
+
     return torch.linalg.eigh(data)

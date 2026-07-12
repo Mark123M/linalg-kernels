@@ -20,7 +20,7 @@ Solution plan:
 ## Repo layout
 
 - `eigh.py` — the kernel under development (CuTe DSL). Also contains the jit/disk-cache plumbing (`EIGH_ENABLE_DISK_CACHE`, `EIGH_CUTE_CACHE_DIR` env vars) and `custom_kernel` entry point.
-- `eigh_bench_local_rtx4050.py` — local runner/benchmark (CUDA-graph replay + L2-rotated tensor sets via quack's bench utils). Includes a torch reflector+GEMV baseline and a `torch.allclose` check of the kernel's GEMV output.
+- `eigh_bench_local_rtx4050.py` — local runner/benchmark (CUDA-graph replay + L2-rotated tensor sets via quack's bench utils). Includes a torch reflector→GEMV→w baseline and a `torch.allclose` check of the kernel's w-column output.
 - `lapack/` — golden correctness references (e.g. `dsytd2`/`dsytrd` for tridiagonalization, `TESTING/EIG/ddrvst.f` for test matrix types).
 - `quack/` — the most efficient CuTe DSL kernel examples; the primary pattern source (`quack/quack/softmax.py` SoftmaxBackward, `reduce.py`, `copy_utils.py`, `bench/bench_utils.py`).
 - `cutlass/` — more kernel examples; `magma/` — linalg algorithm examples; `notes/` — layout notes; `references/` — misc reference kernels.
@@ -39,24 +39,24 @@ Solution plan:
 
 ## Current kernel state (`eigh.py`)
 
-Panel tridiagonalization kernel, one CTA per batch matrix, `num_threads` (128/256) split into row groups of `threads_per_row` (N-dependent, 8→256). Per panel column `i` (loop `cutlass.range(panel_size, unroll_full=True)`):
+Panel tridiagonalization kernel, one CTA per batch matrix, `num_threads` (128/256) split into row groups of `threads_per_row` (N-dependent, 8→256; constructor arg `threads_per_row=` overrides, used to exercise `warps_per_row>1` paths at small N locally). Implements the DLATRD column flow steps 2-5 (no column refresh yet). Per panel column `i` (loop `cutlass.range(panel_size, unroll_full=True)`):
 
 1. **Column load**: 1D async tiled copy of the panel subcolumn into smem `sCol`, predicated `col_idx >= i and col_idx < panel_n` (cp.async zero-fills masked lanes, so `v` is zero below `i` for free).
 2. **Reflector (every row group redundantly)**: `sColBcast` = broadcast view of `sCol` with layout `(rows_per_tile, tiler_n) stride (0,1)`, partitioned by the 2D matvec tiled copy — so each row group's register copy of the column lines up elementwise with its A-tile rows. `norm_sq` via `row_sum` (warp reduction, `block_sum` through `reduction_buffer` when `warps_per_row > 1`). Semantics (LAPACK `dlarfg` convention): `x` includes alpha at index `i`; `beta = -sign(alpha)*||x||`; `tau = (beta-alpha)/beta`; `v` tail `= x/(alpha-beta)` with `v[i] = 1` forced via a dynamic-`if` element loop. Zero-tail columns take the `tau=2` sign-flip reflector (valid under residual gating) instead of LAPACK's `xnorm==0 => H=I` shortcut — deliberate, per input restrictions.
-3. **Pipelined GEMV** `b = A' @ v`: double-buffered smem tile `sA (rows_per_tile, tiler_n, 2)`; prefetch tile `t+1` (one `cp_async_commit_group` per iteration, `cp_async_wait_group(1)`), reduce tile `t` with `row_sum(a * v)`; lane 0 of each row group stores into smem `sB`. Column bound via static `predicate_k(limit=panel_n)`; row bound via scalar `if` (quack convention). No barrier around `sA` — each thread reads back exactly what it copied.
-4. Barriers: inside the GEMV loop only when `warps_per_row > 1` (protects `reduction_buffer` reuse); unconditional at end of each `i` iteration (`sCol`/`sB` reuse).
+3. **Inner correction GEMVs** (dlatrd.f:316-318, 322-324): `s_w = Wᵀv`, `s_v = Vᵀv` into smem arrays `sSw/sSv`, placed between the tile-0 prefetch and the matvec loop to hide the first gmem fetch. Row group `r` owns panel column `j = jt*rows_per_tile + r` (a row of the gmem workspace), so fragments align with `tVrV` like `sColBcast`. `j >= i` is masked (never branched — a group-divergent branch around `row_sum` would break `block_sum`'s CTA barrier); dynamic trip count `ceil(i/rows_per_tile)` is CTA-uniform.
+4. **Pipelined GEMV** `b = A' @ v`: double-buffered smem tile `sA (rows_per_tile, tiler_n, 2)`; prefetch tile `t+1` (one `cp_async_commit_group` per iteration, `cp_async_wait_group(1)`), reduce tile `t` with `row_sum(a * v)`; lane 0 of each row group stores into smem `sB`. Column bound via static `predicate_k(limit=panel_n)`; row bound via scalar `if` (quack convention). No barrier around `sA` — each thread reads back exactly what it copied.
+5. **Outer correction GEMVs** (dlatrd.f:319-321, 325-327): `b -= V·s_w + W·s_v`, one warp per row — lane `l` owns panel column `l (+32m)` with its coefficient preloaded to a register; warp-shuffle reduction, lane 0 rewrites `sB[p]`. Skipped via a warp-uniform `if i > 0` (no CTA barrier inside).
+6. **w formation** (dlatrd.f:328-331): `w = τ·b + (-τ/2)(wᵀv)·v` using `wᵀv = τ·(bᵀv)` (one `row_sum` over a broadcast `sB` view); a thread-strided loop appends `v`/`w` as rows of the gmem workspace and (under `debug_printf`) stores `w` to `mTri[:, panel_row_base+p, col]` for host verification.
 
-Under `debug_printf=True`, `b` is stored to `mTri[:, panel_row_base+j, col]` for host-side verification (throwaway hook).
+**V/W panels live in gmem workspace**, not smem (removes the smem ceiling — every benchmark N/ps launches; a smem-resident variant is a possible later optimization for N≤1024). Per-batch shape `(rows, cols)` from `Eigh.workspace_shape()`: rows = panel_size padded to `rows_per_tile`, cols = `tiler_n`; row-major so inner-GEMV reads and w-appends are coalesced (outer reads are strided but L2-hot). **Callers must `torch.zeros`-allocate**: unwritten rows/pad columns are read under masks before first write and must be finite (`0 * NaN` poisons reductions); the kernel writes only valid data, so the invariant survives graph replays. Kernel/`__call__` signature: `(data, tri, V, W)`.
 
-Next step — the blocked DLATRD column flow (`lapack/SRC/dlatrd.f`, lower variant), NOT an immediate trailing rank-2 update. Within a panel, V and W columns are accumulated and the trailing matrix stays stale; per column `i`:
-1. `i>0`: refresh the panel column before the reflector: `a_i -= V·W(i,:)^T + W·V(i,:)^T` (two skinny GEMVs, dlatrd.f:297).
-2. Reflector (switch to LAPACK `dlarfg` convention: `v[i]=1`; zero tail => `beta=alpha, tau=0`).
-3. `b = A'·v` (done — the DSYMV at dlatrd.f:314, computed against the panel-start A).
-4. Deferred-update corrections, no-op at `i=0`: `b -= V·(W^T v) + W·(V^T v)` (four skinny GEMVs vs the `i-1` accumulated columns, dlatrd.f:316-325). These exist precisely because step 3 used stale A; the unblocked `dsytd2` has no such terms because it DSYR2-updates the whole trailing matrix after every column.
-5. `w_i = tau*b`, then `w_i += (-tau/2)(w^T v)·v` (dlatrd.f:328-331); append `v_i`, `w_i` to the panels (needs smem for V and W, `panel_size` columns each).
-6. After the panel: one block rank-2 update `A -= V W^T + W V^T` (DSYR2K, called from `dsytrd.f`). `panel_size=1` collapses this flow to `dsytd2`.
+Barriers per column: inside reductions only when `warps_per_row > 1` (`reduction_buffer` WAR); unconditional after the matvec (publishes `sB`+`sSw`/`sSv` to the outer pass), after the outer pass (lane 0s rewrote `sB`), and at column end (`sCol` WAR vs next cp.async; also orders this CTA's gmem V/W appends — all its threads share one SM's L1).
 
-Status: GEMV verified vs float64 torch for N ∈ {8, 33, 128, 1000, 4096} and panel_size up to 4 (rel err ≤ 2.5e-7); benchmark parity with cuBLAS `bmm` (1.03x at N=1024, 0.97x at N=4096 on local GPU, DRAM-bound both).
+Remaining DLATRD steps:
+1. `i>0` column refresh before the reflector: `a_i -= V·W(i,:)ᵀ + W·V(i,:)ᵀ` (dlatrd.f:297) — reuses the outer warp-per-row pass with coefficients `W[i,:]`/`V[i,:]` instead of `s_w`/`s_v`, applied to `sCol`. Until then reflectors come from the stale column, so results are verified against a float64 mirror of the kernel's recurrence, not LAPACK output.
+2. After the panel: block rank-2 update `A -= V Wᵀ + W Vᵀ` (DSYR2K, called from `dsytrd.f`). `panel_size=1` collapses the flow to `dsytd2`.
+
+Status: full column pipeline (reflector → inner GEMVs → matvec → outer correction → w) verified vs float64 mirror at N ∈ {65, 128, 512, 1000, 2048} and panel_size up to 16, plus `threads_per_row=64` at N=512 for the `block_sum` paths (rel err ≤ 1.2e-6). All benchmark N/ps combos launch (workspace in gmem). 640×512 ps=1: kernel 3.81 ms vs torch w-reference 4.02 ms (1.057x). **Occupancy/L2 note (local)**: the old smem-resident panels capped occupancy at 1 CTA/SM, so ~20 resident 1 MB matrices fit the 24 MB L2 and re-read columns hit cache (1.78 ms/col at ps=8); with panels in gmem, smem drops to ~20 KB, occupancy rises, the aggregate working set blows L2, and every column pays DRAM roofline (~3.8 ms/col at any ps). Deliberately capping occupancy (dummy smem carveout / launch attr) is a possible knob; on B200 the aggregate exceeds L2 either way, so this is mostly a local-GPU artifact.
 
 ## CuTe DSL performance rules (measured in this project)
 
@@ -64,7 +64,7 @@ Status: GEMV verified vs float64 torch for N ∈ {8, 33, 128, 1000, 4096} and pa
 - **Never respecialize per loop iteration** (`cutlass.range_constexpr` + per-i `const_expr` tile sizes): it duplicates the kernel body per iteration — measured 22x compile time and up to 1.85x runtime regression (I-cache) at panel_size=32, while ceil-rounding made the "smaller" tiles identical anyway. Use `cutlass.range(..., unroll_full=True)` with one traced body + dynamic predicates instead.
 - **Keep predicate limits static when possible**: with a static limit, most of `predicate_k`'s per-thread booleans constant-fold away. Making the bound depend on runtime `i` turned them into live registers and measured 3–11% *slower* — for <2% traffic saved. Columns `< i` are already nullified by `v`'s zeros.
 - `cp.async` needs ≥4-byte transactions: `num_copy_elems=1` copies only work for fp32.
-- Smem budget: `sCol + sB + 2*rows_per_tile*tiler_n` elements (~96 KB at N=4096 fp32) — revisit before pushing N higher.
+- Smem budget: `sCol + sB + 2*rows_per_tile*tiler_n` elements (V/W are gmem) — ~20 KB at N=512, ~98 KB at N=4096 (right at the local 99 KB / sm_89 limit). Exceeding the arch limit fails at **launch**, not compile ("launch shared memory exceeds current GPU arch"), with the allocated byte count in the message.
 - Don't add synchronization unless needed for correctness; document why each barrier exists.
 - Use `cutlass.Constexpr` / `const_expr` type annotations aggressively so the compiler sees static structure.
 - The DSL warns at ≥64 iterations of a static loop; treat that as a hard smell.
@@ -76,8 +76,8 @@ Status: GEMV verified vs float64 torch for N ∈ {8, 33, 128, 1000, 4096} and pa
 # correctness + reflector debug output
 .venv/bin/python eigh_bench_local_rtx4050.py --batch 2 --n 512
 
-# benchmark (CUDA graphs + L2 rotation) with torch GEMV baseline + allclose gate
+# benchmark (CUDA graphs + L2 rotation) with torch w-column baseline + allclose gate
 .venv/bin/python eigh_bench_local_rtx4050.py --batch 640 --n 512 --bench --skip-expected --bench-repeats 3
 ```
 
-When verifying kernel changes, always cover: an odd N (predicates), N=4096 (`warps_per_row=2` → `block_sum` path + loop barrier), and `panel_size > 1` (smem-reuse barriers across `i`). Compare against float64 torch references mirroring the kernel's exact reflector semantics (see `torch_reflector_gemv` in the runner).
+When verifying kernel changes, always cover: an odd N (predicates), a `warps_per_row=2` config (`block_sum` path + reduction barriers — use the `threads_per_row=64` override at N=512, since N=4096 no longer fits local smem with V/W panels), and `panel_size > 1` (correction GEMVs + smem-reuse barriers across `i`). Compare against float64 torch references mirroring the kernel's exact recurrence — reflector, corrections, and w formation (see `torch_reflector_w` in the runner and the scratchpad `test_panel.py` mirror).

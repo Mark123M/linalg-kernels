@@ -37,11 +37,20 @@ def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> 
     return data.contiguous()
 
 
+def make_workspace(data: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # V/W panel workspace in gmem; must be zero-allocated (see Eigh.workspace_shape).
+    data_dtype = eigh.torch2cute_dtype_map[data.dtype]
+    rows, cols = eigh.Eigh(data_dtype, data.size(1), k=k, panel_size=PANEL_SIZE).workspace_shape()
+    v_ws = torch.zeros(data.size(0), rows, cols, device=data.device, dtype=torch.float32)
+    return v_ws, torch.zeros_like(v_ws)
+
+
 def run_direct(data: torch.Tensor, k: int = 0) -> torch.Tensor:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
     tri = torch.full_like(data, float("nan"))
+    v_ws, w_ws = make_workspace(data, k)
     compiled = eigh.Eigh.compile(data_dtype, data.size(1), k=k, panel_size=PANEL_SIZE)
-    compiled(data, tri)
+    compiled(data, tri, v_ws, w_ws)
     return tri
 
 
@@ -61,10 +70,12 @@ def benchmark_direct(
         k=k,
         panel_size=PANEL_SIZE,
     )
-    # Rotate only the input matrices: tri is untouched by the non-debug kernel and the
-    # torch baseline's out is tiny, so sharing them keeps the auto-picked set counts and
+    # Rotate only the input matrices: tri is untouched by the non-debug kernel, the
+    # V/W workspace is fully rewritten in its valid region every call, and the torch
+    # baseline's out is tiny — so sharing them keeps the auto-picked set counts and
     # per-set memory traffic identical between the kernel and torch benches.
     tri = torch.empty_like(data)
+    v_ws, w_ws = make_workspace(data, k)
     base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
@@ -72,7 +83,7 @@ def benchmark_direct(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(bench_data: torch.Tensor) -> None:
-        compiled(bench_data, tri)
+        compiled(bench_data, tri, v_ws, w_ws)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -88,33 +99,44 @@ def benchmark_direct(
     return samples, n_sets
 
 
-def torch_reflector_gemv(data: torch.Tensor, k: int, out: torch.Tensor | None = None):
-    # Same op as the kernel's i=0 column: reflector v from the panel's first subcolumn
-    # with LAPACK's v[0] = 1 convention (tail = x[1:]/(alpha-beta)), then b = trailing A @ v.
+def torch_reflector_w(
+    data: torch.Tensor,
+    k: int,
+    out: torch.Tensor | None = None,
+):
+    # Same ops as the kernel's i=0 column: reflector v from the panel's first subcolumn
+    # with LAPACK's v[0] = 1 convention (tail = x[1:]/(alpha-beta)), b = trailing A @ v,
+    # then w = tau*b + (-tau/2)(w^T v) v (deferred-update corrections are no-ops at i=0).
     # No zero-tail edge handling: benchmark inputs are dense random symmetric, and the
     # kernel's tau=2 fallback is a valid sign-flip reflector under residual gating.
+    # Everything here must stay CUDA-graph-capture-safe (no .any()/boolean indexing).
     panel_start = k * PANEL_SIZE
     x = data[:, panel_start + 1 :, panel_start]
     norm = x.norm(dim=1)
     alpha = x[:, 0]
     beta = torch.where(alpha < 0, norm, -norm)
+    tau = (beta - alpha) / beta
     v = x / (alpha - beta).unsqueeze(1)
     v[:, 0] = 1
     trailing = data[:, panel_start + 1 :, panel_start + 1 :]
+    b = torch.bmm(trailing, v.unsqueeze(2)).squeeze(2)
+    w = tau.unsqueeze(1) * b
+    aw = -0.5 * tau * (w * v).sum(dim=1)
+    w = w + aw.unsqueeze(1) * v
     if out is None:
-        return torch.bmm(trailing, v.unsqueeze(2)).squeeze(2)
-    torch.bmm(trailing, v.unsqueeze(2), out=out)
+        return w
+    out.copy_(w)
 
 
 def check_gemv_allclose(data: torch.Tensor, k: int) -> bool:
     tri = run_direct(data, k)
     torch.cuda.synchronize()
     panel_start = k * PANEL_SIZE
-    b_kernel = tri[:, panel_start + 1 :, panel_start].float()
-    b_ref = torch_reflector_gemv(data.float(), k)
-    close = torch.allclose(b_kernel, b_ref, rtol=1e-3, atol=1e-2)
-    max_rel = ((b_kernel - b_ref).abs().max() / b_ref.abs().max().clamp_min(1e-30)).item()
-    print(f"gemv check: allclose={close} max_rel={max_rel:.3e}", flush=True)
+    w_kernel = tri[:, panel_start + 1 :, panel_start].float()
+    w_ref = torch_reflector_w(data.float(), k)
+    close = torch.allclose(w_kernel, w_ref, rtol=1e-3, atol=1e-2)
+    max_rel = ((w_kernel - w_ref).abs().max() / w_ref.abs().max().clamp_min(1e-30)).item()
+    print(f"w check: allclose={close} max_rel={max_rel:.3e}", flush=True)
     return close
 
 
@@ -128,7 +150,7 @@ def benchmark_torch_gemv(
 ) -> tuple[list[float], int]:
     panel_start = k * PANEL_SIZE
     m = data.size(1) - panel_start - 1
-    out = torch.empty(data.size(0), m, 1, device=data.device, dtype=data.dtype)
+    out = torch.empty(data.size(0), m, device=data.device, dtype=data.dtype)
     base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
@@ -136,7 +158,7 @@ def benchmark_torch_gemv(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(bench_data: torch.Tensor) -> None:
-        torch_reflector_gemv(bench_data, k, out=out)
+        torch_reflector_w(bench_data, k, out=out)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -162,7 +184,11 @@ def select_sample(samples: list[float], stat: str) -> float:
     raise ValueError(f"Unsupported benchmark stat: {stat}")
 
 
-def first_column_householder_reference(data: torch.Tensor, k: int, i: int = 0):
+def first_column_householder_reference(
+    data: torch.Tensor,
+    k: int,
+    i: int = 0,
+):
     panel_start = k * PANEL_SIZE
     col_idx = panel_start + i
     row_start = panel_start + i + 1
