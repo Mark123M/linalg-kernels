@@ -90,13 +90,16 @@ def benchmark_direct(
 
 def torch_reflector_gemv(data: torch.Tensor, k: int, out: torch.Tensor | None = None):
     # Same op as the kernel's i=0 column: reflector v from the panel's first subcolumn
-    # (x includes alpha at index 0, v = x/(alpha-beta)), then b = trailing A @ v.
+    # with LAPACK's v[0] = 1 convention (tail = x[1:]/(alpha-beta)), then b = trailing A @ v.
+    # No zero-tail edge handling: benchmark inputs are dense random symmetric, and the
+    # kernel's tau=2 fallback is a valid sign-flip reflector under residual gating.
     panel_start = k * PANEL_SIZE
     x = data[:, panel_start + 1 :, panel_start]
     norm = x.norm(dim=1)
     alpha = x[:, 0]
     beta = torch.where(alpha < 0, norm, -norm)
     v = x / (alpha - beta).unsqueeze(1)
+    v[:, 0] = 1
     trailing = data[:, panel_start + 1 :, panel_start + 1 :]
     if out is None:
         return torch.bmm(trailing, v.unsqueeze(2)).squeeze(2)

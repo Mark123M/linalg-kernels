@@ -477,7 +477,12 @@ class Eigh:
             if denom != 0.0:
                 inv_denom = Float32(1.0) / denom
 
+            # LAPACK dlarfg convention: v[i] = 1 (col_values gives alpha/denom there).
+            # Dynamic condition => `if` statement; a ternary would bake a branch at trace time.
             tVrV.store(col_values * inv_denom)
+            for elem in cutlass.range(cute.size(tVrV), unroll_full=True):
+                if tAcA[elem][1] == i:
+                    tVrV[elem] = Float32(1.0)
 
             if const_expr(self.debug_printf):
                 if bidx == 0 and tidx == 0:
