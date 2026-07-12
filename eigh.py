@@ -236,30 +236,19 @@ def row_sum(
 
 
 @cute.jit
-def cta_sum(
-    partial: cute.Numeric,
-    threads_per_row: cutlass.Constexpr[int],
-    reduction_buffer: cute.Tensor,
-) -> cute.Numeric:
-    """Combine active reduction-warp partials and broadcast the CTA-wide sum."""
-    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-
-    partial = cute.arch.warp_reduction(
-        partial,
-        operator.add,
-        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
+def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
+    # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
+    tApA = cute.make_rmem_tensor(
+        cute.make_layout(
+            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            stride=(cute.size(tAcA, mode=[2]), 0, 1),
+        ),
+        Boolean,
     )
-
-    active_warps = cute.ceil_div(threads_per_row, cute.arch.WARP_SIZE)
-    if warp_idx < active_warps:
-        if lane_idx == 0:
-            reduction_buffer[0, warp_idx] = partial
-    cute.arch.barrier()
-
-    total = Float32(0.0)
-    if lane_idx < active_warps:
-        total = reduction_buffer[0, lane_idx]
-    return cute.arch.warp_reduction(total, operator.add)
+    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
+        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
+            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+    return tApA
 
 
 class Eigh:
@@ -341,12 +330,15 @@ class Eigh:
         num_threads = self._num_threads()
         threads_per_row = self._threads_per_row()
         assert threads_per_row <= num_threads
+        assert num_threads % threads_per_row == 0
         panel_start = self.k * self.panel_size
         max_panel_n = self.N - panel_start - 1
         tiler_n = cute.ceil_div(max_panel_n, num_threads) * num_threads
         tiled_copy = self.tiled_copy_1d(self.dtype, num_threads, is_async=True)
-        reduction_tiled_copy = self.tiled_copy_1d(self.dtype, threads_per_row)
-        return tiled_copy, reduction_tiled_copy, tiler_n, threads_per_row
+        matvec_tiled_copy = self.tiled_copy_2d(
+            self.dtype, threads_per_row, num_threads, is_async=True
+        )
+        return tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row
 
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout):
         num_warps = cute.ceil_div(cute.size(tv_layout, mode=[0]), cute.arch.WARP_SIZE)
@@ -381,21 +373,36 @@ class Eigh:
         mTri: cute.Tensor,
         tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
-        reduction_tiled_copy: cute.TiledCopy,
+        matvec_tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        tv_layout = tiled_copy.layout_tv_tiled
+        tv_layout = matvec_tiled_copy.layout_tv_tiled
 
         panel_start = const_expr(self.k * self.panel_size)
         panel_row_base = const_expr(panel_start + 1)
         panel_n = self.N - panel_row_base
+        num_threads = const_expr(tiled_copy.size)
+        rows_per_tile = const_expr(num_threads // threads_per_row)
+        warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
+        num_tiles = const_expr(cute.ceil_div(panel_n, rows_per_tile))
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
             mData.element_type,
             cute.make_layout(tiler_n),
+            byte_alignment=16,
+        )
+        # A @ v
+        sB = smem.allocate_tensor(
+            self.reduction_dtype,
+            cute.make_layout(tiler_n),
+            byte_alignment=16,
+        )
+        sA = smem.allocate_tensor(
+            mData.element_type,
+            cute.make_ordered_layout((rows_per_tile, tiler_n, 2), order=(1, 0, 2)),
             byte_alignment=16,
         )
         reduction_buffer = smem.allocate_tensor(
@@ -407,9 +414,25 @@ class Eigh:
         thr_copy = tiled_copy.get_slice(tidx)
         tCsCol = thr_copy.partition_D(sCol)
         reduction_tidx = tidx % threads_per_row
-        thr_reduction = reduction_tiled_copy.get_slice(reduction_tidx)
-        tRsCol = thr_reduction.partition_S(sCol)
-        tRrCol = cute.make_rmem_tensor_like(tRsCol)
+
+        thr_matvec = matvec_tiled_copy.get_slice(tidx)
+        # Each row group reads the whole column with the same per-thread layout as a tile row,
+        # so v registers line up elementwise with tile rows in the matvec below.
+        sColBcast = cute.make_tensor(
+            sCol.iterator, cute.make_layout((rows_per_tile, tiler_n), stride=(0, 1))
+        )
+        tVsV = thr_matvec.partition_S(sColBcast)
+        tVrCol = cute.make_rmem_tensor_like(tVsV)
+        tVrV = cute.make_rmem_tensor(tVsV.shape, Float32)
+        tAsA = thr_matvec.partition_D(sA)
+        tArA = cute.make_rmem_tensor_like(tAsA[None, None, None, 0])
+
+        cA = cute.make_identity_tensor((rows_per_tile, tiler_n))
+        tAcA = thr_matvec.partition_S(cA)
+        tApA = predicate_k(tAcA, limit=panel_n)
+        local_row = tAcA[0][0]
+
+        mA = cute.domain_offset((panel_row_base, panel_row_base), mData[bidx, None, None])
 
         for i in cutlass.range(self.panel_size, unroll_full=True):
             col = panel_start + i
@@ -429,25 +452,13 @@ class Eigh:
 
             alpha = Float32(sCol[i])
 
-            partial = Float32(0.0)
-            if tidx < threads_per_row:
-                cute.autovec_copy(tRsCol, tRrCol)
-                reduction_values = tRrCol.load().to(Float32)
-                partial = (reduction_values * reduction_values).reduce(
-                    cute.ReductionOp.ADD,
-                    init_val=0.0,
-                    reduction_profile=0,
-                )
-
-            norm_sq = cta_sum(
-                partial,
+            cute.autovec_copy(tVsV, tVrCol)
+            col_values = tVrCol.load().to(Float32)
+            norm_sq = row_sum(
+                col_values * col_values,
                 threads_per_row,
                 reduction_buffer[None, None, 0],
             )
-
-            tCrCol = cute.make_rmem_tensor_like(tCgCol)
-            cute.autovec_copy(tCsCol, tCrCol)
-            col_values = tCrCol.load().to(Float32)
 
             norm = Float32(0.0)
             if norm_sq > 0.0:
@@ -466,9 +477,7 @@ class Eigh:
             if denom != 0.0:
                 inv_denom = Float32(1.0) / denom
 
-            vi = col_values * inv_denom
-            tCrVi = cute.make_rmem_tensor(tCrCol.shape, Float32)
-            tCrVi.store(vi)
+            tVrV.store(col_values * inv_denom)
 
             if const_expr(self.debug_printf):
                 if bidx == 0 and tidx == 0:
@@ -482,6 +491,57 @@ class Eigh:
                         beta,
                         tau,
                     )
+
+            # b = A' @ v over the trailing (panel_n x panel_n) block, pipelined over row tiles:
+            # prefetch tile t+1 while reducing tile t. Each thread reads back exactly the smem
+            # elements it copied, so no barrier is needed around sA. Columns < i are loaded
+            # but multiply v's zeros; masking them off the load measured slower (a dynamic
+            # predicate defeats the constant folding a static limit gets) for <2% traffic.
+            gA0 = cute.local_tile(mA, (rows_per_tile, tiler_n), (0, 0))
+            tAgA0 = thr_matvec.partition_S(gA0)
+            if local_row < panel_n:
+                cute.copy(thr_matvec, tAgA0, tAsA[None, None, None, 0], pred=tApA)
+            cute.arch.cp_async_commit_group()
+
+            for t in cutlass.range(num_tiles):
+                if t + 1 < num_tiles:
+                    gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (t + 1, 0))
+                    tAgA_next = thr_matvec.partition_S(gA_next)
+                    if (t + 1) * rows_per_tile + local_row < panel_n:
+                        cute.copy(
+                            thr_matvec,
+                            tAgA_next,
+                            tAsA[None, None, None, (t + 1) % 2],
+                            pred=tApA,
+                        )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(1)
+
+                if const_expr(warps_per_row > 1):
+                    # Keep a fast row group from overwriting reduction_buffer before slow
+                    # warps have read the previous reduction.
+                    cute.arch.barrier()
+                cute.autovec_copy(tAsA[None, None, None, t % 2], tArA)
+                a = tArA.load().to(Float32)
+                b = row_sum(
+                    a * tVrV.load(),
+                    threads_per_row,
+                    reduction_buffer[None, None, 0],
+                )
+                row_global = t * rows_per_tile + local_row
+                if reduction_tidx == 0:
+                    if row_global < panel_n:
+                        sB[row_global] = b
+
+            # All threads read sCol/reduction_buffer during the matvec; sync before the next
+            # column overwrites them (and before reading sB below).
+            cute.arch.barrier()
+
+            if const_expr(self.debug_printf):
+                for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                    j = tidx + m * num_threads
+                    if j < panel_n:
+                        mTri[bidx, panel_row_base + j, col] = self.dtype(sB[j])
     
     @cute.jit
     def __call__(
@@ -492,7 +552,7 @@ class Eigh:
     ):
         assert mData.element_type == self.dtype
         assert mTri.element_type == self.dtype
-        tiled_copy, reduction_tiled_copy, tiler_n, threads_per_row = (
+        tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row = (
             self._get_column_tiled_copy()
         )
         num_threads = tiled_copy.size
@@ -501,7 +561,7 @@ class Eigh:
             mTri,
             tiler_n,
             tiled_copy,
-            reduction_tiled_copy,
+            matvec_tiled_copy,
             threads_per_row,
         ).launch(
             grid=[mData.shape[0], 1, 1],

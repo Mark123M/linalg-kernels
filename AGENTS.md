@@ -7,6 +7,7 @@ Build an efficient eigendecomposition algorithm for the B200 GPU in eigh.py for 
 3. Backtransform for eigenvectors
 
 ## References
+- lapack/ directory contains the golden correctness references
 - quack/ directory has the most efficient CuTeDSL kernel examples
 - cutlass/ directory also has efficient kernel examples
 - magma/ directory has linalg algorithm examples

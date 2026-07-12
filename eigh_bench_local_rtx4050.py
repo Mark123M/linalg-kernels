@@ -86,6 +86,67 @@ def benchmark_direct(
     return samples, n_sets
 
 
+def torch_reflector_gemv(data: torch.Tensor, k: int, out: torch.Tensor | None = None):
+    # Same op as the kernel's i=0 column: reflector v from the panel's first subcolumn
+    # (x includes alpha at index 0, v = x/(alpha-beta)), then b = trailing A @ v.
+    panel_start = k * PANEL_SIZE
+    x = data[:, panel_start + 1 :, panel_start]
+    norm = x.norm(dim=1)
+    alpha = x[:, 0]
+    beta = torch.where(alpha < 0, norm, -norm)
+    v = x / (alpha - beta).unsqueeze(1)
+    trailing = data[:, panel_start + 1 :, panel_start + 1 :]
+    if out is None:
+        return torch.bmm(trailing, v.unsqueeze(2)).squeeze(2)
+    torch.bmm(trailing, v.unsqueeze(2), out=out)
+
+
+def check_gemv_allclose(data: torch.Tensor, k: int) -> bool:
+    tri = run_direct(data, k)
+    torch.cuda.synchronize()
+    panel_start = k * PANEL_SIZE
+    b_kernel = tri[:, panel_start + 1 :, panel_start].float()
+    b_ref = torch_reflector_gemv(data.float(), k)
+    close = torch.allclose(b_kernel, b_ref, rtol=1e-3, atol=1e-2)
+    max_rel = ((b_kernel - b_ref).abs().max() / b_ref.abs().max().clamp_min(1e-30)).item()
+    print(f"gemv check: allclose={close} max_rel={max_rel:.3e}", flush=True)
+    return close
+
+
+def benchmark_torch_gemv(
+    data: torch.Tensor,
+    k: int,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    panel_start = k * PANEL_SIZE
+    m = data.size(1) - panel_start - 1
+    out = torch.empty(data.size(0), m, 1, device=data.device, dtype=data.dtype)
+    base_args = (data, out)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(bench_data: torch.Tensor, bench_out: torch.Tensor) -> None:
+        torch_reflector_gemv(bench_data, k, out=bench_out)
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
 def select_sample(samples: list[float], stat: str) -> float:
     if stat == "min":
         return min(samples)
@@ -260,6 +321,7 @@ def main() -> None:
             f"warmup_ms={args.bench_warmup_ms:g}, repeats={args.bench_repeats})",
             flush=True,
         )
+        check_gemv_allclose(data, args.k)
         samples, bench_sets = benchmark_direct(
             data,
             args.k,
@@ -273,6 +335,20 @@ def main() -> None:
         print(f"bench sets={bench_sets}", flush=True)
         print(f"bench samples_ms=[{sample_text}]", flush=True)
         print(f"bench {args.bench_stat}_ms={selected:.6f}", flush=True)
+        torch_samples, torch_sets = benchmark_torch_gemv(
+            data,
+            args.k,
+            args.bench_sets,
+            args.bench_calls,
+            args.bench_warmup_ms,
+            args.bench_repeats,
+        )
+        torch_selected = select_sample(torch_samples, args.bench_stat)
+        torch_sample_text = ", ".join(f"{sample:.6f}" for sample in torch_samples)
+        print(f"bench torch_gemv sets={torch_sets}", flush=True)
+        print(f"bench torch_gemv samples_ms=[{torch_sample_text}]", flush=True)
+        print(f"bench torch_gemv {args.bench_stat}_ms={torch_selected:.6f}", flush=True)
+        print(f"bench kernel/torch_gemv ratio={torch_selected / selected:.3f}x", flush=True)
         print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
         return
 
