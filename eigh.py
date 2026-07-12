@@ -474,6 +474,8 @@ class Eigh:
         # Note the cross-pairing downstream: coef_sw multiplies V, coef_sv multiplies W.
         coef_sw = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
         coef_sv = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
+        # Column-refresh accumulators: thread owns rows p = tidx + m*num_threads.
+        acc = cute.make_rmem_tensor(cute.make_layout(tiler_n // num_threads), Float32)
         lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
 
         cA = cute.make_identity_tensor((rows_per_tile, tiler_n))
@@ -508,7 +510,35 @@ class Eigh:
 
             cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
             cute.arch.cp_async_commit_group()
+
+            # Column refresh (dlatrd.f:297-300): corr[p] = sum_{j<i} V[p,j]W[i,j] +
+            # W[p,j]V[i,j], accumulated in registers while the column cp.async is in
+            # flight (reads only the V/W workspace). Thread owns p = tidx +
+            # m*num_threads (w-append striding); at fixed j consecutive threads read
+            # consecutive p — coalesced. Coefficient reads are warp-broadcast. Dynamic
+            # j-trip is CTA-uniform; no reductions/barriers inside. Reads at
+            # p >= panel_n land in the workspace's zero pad (zeros-alloc invariant).
+            for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                acc[m] = Float32(0.0)
+            for j in cutlass.range(i):
+                cw = Float32(mWb[j, i])
+                cv = Float32(mVb[j, i])
+                for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                    p = tidx + m * num_threads
+                    acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
+
             cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            # Apply the refresh. p < i must stay zero (v's zero prefix, from the
+            # predicated load); p >= panel_n untouched keeps sCol's zero tail for the
+            # bcast fragments. Uniform at i=0: zero-trip j-loop makes it x - 0.
+            for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                p = tidx + m * num_threads
+                if p >= i and p < panel_n:
+                    sCol[p] = self.dtype(Float32(sCol[p]) - acc[m])
+            # The subtract rewrote sCol thread-strided; alpha and the reflector's
+            # sColBcast fragments read other threads' elements.
             cute.arch.barrier()
 
             alpha = Float32(sCol[i])
@@ -661,6 +691,7 @@ class Eigh:
                     row = row_tile * num_warps + warp_idx
                     if row < panel_n:
                         partial = Float32(0.0)
+                        # local thread reduction
                         for m in cutlass.range(jw_per_lane, unroll_full=True):
                             j_lane = lane_idx + m * cute.arch.WARP_SIZE
                             if j_lane < i:
