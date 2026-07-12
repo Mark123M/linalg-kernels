@@ -25,11 +25,9 @@ from quack.bench.bench_utils import (  # noqa: E402
 )
 
 
-DTYPES = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
+# The kernel's cp.async path (num_copy_elems=1) needs >=4-byte transactions and the
+# competition input is fp32, so the runner is fp32-only.
+DTYPE = torch.float32
 PANEL_SIZE = 1
 
 
@@ -63,14 +61,18 @@ def benchmark_direct(
         k=k,
         panel_size=PANEL_SIZE,
     )
-    base_args = (data, torch.empty_like(data))
+    # Rotate only the input matrices: tri is untouched by the non-debug kernel and the
+    # torch baseline's out is tiny, so sharing them keeps the auto-picked set counts and
+    # per-set memory traffic identical between the kernel and torch benches.
+    tri = torch.empty_like(data)
+    base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
         n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
-    def launch(bench_data: torch.Tensor, bench_tri: torch.Tensor) -> None:
-        compiled(bench_data, bench_tri)
+    def launch(bench_data: torch.Tensor) -> None:
+        compiled(bench_data, tri)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -124,14 +126,14 @@ def benchmark_torch_gemv(
     panel_start = k * PANEL_SIZE
     m = data.size(1) - panel_start - 1
     out = torch.empty(data.size(0), m, 1, device=data.device, dtype=data.dtype)
-    base_args = (data, out)
+    base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
         n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
-    def launch(bench_data: torch.Tensor, bench_out: torch.Tensor) -> None:
-        torch_reflector_gemv(bench_data, k, out=bench_out)
+    def launch(bench_data: torch.Tensor) -> None:
+        torch_reflector_gemv(bench_data, k, out=out)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -210,7 +212,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local runner for eigh.py CuTeDSL skeleton.")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--n", type=int, default=512)
-    parser.add_argument("--dtype", choices=DTYPES, default="float32")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--k",
@@ -238,11 +239,6 @@ def main() -> None:
         "--skip-expected",
         action="store_true",
         help="Do not print the host-side Householder reference.",
-    )
-    parser.add_argument(
-        "--custom",
-        action="store_true",
-        help="Call eigh.custom_kernel(data) instead of the direct CuTe kernel path.",
     )
     parser.add_argument(
         "--bench",
@@ -279,9 +275,14 @@ def main() -> None:
         default="median",
         help="Statistic to report when --bench-repeats is greater than one.",
     )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="high",
+        help="torch.set_float32_matmul_precision for the timed torch baseline "
+        "(applied after the strict-fp32 allclose check).",
+    )
     args = parser.parse_args()
-    if args.bench and args.custom:
-        parser.error("--bench currently supports the direct CuTe kernel path, not --custom")
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
     if args.bench_warmup_ms < 0:
@@ -299,13 +300,14 @@ def main() -> None:
         torch.empty((), device=device)
     except Exception as exc:
         raise SystemExit(f"CUDA device allocation failed: {exc}") from exc
-    data = make_input(args.batch, args.n, DTYPES[args.dtype], device)
+    data = make_input(args.batch, args.n, DTYPE, device)
 
     print(f"input: shape={tuple(data.shape)} dtype={data.dtype} device={data.device}", flush=True)
     print(f"panel debug: k={args.k} panel_size={PANEL_SIZE} panel_start={panel_start}", flush=True)
     if args.batch != 1:
         print("note: current debug kernel prints only the reflector for mData[0]", flush=True)
-    if not args.skip_expected:
+    # --bench implies skipping the host-side reference printout.
+    if not args.bench and not args.skip_expected:
         print_householder_reference(
             data,
             args.k,
@@ -322,6 +324,8 @@ def main() -> None:
             flush=True,
         )
         check_gemv_allclose(data, args.k)
+        torch.set_float32_matmul_precision(args.matmul_precision)
+        print(f"bench float32_matmul_precision={args.matmul_precision}", flush=True)
         samples, bench_sets = benchmark_direct(
             data,
             args.k,
@@ -352,18 +356,11 @@ def main() -> None:
         print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
         return
 
-    if args.custom:
-        out = eigh.custom_kernel(data)
-    else:
-        out = run_direct(data, args.k)
+    out = run_direct(data, args.k)
     torch.cuda.synchronize()
 
-    if isinstance(out, tuple):
-        for idx, tensor in enumerate(out):
-            print(f"out[{idx}]: shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}")
-    else:
-        print(f"out: shape={tuple(out.shape)} dtype={out.dtype} device={out.device}")
-        print(f"out nan_count={torch.isnan(out).sum().item()}")
+    print(f"out: shape={tuple(out.shape)} dtype={out.dtype} device={out.device}")
+    print(f"out nan_count={torch.isnan(out).sum().item()}")
     print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
 
 
