@@ -7,10 +7,11 @@ import pickle
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
-from typing import Type, Optional
+from typing import Type, Optional, Literal
 from functools import lru_cache, wraps
 
 import torch
@@ -26,11 +27,15 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 import cuda.bindings.driver as cuda
 from task import input_t, output_t
+from torch.utils.cpp_extension import load_inline
 
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+MAX_PANEL_SIZE = 128
+Rank2KBackend = Literal["cublas", "cublasdx"]
+_BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_rank2k_native"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -250,6 +255,494 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
             tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
     return tApA
 
+_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+torch::Tensor cublas_rank2k_(torch::Tensor data,
+                             torch::Tensor v,
+                             torch::Tensor w,
+                             int64_t k,
+                             int64_t panel_size);
+
+#ifdef EIGH_WITH_CUBLASDX
+torch::Tensor cublasdx_rank2k_(torch::Tensor data,
+                               torch::Tensor v,
+                               torch::Tensor w,
+                               int64_t k);
+#endif
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("cublas_rank2k_", &cublas_rank2k_, "DLATRD rank-2k update (cuBLAS)");
+#ifdef EIGH_WITH_CUBLASDX
+  m.def("cublasdx_rank2k_", &cublasdx_rank2k_, "DLATRD rank-2k update (cuBLASDx)");
+#endif
+}
+"""
+
+
+_COMMON_CUDA_SOURCE = r"""
+#include <ATen/cuda/CUDAContextLight.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cublas_v2.h>
+#include <torch/extension.h>
+
+namespace {
+
+void validate_inputs(const torch::Tensor& data,
+                     const torch::Tensor& v,
+                     const torch::Tensor& w,
+                     int64_t k,
+                     int64_t panel_size) {
+  TORCH_CHECK(data.is_cuda() && v.is_cuda() && w.is_cuda(), "data, V, and W must be CUDA tensors");
+  TORCH_CHECK(data.scalar_type() == at::kFloat && v.scalar_type() == at::kFloat &&
+                  w.scalar_type() == at::kFloat,
+              "rank-2k backends require FP32 tensors");
+  TORCH_CHECK(data.is_contiguous() && v.is_contiguous() && w.is_contiguous(),
+              "data, V, and W must be contiguous");
+  TORCH_CHECK(data.dim() == 3 && data.size(1) == data.size(2),
+              "data must have shape (batch, N, N)");
+  TORCH_CHECK(v.dim() == 3 && w.dim() == 3 && v.sizes() == w.sizes(),
+              "V and W must have identical (batch, rows, cols) shapes");
+  TORCH_CHECK(v.size(0) == data.size(0), "workspace batch dimension must match data");
+  TORCH_CHECK(k >= 0, "k must be non-negative");
+  TORCH_CHECK(panel_size >= 1 && panel_size <= 128, "panel_size must be in [1, 128]");
+  TORCH_CHECK(v.size(1) >= panel_size, "workspace has fewer rows than panel_size");
+  const int64_t panel_start = k * panel_size;
+  TORCH_CHECK(panel_start + panel_size < data.size(1), "panel does not fit within N");
+  const int64_t panel_n = data.size(1) - panel_start - 1;
+  TORCH_CHECK(v.size(2) >= panel_n, "workspace has too few columns for this panel");
+}
+
+void check_cublas(cublasStatus_t status, const char* operation) {
+  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, operation, " failed with cuBLAS status ",
+              static_cast<int>(status));
+}
+
+}  // namespace
+
+torch::Tensor cublas_rank2k_(torch::Tensor data,
+                             torch::Tensor v,
+                             torch::Tensor w,
+                             int64_t k,
+                             int64_t panel_size) {
+  validate_inputs(data, v, w, k, panel_size);
+
+  const int batch = static_cast<int>(data.size(0));
+  const int n = static_cast<int>(data.size(1));
+  const int workspace_rows = static_cast<int>(v.size(1));
+  const int tiler_n = static_cast<int>(v.size(2));
+  // dsytrd.f lower DSYR2K: trailing block starts at global row/col
+  // panel_start + nb, i.e. workspace column p = nb - 1 (global = panel_start+1+p).
+  const int offset = static_cast<int>(k * panel_size + panel_size);
+  const int trailing_n = n - offset;
+  const int rank = static_cast<int>(panel_size);
+  const long long matrix_stride = static_cast<long long>(n) * n;
+  const long long workspace_stride = static_cast<long long>(workspace_rows) * tiler_n;
+
+  float* data_ptr = data.data_ptr<float>() + static_cast<long long>(offset) * (n + 1);
+  const float* v_ptr = v.data_ptr<float>() + panel_size - 1;
+  const float* w_ptr = w.data_ptr<float>() + panel_size - 1;
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  check_cublas(cublasGemmStridedBatchedEx(handle,
+                                           CUBLAS_OP_N,
+                                           CUBLAS_OP_T,
+                                           trailing_n,
+                                           trailing_n,
+                                           rank,
+                                           &alpha,
+                                           v_ptr,
+                                           CUDA_R_32F,
+                                           tiler_n,
+                                           workspace_stride,
+                                           w_ptr,
+                                           CUDA_R_32F,
+                                           tiler_n,
+                                           workspace_stride,
+                                           &beta,
+                                           data_ptr,
+                                           CUDA_R_32F,
+                                           n,
+                                           matrix_stride,
+                                           batch,
+                                           CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT),
+               "V*W^T strided-batched GEMM");
+  check_cublas(cublasGemmStridedBatchedEx(handle,
+                                           CUBLAS_OP_N,
+                                           CUBLAS_OP_T,
+                                           trailing_n,
+                                           trailing_n,
+                                           rank,
+                                           &alpha,
+                                           w_ptr,
+                                           CUDA_R_32F,
+                                           tiler_n,
+                                           workspace_stride,
+                                           v_ptr,
+                                           CUDA_R_32F,
+                                           tiler_n,
+                                           workspace_stride,
+                                           &beta,
+                                           data_ptr,
+                                           CUDA_R_32F,
+                                           n,
+                                           matrix_stride,
+                                           batch,
+                                           CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT),
+               "W*V^T strided-batched GEMM");
+  return data;
+}
+"""
+
+
+_CUBLASDX_CUDA_SOURCE = r"""
+#define EIGH_WITH_CUBLASDX 1
+#include <cublasdx.hpp>
+
+namespace {
+
+constexpr int kPanelSize = EIGH_PANEL_SIZE;
+constexpr int kTile = 32;
+
+#if EIGH_DX_ARCH == 1000
+using TargetSM = cublasdx::SM<1000, cublasdx::arch_specific>;
+#else
+using TargetSM = cublasdx::SM<EIGH_DX_ARCH>;
+#endif
+
+using Rank2KBLAS = decltype(cublasdx::Size<kTile, kTile, kPanelSize>() +
+                            cublasdx::Precision<float>() +
+                            cublasdx::Type<cublasdx::type::real>() +
+                            cublasdx::Function<cublasdx::function::MM>() +
+                            cublasdx::Arrangement<cublasdx::row_major,
+                                                  cublasdx::col_major,
+                                                  cublasdx::row_major>() +
+                            cublasdx::Block() + TargetSM());
+
+template <class BLAS>
+__launch_bounds__(BLAS::max_threads_per_block)
+__global__ void rank2k_kernel(float* data,
+                              const float* v,
+                              const float* w,
+                              int batch,
+                              int n,
+                              int workspace_rows,
+                              int tiler_n,
+                              int offset,
+                              int trailing_n) {
+  CUBLASDX_SKIP_IF_NOT_APPLICABLE_SM(BLAS);
+  extern __shared__ __align__(16) cublasdx::byte smem[];
+  using alignment = cublasdx::alignment_of<BLAS>;
+  auto [a_shared, b_shared] =
+      cublasdx::shared_memory::slice<typename BLAS::a_value_type,
+                                     typename BLAS::b_value_type>(
+          smem,
+          alignment::a,
+          BLAS::suggest_layout_smem_a(),
+          alignment::b,
+          BLAS::suggest_layout_smem_b());
+
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  if (batch_idx >= batch) {
+    return;
+  }
+  const int tile_row = static_cast<int>(blockIdx.x) * kTile;
+  const int tile_col = static_cast<int>(blockIdx.y) * kTile;
+  const long long workspace_batch_stride =
+      static_cast<long long>(workspace_rows) * tiler_n;
+  const long long matrix_batch_stride = static_cast<long long>(n) * n;
+  const float* vb = v + static_cast<long long>(batch_idx) * workspace_batch_stride;
+  const float* wb = w + static_cast<long long>(batch_idx) * workspace_batch_stride;
+  float* ab = data + static_cast<long long>(batch_idx) * matrix_batch_stride;
+
+  // First product: V_rows * W_cols^T.  The workspace stores panel vectors as
+  // contiguous rows, so logical V[p,j] is workspace[j,p].
+  for (int linear = static_cast<int>(threadIdx.x); linear < kTile * kPanelSize;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kPanelSize;
+    const int j = linear - row * kPanelSize;
+    const int p = kPanelSize - 1 + tile_row + row;
+    a_shared(row, j) = p < kPanelSize - 1 + trailing_n ? vb[j * tiler_n + p] : 0.0f;
+  }
+  for (int linear = static_cast<int>(threadIdx.x); linear < kPanelSize * kTile;
+       linear += static_cast<int>(blockDim.x)) {
+    const int j = linear / kTile;
+    const int col = linear - j * kTile;
+    const int p = kPanelSize - 1 + tile_col + col;
+    b_shared(j, col) = p < kPanelSize - 1 + trailing_n ? wb[j * tiler_n + p] : 0.0f;
+  }
+  __syncthreads();
+
+  auto accumulator = BLAS::get_accumulator();
+  BLAS().execute(a_shared, b_shared, accumulator);
+
+  // Second product reuses the same shared buffers and accumulator: W_rows * V_cols^T.
+  __syncthreads();
+  for (int linear = static_cast<int>(threadIdx.x); linear < kTile * kPanelSize;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kPanelSize;
+    const int j = linear - row * kPanelSize;
+    const int p = kPanelSize - 1 + tile_row + row;
+    a_shared(row, j) = p < kPanelSize - 1 + trailing_n ? wb[j * tiler_n + p] : 0.0f;
+  }
+  for (int linear = static_cast<int>(threadIdx.x); linear < kPanelSize * kTile;
+       linear += static_cast<int>(blockDim.x)) {
+    const int j = linear / kTile;
+    const int col = linear - j * kTile;
+    const int p = kPanelSize - 1 + tile_col + col;
+    b_shared(j, col) = p < kPanelSize - 1 + trailing_n ? vb[j * tiler_n + p] : 0.0f;
+  }
+  __syncthreads();
+  BLAS().execute(a_shared, b_shared, accumulator);
+
+  if (accumulator.is_thread_active()) {
+    auto results = accumulator.get_results();
+#pragma unroll
+    for (int idx = 0; idx < cublasdx::size(results); ++idx) {
+      const auto coord = accumulator.map_fragment_index(idx);
+      const int row = tile_row + static_cast<int>(cute::get<0>(coord));
+      const int col = tile_col + static_cast<int>(cute::get<1>(coord));
+      if (row < trailing_n && col < trailing_n) {
+        const long long matrix_idx =
+            static_cast<long long>(offset + row) * n + offset + col;
+        ab[matrix_idx] -= static_cast<float>(results(idx));
+      }
+    }
+  }
+}
+
+}  // namespace
+
+torch::Tensor cublasdx_rank2k_(torch::Tensor data,
+                               torch::Tensor v,
+                               torch::Tensor w,
+                               int64_t k) {
+  validate_inputs(data, v, w, k, kPanelSize);
+  const int batch = static_cast<int>(data.size(0));
+  const int n = static_cast<int>(data.size(1));
+  const int workspace_rows = static_cast<int>(v.size(1));
+  const int tiler_n = static_cast<int>(v.size(2));
+  const int offset = static_cast<int>(k * kPanelSize + kPanelSize);
+  const int trailing_n = n - offset;
+  const dim3 grid((trailing_n + kTile - 1) / kTile,
+                  (trailing_n + kTile - 1) / kTile,
+                  batch);
+  const auto shared_memory_size = cublasdx::get_shared_storage_size_ab<Rank2KBLAS>();
+  auto kernel = rank2k_kernel<Rank2KBLAS>;
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  kernel<<<grid, Rank2KBLAS::block_dim, shared_memory_size, stream>>>(
+      data.data_ptr<float>(),
+      v.data_ptr<float>(),
+      w.data_ptr<float>(),
+      batch,
+      n,
+      workspace_rows,
+      tiler_n,
+      offset,
+      trailing_n);
+  auto status = cudaPeekAtLastError();
+  TORCH_CHECK(status == cudaSuccess, "cuBLASDx rank-2k launch failed: ", cudaGetErrorString(status));
+  return data;
+}
+"""
+
+
+def _cublas_link_flags() -> list[str]:
+    # Known pip-wheel layouts: consolidated cu13 wheels, then per-library cu12/cu13
+    # wheels. Fall back to the toolkit's libcublas on the default linker path.
+    site_root = Path(torch.__file__).resolve().parent.parent / "nvidia"
+    for rel, soname in (
+        ("cu13/lib", "libcublas.so.13"),
+        ("cublas/lib", "libcublas.so.13"),
+        ("cublas/lib", "libcublas.so.12"),
+    ):
+        lib_dir = site_root / rel
+        if (lib_dir / soname).is_file():
+            return [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}", f"-l:{soname}"]
+    return ["-lcublas"]
+
+
+def _mathdx_root_includes(root: Path) -> Optional[list[str]]:
+    if (root / "include" / "cublasdx.hpp").is_file() and (
+        root / "external" / "cutlass" / "include"
+    ).is_dir():
+        return [
+            str((root / "include").resolve()),
+            str((root / "external" / "cutlass" / "include").resolve()),
+        ]
+    return None
+
+
+def _mathdx_include_paths() -> list[str]:
+    configured = os.environ.get("MATHDX_ROOT")
+    if configured:
+        root = Path(configured).expanduser()
+        includes = _mathdx_root_includes(root)
+        if includes is None:
+            raise RuntimeError(
+                f"MATHDX_ROOT={root} is invalid; expected include/cublasdx.hpp and "
+                "external/cutlass/include."
+            )
+        return includes
+
+    # pip-installed nvidia-mathdx: site-packages/nvidia/mathdx[/<version>].
+    site_mathdx = Path(torch.__file__).resolve().parent.parent / "nvidia" / "mathdx"
+    if site_mathdx.is_dir():
+        for root in (site_mathdx, *sorted(site_mathdx.iterdir(), reverse=True)):
+            includes = _mathdx_root_includes(root)
+            if includes is not None:
+                return includes
+
+    candidates: list[Path] = []
+    for variable in ("CPATH", "CPLUS_INCLUDE_PATH"):
+        candidates.extend(
+            Path(entry).expanduser()
+            for entry in os.environ.get(variable, "").split(os.pathsep)
+            if entry
+        )
+    candidates.extend((Path("/usr/local/include"), Path("/usr/include")))
+    dx_paths = [path for path in candidates if (path / "cublasdx.hpp").is_file()]
+    cute_paths = [path for path in candidates if (path / "cute" / "tensor.hpp").is_file()]
+    if dx_paths and cute_paths:
+        return list(dict.fromkeys(str(path.resolve()) for path in dx_paths + cute_paths))
+    raise RuntimeError(
+        "cuBLASDx headers are not visible. Run:\n"
+        "  export MATHDX_ROOT=/absolute/path/to/nvidia/mathdx/26.06\n"
+        "or add both the MathDx and compatible CUTLASS include directories to CPATH."
+    )
+
+
+def _current_arch() -> tuple[str, int]:
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) == (8, 9):
+        return "sm89", 890
+    if (major, minor) == (10, 0):
+        return "sm100a", 1000
+    raise RuntimeError(
+        f"cuBLASDx rank-2k currently supports SM89 and B200 SM100a, got SM{major}{minor}"
+    )
+
+
+@contextmanager
+def _extension_arch(arch_name: str):
+    old = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a" if arch_name == "sm100a" else "8.9"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = old
+
+
+def _build_directory(name: str) -> str:
+    path = _BUILD_ROOT / name
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+@lru_cache(maxsize=1)
+def _load_cublas_module():
+    name = "eigh_rank2k_cublas_v2"
+    return load_inline(
+        name,
+        cpp_sources=_CPP_SOURCE,
+        cuda_sources=_COMMON_CUDA_SOURCE,
+        functions=None,
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+        extra_ldflags=_cublas_link_flags(),
+        build_directory=_build_directory(name),
+        verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
+    )
+
+
+@lru_cache(maxsize=None)
+def _load_cublasdx_module(panel_size: int, arch_name: str, arch: int):
+    name = f"eigh_rank2k_cublasdx_ps{panel_size}_{arch_name}_v4"
+    cuda_source = _COMMON_CUDA_SOURCE + _CUBLASDX_CUDA_SOURCE
+    flags = [
+        "-O3",
+        "-std=c++17",
+        "-lineinfo",
+        f"-DEIGH_PANEL_SIZE={panel_size}",
+        f"-DEIGH_DX_ARCH={arch}",
+        "-DEIGH_WITH_CUBLASDX=1",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+    ]
+    with _extension_arch(arch_name):
+        return load_inline(
+            name,
+            cpp_sources=_CPP_SOURCE,
+            cuda_sources=cuda_source,
+            functions=None,
+            extra_include_paths=_mathdx_include_paths(),
+            extra_cflags=["-O3", "-std=c++17", "-DEIGH_WITH_CUBLASDX=1"],
+            extra_cuda_cflags=flags,
+            extra_ldflags=_cublas_link_flags(),
+            build_directory=_build_directory(name),
+            verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
+        )
+
+
+def _validate_python_inputs(
+    data: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    k: int,
+    panel_size: int,
+) -> None:
+    if not 1 <= panel_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
+    if k < 0:
+        raise ValueError(f"k must be non-negative, got {k}")
+    if data.ndim != 3 or data.shape[1] != data.shape[2]:
+        raise ValueError(f"data must have shape (batch, N, N), got {tuple(data.shape)}")
+    if k * panel_size + panel_size >= data.shape[1]:
+        raise ValueError("k * panel_size + panel_size must be less than N")
+    if v.shape != w.shape or v.ndim != 3:
+        raise ValueError("V and W must have identical 3D shapes")
+
+
+def warm_rank2k_backend(panel_size: int, backend: Rank2KBackend) -> None:
+    """Compile/load a backend before CUDA graph capture."""
+    if not 1 <= panel_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
+    if backend == "cublas":
+        _load_cublas_module()
+    elif backend == "cublasdx":
+        arch_name, arch = _current_arch()
+        _load_cublasdx_module(panel_size, arch_name, arch)
+    else:
+        raise ValueError(f"unsupported rank-2k backend: {backend!r}")
+
+
+def rank2k_update_(
+    data: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    k: int,
+    panel_size: int,
+    backend: Rank2KBackend,
+) -> torch.Tensor:
+    """Apply the post-panel DLATRD update to ``data`` in place."""
+    _validate_python_inputs(data, v, w, k, panel_size)
+    if backend == "cublas":
+        return _load_cublas_module().cublas_rank2k_(data, v, w, k, panel_size)
+    if backend == "cublasdx":
+        arch_name, arch = _current_arch()
+        module = _load_cublasdx_module(panel_size, arch_name, arch)
+        return module.cublasdx_rank2k_(data, v, w, k)
+    raise ValueError(f"unsupported rank-2k backend: {backend!r}")
+
 
 class Eigh:
     def __init__(
@@ -264,7 +757,7 @@ class Eigh:
         threads_per_row: Optional[int] = None,
     ):
         assert k >= 0
-        assert panel_size > 0
+        assert 1 <= panel_size <= MAX_PANEL_SIZE
         assert k * panel_size + panel_size < N
         self.dtype = dtype
         self.N = N
@@ -497,7 +990,19 @@ class Eigh:
         for m in cutlass.range(tiler_n // num_threads):
             sB[tidx + m * num_threads] = self.reduction_dtype(0.0)
 
-        for i in cutlass.range(self.panel_size, unroll_full=True):
+        # Fully unrolling through 32 keeps the current fast small-panel code.  At
+        # larger widths a four-column partial unroll avoids the 64/128-iteration
+        # code-size and compile-time cliff while preserving some ILP.
+        panel_unroll = const_expr(0)
+        panel_unroll_full = const_expr(True)
+        if const_expr(self.panel_size > 32):
+            panel_unroll = const_expr(4)
+            panel_unroll_full = const_expr(False)
+        for i in cutlass.range(
+            self.panel_size,
+            unroll=panel_unroll,
+            unroll_full=panel_unroll_full,
+        ):
             col = panel_start + i
             mCol = cute.domain_offset((panel_row_base,), mData[bidx, None, col])
             gCol = cute.local_tile(mCol, (tiler_n,), (0,))
@@ -797,6 +1302,41 @@ class Eigh:
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
+
+
+def run_panel_with_update(
+    data: torch.Tensor,
+    tri: torch.Tensor,
+    v_ws: torch.Tensor,
+    w_ws: torch.Tensor,
+    *,
+    k: int = 0,
+    panel_size: int = 1,
+    backend: Rank2KBackend = "cublas",
+    debug_printf: bool = False,
+    threads_per_row: Optional[int] = None,
+) -> torch.Tensor:
+    """Factor one DLATRD panel, then update its unreduced trailing block.
+
+    ``data`` is deliberately mutated by the rank-2k update.  The panel kernel and
+    native backend both use PyTorch's current CUDA stream, so their launch order is
+    sufficient and no host synchronization is required.
+    """
+    if data.dtype not in torch2cute_dtype_map:
+        raise TypeError(f"unsupported data dtype: {data.dtype}")
+    if not 1 <= panel_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
+    data_dtype = torch2cute_dtype_map[data.dtype]
+    compiled = Eigh.compile(
+        data_dtype,
+        data.size(1),
+        debug_printf=debug_printf,
+        k=k,
+        panel_size=panel_size,
+        threads_per_row=threads_per_row,
+    )
+    compiled(data, tri, v_ws, w_ws)
+    return rank2k_update_(data, v_ws, w_ws, k, panel_size, backend)
 
 def custom_kernel_old(data: input_t) -> output_t:
     values, vectors = torch.linalg.eigh(data)

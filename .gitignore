@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+nvidia-mathdx-*/
+*.deb
+*.tar.gz
