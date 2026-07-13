@@ -9,6 +9,10 @@ the word "stream".
 Usage:
     modal run eigh_bench_b200_modal.py --cases 640x512 --panel-size 8 \
         --backends cublas,cublasdx --repeats 3
+    # full tridiagonalization (one timed call = one full factorization,
+    # so keep --calls small):
+    modal run eigh_bench_b200_modal.py --cases 640x512 --panel-size 16 \
+        --backends cublas --tri --calls 20 --repeats 3
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
 """
@@ -56,6 +60,47 @@ image = (
     # torch-only module (pandas/triton imports are TYPE_CHECKING / unused paths);
     # mounted flat and re-registered as quack.bench.bench_utils inside bench().
     .add_local_file("quack/quack/bench/bench_utils.py", "/workspace/bench_utils.py", copy=False)
+)
+
+# IKET first ships with CuTe DSL 4.6. Keep it in a separate image so the
+# performance benchmark above remains pinned to its established 4.5.2 compiler.
+trace_image = (
+    modal.Image.from_registry("nvidia/cuda:13.1.1-devel-ubuntu24.04", add_python="3.13")
+    .entrypoint([])
+    .pip_install(
+        "nvidia-cutlass-dsl[cu13]==4.6.0",
+        "apache-tvm-ffi",
+        "torch==2.12.0",
+        "ninja",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
+    )
+    .add_local_dir(
+        "nvidia-mathdx-26.06.0-cuda13",
+        "/opt/mathdx",
+        copy=True,
+        ignore=["**/doc/**", "**/example/**", "**/__pycache__"],
+    )
+    .env(
+        {
+            "MATHDX_ROOT": "/opt/mathdx/nvidia/mathdx/26.06",
+            # IKET re-runs the workload in separate compiler passes. Loading an
+            # exported object would bypass instrumentation, so disk caching is off.
+            "EIGH_ENABLE_DISK_CACHE": "0",
+            "TMPDIR": "/cache/tmp",
+        }
+    )
+    .add_local_file("eigh.py", "/workspace/eigh.py", copy=False)
+    .add_local_file(
+        "eigh_bench_local_rtx4050.py",
+        "/workspace/eigh_bench_local_rtx4050.py",
+        copy=False,
+    )
+    # Namespace-package placement lets the runner import this in its child process.
+    .add_local_file(
+        "quack/quack/bench/bench_utils.py",
+        "/workspace/quack/bench/bench_utils.py",
+        copy=False,
+    )
 )
 
 app = modal.App("eigh-b200-bench", image=image)
@@ -129,6 +174,7 @@ def bench(
     matmul_precision: str,
     seed: int,
     bench_eigh: bool,
+    tri: bool,
 ) -> None:
     import os
     import sys
@@ -169,6 +215,56 @@ def bench(
         # Gates run under strict fp32 matmul (reset per case: a previous case's
         # timed phase may have lowered it).
         torch.set_float32_matmul_precision("highest")
+
+        if tri:
+            # Full-tridiagonalization mode: D/E gate, then graph-captured
+            # kernel driver vs the fair torch driver. One timed call is a full
+            # factorization (tens of ms) — pass a small --calls (e.g. 20).
+            tri_backends = backends or ["cublas"]
+            gate_results = [runner.check_tridiag(data, be) for be in tri_backends]
+            if not all(gate_results):
+                print(f"{label}: TRIDIAG GATE FAILED — skipping timings", flush=True)
+                summaries.append(f"{label}: TRIDIAG GATE FAILED")
+                failed = True
+                continue
+            torch.set_float32_matmul_precision(matmul_precision)
+            parts = []
+            first_ms = None
+            for be in tri_backends:
+                samples, n_sets = runner.benchmark_tridiag(
+                    data, be, sets, calls, warmup_ms, repeats
+                )
+                tri_ms = runner.select_sample(samples, stat)
+                if first_ms is None:
+                    first_ms = tri_ms
+                print(
+                    f"tridiag_{be} sets={n_sets} samples_ms={[f'{s:.4f}' for s in samples]}",
+                    flush=True,
+                )
+                parts.append(f"tridiag_{be}={tri_ms:.4f}ms")
+            samples, n_sets = runner.benchmark_torch_tridiag(
+                data, sets, calls, warmup_ms, repeats
+            )
+            torch_tri_ms = runner.select_sample(samples, stat)
+            print(
+                f"torch_tridiag sets={n_sets} samples_ms={[f'{s:.4f}' for s in samples]}",
+                flush=True,
+            )
+            parts.append(f"torch_tridiag={torch_tri_ms:.4f}ms")
+            parts.append(f"ratio={torch_tri_ms / first_ms:.3f}x")
+            if bench_eigh:
+                samples, n_sets = _bench_torch_eigh(data, max(10, calls // 10), repeats)
+                eigh_ms = runner.select_sample(samples, stat)
+                print(
+                    f"torch_eigh sets={n_sets} samples_ms={[f'{s:.4f}' for s in samples]}",
+                    flush=True,
+                )
+                parts.append(f"torch_eigh={eigh_ms:.4f}ms")
+            summaries.append(f"{label}: " + " ".join(parts))
+            del data
+            torch.cuda.empty_cache()
+            continue
+
         if not runner.check_gemv_allclose(data, k):
             print(f"{label}: PANEL GATE FAILED — skipping timings", flush=True)
             summaries.append(f"{label}: PANEL GATE FAILED")
@@ -241,6 +337,90 @@ def bench(
         raise SystemExit("one or more correctness gates failed")
 
 
+@app.function(image=trace_image, gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
+def trace_panel(
+    batch: int,
+    n: int,
+    panel_size: int,
+    k: int,
+    seed: int,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Gate and trace one panel launch, returning volume paths for its artifacts."""
+    from datetime import datetime, timezone
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    os.makedirs("/cache/tmp", exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_name = f"n{n}_ps{panel_size}_k{k}_{stamp}"
+    output_dir = Path("/cache/iket") / run_name
+
+    env = os.environ.copy()
+    env["EIGH_ENABLE_DISK_CACHE"] = "0"
+    env["PYTHONPATH"] = "/workspace"
+    workload = [
+        sys.executable,
+        "/workspace/eigh_bench_local_rtx4050.py",
+        "--batch",
+        str(batch),
+        "--n",
+        str(n),
+        "--panel-size",
+        str(panel_size),
+        "--k",
+        str(k),
+        "--seed",
+        str(seed),
+        "--skip-expected",
+    ]
+
+    _report_env("trace")
+    print("=== CuTe 4.6 panel correctness preflight ===", flush=True)
+    preflight = subprocess.run(workload + ["--check-panel-only"], env=env)
+    if preflight.returncode != 0:
+        raise RuntimeError(f"CuTe 4.6 panel correctness preflight failed: {preflight.returncode}")
+
+    command = [
+        "run-iket",
+        "--output-dir",
+        str(output_dir),
+        "--clobber",
+        "profile",
+        "--postprocess",
+        "all",
+        "--max-ts-cnt-per-warp",
+        # Sixteen nested ranges per column plus panel/setup metadata: panel
+        # size 128 emits 4100 timestamps per warp, so reserve the next power of two.
+        "8192",
+        "--",
+        *workload,
+        "--trace-once",
+    ]
+    print("=== IKET panel trace ===", flush=True)
+    print("command: " + " ".join(command), flush=True)
+    profiled = subprocess.run(command, env=env)
+    if profiled.returncode != 0:
+        raise RuntimeError(f"run-iket failed: {profiled.returncode}")
+
+    artifacts = sorted(
+        path
+        for path in output_dir.rglob("*")
+        if path.is_file() and path.suffix in (".pftrace", ".json") and path.stat().st_size > 0
+    )
+    if not artifacts:
+        raise RuntimeError(f"run-iket produced no nonempty trace artifacts under {output_dir}")
+
+    cache_vol.commit()
+    result = [
+        (str(path.relative_to(output_dir)), str(path.relative_to("/cache")))
+        for path in artifacts
+    ]
+    print(f"IKET artifacts: {[relative for relative, _ in result]}", flush=True)
+    return run_name, result
+
+
 @app.local_entrypoint()
 def main(
     cases: str = "640x512",
@@ -255,6 +435,10 @@ def main(
     matmul_precision: str = "high",
     seed: int = 0,
     bench_eigh: bool = False,
+    tri: bool = False,
+    trace: bool = False,
+    trace_batch: int = 1,
+    trace_output: str = "profiles/eigh_iket",
 ) -> None:
     parsed_cases = []
     for item in cases.split(","):
@@ -266,6 +450,30 @@ def main(
             raise SystemExit(f"unknown backend: {backend}")
     if stat not in ("min", "mean", "median"):
         raise SystemExit(f"unknown stat: {stat}")
+    if trace:
+        if len(parsed_cases) != 1:
+            raise SystemExit("--trace requires exactly one --cases entry")
+        if trace_batch <= 0:
+            raise SystemExit("--trace-batch must be positive")
+        _, n = parsed_cases[0]
+        run_name, artifacts = trace_panel.remote(trace_batch, n, panel_size, k, seed)
+
+        from pathlib import Path
+
+        destination = Path(trace_output) / run_name
+        cache_vol.reload()
+        downloaded: list[Path] = []
+        for relative, remote_path in artifacts:
+            local_path = destination / relative
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as fileobj:
+                cache_vol.read_file_into_fileobj(remote_path, fileobj)
+            downloaded.append(local_path)
+            print(f"downloaded {local_path}")
+        for path in downloaded:
+            if path.suffix == ".pftrace":
+                print(f"Perfetto trace: {path} (open in https://ui.perfetto.dev/)")
+        return
     bench.remote(
         parsed_cases,
         panel_size,
@@ -279,4 +487,5 @@ def main(
         matmul_precision,
         seed,
         bench_eigh,
+        tri,
     )

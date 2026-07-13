@@ -37,21 +37,20 @@ def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> 
     return data.contiguous()
 
 
-def make_workspace(data: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def make_workspace(data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # V/W panel workspace in gmem; must be zero-allocated (see Eigh.workspace_shape).
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
-    rows, cols = eigh.Eigh(data_dtype, data.size(1), k=k, panel_size=PANEL_SIZE).workspace_shape()
+    rows, cols = eigh.Eigh(data_dtype, data.size(1), panel_size=PANEL_SIZE).workspace_shape()
     v_ws = torch.zeros(data.size(0), rows, cols, device=data.device, dtype=torch.float32)
     return v_ws, torch.zeros_like(v_ws)
 
 
-def run_direct(data: torch.Tensor, k: int = 0) -> torch.Tensor:
-    data_dtype = eigh.torch2cute_dtype_map[data.dtype]
-    tri = torch.full_like(data, float("nan"))
-    v_ws, w_ws = make_workspace(data, k)
-    compiled = eigh.Eigh.compile(data_dtype, data.size(1), k=k, panel_size=PANEL_SIZE)
-    compiled(data, tri, v_ws, w_ws)
-    return tri
+def make_de(data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # LAPACK/cuSOLVER-style outputs: D (batch, N) diagonal, E (batch, N-1) subdiagonal.
+    b, n = data.size(0), data.size(1)
+    D = torch.empty(b, n, device=data.device, dtype=torch.float32)
+    E = torch.empty(b, n - 1, device=data.device, dtype=torch.float32)
+    return D, E
 
 
 def factor_panel(
@@ -59,23 +58,22 @@ def factor_panel(
     k: int,
     *,
     debug_printf: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
-    tri = torch.empty_like(data)
-    v_ws, w_ws = make_workspace(data, k)
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
     compiled = eigh.Eigh.compile(
         data_dtype,
         data.size(1),
         debug_printf=debug_printf,
-        k=k,
         panel_size=PANEL_SIZE,
     )
-    compiled(data, tri, v_ws, w_ws)
-    return tri, v_ws, w_ws
+    compiled(data, D, E, v_ws, w_ws, k * PANEL_SIZE)
+    return D, E, v_ws, w_ws
 
 
 def check_rank2k_backend(data: torch.Tensor, k: int, backend: str) -> bool:
-    _, v_ws, w_ws = factor_panel(data, k)
+    _, _, v_ws, w_ws = factor_panel(data, k)
     panel_start = k * PANEL_SIZE
     panel_n = data.size(1) - panel_start - 1
     # dsytrd.f DSYR2K offsets: the trailing block starts at global row/col
@@ -89,7 +87,7 @@ def check_rank2k_backend(data: torch.Tensor, k: int, backend: str) -> bool:
         + torch.bmm(w_trailing, v_trailing.transpose(1, 2))
     )
     actual = data.clone()
-    eigh.rank2k_update_(actual, v_ws, w_ws, k, PANEL_SIZE, backend)
+    eigh.rank2k_update_(actual, v_ws, w_ws, panel_start, PANEL_SIZE, backend)
     torch.cuda.synchronize()
     diff = (actual - expected).abs()
     max_abs = diff.max().item()
@@ -116,7 +114,7 @@ def benchmark_rank2k(
     warmup_target_ms: float,
     repeats: int,
 ) -> tuple[list[float], int]:
-    _, v_ws, w_ws = factor_panel(data, k)
+    _, _, v_ws, w_ws = factor_panel(data, k)
     eigh.warm_rank2k_backend(PANEL_SIZE, backend)
     base_args = (data.clone(),)
     base_kwargs = {}
@@ -132,7 +130,7 @@ def benchmark_rank2k(
             work,
             v_ws,
             w_ws,
-            k,
+            k * PANEL_SIZE,
             PANEL_SIZE,
             backend,
             queue_handle=torch.cuda.current_stream().cuda_stream,
@@ -166,12 +164,11 @@ def benchmark_panel_with_update(
         data_dtype,
         data.size(1),
         debug_printf=False,
-        k=k,
         panel_size=PANEL_SIZE,
     )
     eigh.warm_rank2k_backend(PANEL_SIZE, backend)
-    tri = torch.empty_like(data)
-    v_ws, w_ws = make_workspace(data, k)
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
     # The public input must remain available to the eventual residual checker, so
     # combined timing includes the explicit source -> working-matrix copy.
     base_args = (data, data.clone())
@@ -182,13 +179,13 @@ def benchmark_panel_with_update(
 
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
-        compiled(work, tri, v_ws, w_ws)
+        compiled(work, D, E, v_ws, w_ws, k * PANEL_SIZE)
         # Capture-time current stream: see benchmark_rank2k.
         eigh.rank2k_update_(
             work,
             v_ws,
             w_ws,
-            k,
+            k * PANEL_SIZE,
             PANEL_SIZE,
             backend,
             queue_handle=torch.cuda.current_stream().cuda_stream,
@@ -221,15 +218,14 @@ def benchmark_direct(
         data_dtype,
         data.size(1),
         debug_printf=False,
-        k=k,
         panel_size=PANEL_SIZE,
     )
-    # Rotate only the input matrices: tri is untouched by the non-debug kernel, the
-    # V/W workspace is fully rewritten in its valid region every call, and the torch
-    # baseline's out is tiny — so sharing them keeps the auto-picked set counts and
+    # Rotate only the input matrices: D/E and the V/W workspace are fully
+    # rewritten in their valid regions every call, and the torch baseline's
+    # outputs are tiny — so sharing them keeps the auto-picked set counts and
     # per-set memory traffic identical between the kernel and torch benches.
-    tri = torch.empty_like(data)
-    v_ws, w_ws = make_workspace(data, k)
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
     base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
@@ -237,7 +233,7 @@ def benchmark_direct(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(bench_data: torch.Tensor) -> None:
-        compiled(bench_data, tri, v_ws, w_ws)
+        compiled(bench_data, D, E, v_ws, w_ws, k * PANEL_SIZE)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -255,40 +251,58 @@ def benchmark_direct(
 
 def torch_dlatrd_panel(
     data: torch.Tensor,
-    k: int,
+    panel_start: int,
+    panel_size: int,
     V: torch.Tensor | None = None,
     W: torch.Tensor | None = None,
+    D: torch.Tensor | None = None,
+    E: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Fair cuBLAS baseline: the same op sequence as the kernel's panel, per column i —
     # column refresh (i>0), reflector with LAPACK's v[i] = 1 convention, b = stale
     # trailing A @ v, inner GEMVs s_w = W^T v / s_v = V^T v, outer corrections
     # b -= V s_w + W s_v, then w = tau*b + (-tau/2)(w^T v) v — accumulating v/w into
     # V/W (batch, m, panel_size), mirroring the kernel's gmem workspace appends.
+    # When D/E are provided, the kernel's per-column D/E stores are mirrored too:
+    # E[col] = beta; D[col] = raw diagonal minus its refresh correction (the
+    # diagonal of column i sits at v-row i-1), raw copy at i = 0.
     # At panel_size=1 this reduces to the old reflector->GEMV->w baseline.
     # No zero-tail edge handling: benchmark inputs are dense random symmetric, and the
     # kernel's tau=2 fallback is a valid sign-flip reflector under residual gating.
     # Everything here must stay CUDA-graph-capture-safe (no .any()/boolean indexing;
     # slice bounds are Python ints, so the panel loop unrolls into the graph).
-    panel_start = k * PANEL_SIZE
     m = data.size(1) - panel_start - 1
     if V is None:
-        V = torch.empty(data.size(0), m, PANEL_SIZE, device=data.device, dtype=data.dtype)
+        V = torch.empty(data.size(0), m, panel_size, device=data.device, dtype=data.dtype)
     if W is None:
         W = torch.empty_like(V)
     trailing = data[:, panel_start + 1 :, panel_start + 1 :]
-    for i in range(PANEL_SIZE):
-        x = data[:, panel_start + 1 + i :, panel_start + i]
+    for i in range(panel_size):
+        col = panel_start + i
+        x = data[:, panel_start + 1 + i :, col]
         if i > 0:
+            # Refresh coefficient row = the diagonal row of column i, v-space
+            # row i-1 (dlatrd.f reads W(I,1)/A(I,1), local row I).
             Vp, Wp = V[:, :, :i], W[:, :, :i]
             corr = (
-                torch.bmm(Vp[:, i:], W[:, i, :i].unsqueeze(2))
-                + torch.bmm(Wp[:, i:], V[:, i, :i].unsqueeze(2))
+                torch.bmm(Vp[:, i:], W[:, i - 1, :i].unsqueeze(2))
+                + torch.bmm(Wp[:, i:], V[:, i - 1, :i].unsqueeze(2))
             ).squeeze(2)
             x = x - corr
+        if D is not None:
+            if i == 0:
+                D[:, col] = data[:, col, col]
+            else:
+                # Diagonal element: row and coefficient row coincide (both i-1).
+                D[:, col] = data[:, col, col] - 2 * (
+                    V[:, i - 1, :i] * W[:, i - 1, :i]
+                ).sum(dim=1)
         norm = x.norm(dim=1)
         alpha = x[:, 0]
         beta = torch.where(alpha < 0, norm, -norm)
         tau = (beta - alpha) / beta
+        if E is not None:
+            E[:, col] = beta
         v = V[:, :, i]
         v[:, :i] = 0
         v[:, i:] = x / (alpha - beta).unsqueeze(1)
@@ -304,23 +318,209 @@ def torch_dlatrd_panel(
     return V, W
 
 
+def _panel_spans(n: int, panel_size: int) -> list[tuple[int, int]]:
+    # The N-1 reflector columns split into full panels plus one tail panel.
+    full, tail = divmod(n - 1, panel_size)
+    spans = [(j * panel_size, panel_size) for j in range(full)]
+    if tail:
+        spans.append((full * panel_size, tail))
+    return spans
+
+
+def torch_tridiag_reference(data: torch.Tensor, panel_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """float64 D/E ground truth: the full blocked DLATRD + DSYR2K recurrence."""
+    A = data.double().clone()
+    b, n = A.size(0), A.size(1)
+    D = torch.empty(b, n, device=A.device, dtype=torch.float64)
+    E = torch.empty(b, n - 1, device=A.device, dtype=torch.float64)
+    for start, size in _panel_spans(n, panel_size):
+        V, W = torch_dlatrd_panel(A, start, size, D=D, E=E)
+        off = start + size
+        # Trailing rows of the panel vectors: v-row p maps to global row
+        # start+1+p, so the block starting at global `off` is p >= size-1.
+        Vt = V[:, size - 1 :, :]
+        Wt = W[:, size - 1 :, :]
+        A[:, off:, off:] -= torch.bmm(Vt, Wt.transpose(1, 2)) + torch.bmm(
+            Wt, Vt.transpose(1, 2)
+        )
+    D[:, -1] = A[:, -1, -1]
+    return D, E
+
+
+def torch_tridiag_driver(
+    source: torch.Tensor,
+    work: torch.Tensor,
+    D: torch.Tensor,
+    E: torch.Tensor,
+    V: torch.Tensor,
+    W: torch.Tensor,
+) -> None:
+    # Fair cuBLAS baseline for the full tridiagonalization: the kernel path's
+    # exact op sequence — source copy, per-panel DLATRD chain (incl. D/E
+    # writes), two bmm rank-2k updates per panel, final D gather. Capture-safe.
+    n = source.size(1)
+    work.copy_(source)
+    for start, size in _panel_spans(n, PANEL_SIZE):
+        m = n - start - 1
+        torch_dlatrd_panel(
+            work, start, size, V=V[:, :m, :size], W=W[:, :m, :size], D=D, E=E
+        )
+        off = start + size
+        Vt = V[:, size - 1 : m, :size]
+        Wt = W[:, size - 1 : m, :size]
+        work[:, off:, off:] -= torch.bmm(Vt, Wt.transpose(1, 2)) + torch.bmm(
+            Wt, Vt.transpose(1, 2)
+        )
+    D[:, -1] = work[:, -1, -1]
+
+
 def check_gemv_allclose(data: torch.Tensor, k: int) -> bool:
-    tri = run_direct(data, k)
+    D, E, _, w_ws = factor_panel(data, k)
     torch.cuda.synchronize()
     panel_start = k * PANEL_SIZE
-    _, w_ref = torch_dlatrd_panel(data.float(), k)
+    panel_n = data.size(1) - panel_start - 1
+    D_ref, E_ref = make_de(data)
+    _, w_ref = torch_dlatrd_panel(data.float(), panel_start, PANEL_SIZE, D=D_ref, E=E_ref)
     close = True
     max_rel = 0.0
     for i in range(PANEL_SIZE):
-        w_kernel = tri[:, panel_start + 1 :, panel_start + i].float()
+        # The kernel's w columns live in the gmem workspace rows (mTri is gone).
+        w_kernel = w_ws[:, i, :panel_n]
         close &= torch.allclose(w_kernel, w_ref[:, :, i], rtol=1e-3, atol=1e-2)
         rel = (
             (w_kernel - w_ref[:, :, i]).abs().max()
             / w_ref[:, :, i].abs().max().clamp_min(1e-30)
         ).item()
         max_rel = max(max_rel, rel)
-    print(f"w check: allclose={close} max_rel={max_rel:.3e} (over {PANEL_SIZE} cols)", flush=True)
+    cols = slice(panel_start, panel_start + PANEL_SIZE)
+    d_close = torch.allclose(D[:, cols], D_ref[:, cols], rtol=1e-3, atol=1e-2)
+    e_close = torch.allclose(E[:, cols], E_ref[:, cols], rtol=1e-3, atol=1e-2)
+    close &= d_close and e_close
+    print(
+        f"w check: allclose={close} max_rel={max_rel:.3e} (over {PANEL_SIZE} cols) "
+        f"D={d_close} E={e_close}",
+        flush=True,
+    )
     return close
+
+
+def check_tridiag(data: torch.Tensor, backend: str) -> bool:
+    work = data.clone()
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
+    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    torch.cuda.synchronize()
+    finite = bool(torch.isfinite(D).all().item() and torch.isfinite(E).all().item())
+    D_ref, E_ref = torch_tridiag_reference(data, PANEL_SIZE)
+    d_scale = D_ref.abs().max().clamp_min(1e-30)
+    per_mat = (D.double() - D_ref).abs().max(dim=1).values / d_scale
+    d_med, d_max = per_mat.median().item(), per_mat.max().item()
+    e_max = ((E.double() - E_ref).abs().max() / E_ref.abs().max().clamp_min(1e-30)).item()
+    # fp32 and fp64 Householder trajectories legitimately bifurcate at
+    # near-cancellations (both remain valid factorizations), so elementwise
+    # divergence vs the fp64 mirror is heavy-tailed (max ~4e-1 at 640x512 with
+    # eigenvalues still matching to 5e-8). The hard gate is semantic:
+    # eigenvalues of the kernel's T vs A in fp64 on the elementwise-worst
+    # matrices — a recurrence bug measures ~1e-1 there, healthy runs ~5e-8.
+    eig_rel = 0.0
+    for row in per_mat.topk(min(3, data.size(0))).indices.tolist():
+        T = (
+            torch.diag(D[row].double())
+            + torch.diag(E[row].double(), 1)
+            + torch.diag(E[row].double(), -1)
+        )
+        ev_t = torch.linalg.eigvalsh(T)
+        ev_a = torch.linalg.eigvalsh(data[row].double())
+        eig_rel = max(eig_rel, ((ev_t - ev_a).abs().max() / ev_a.abs().max()).item())
+    close = finite and eig_rel <= 1e-4 and d_med <= 1e-2
+    print(
+        f"tridiag {backend}: ok={close} eig_rel={eig_rel:.3e} (worst-3 mats) "
+        f"D rel median={d_med:.3e} max={d_max:.3e} E max={e_max:.3e} (ps={PANEL_SIZE})",
+        flush=True,
+    )
+    return close
+
+
+def benchmark_tridiag(
+    data: torch.Tensor,
+    backend: str,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
+    eigh.warm_rank2k_backend(PANEL_SIZE, backend)
+    tail = (data.size(1) - 1) % PANEL_SIZE
+    if tail and backend == "cublasdx":
+        eigh.warm_rank2k_backend(tail, backend)
+    base_args = (data, data.clone())
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(source: torch.Tensor, work: torch.Tensor) -> None:
+        work.copy_(source)
+        # Capture-time current stream: see benchmark_rank2k.
+        eigh.tridiagonalize_(
+            work,
+            D,
+            E,
+            v_ws,
+            w_ws,
+            panel_size=PANEL_SIZE,
+            backend=backend,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def benchmark_torch_tridiag(
+    data: torch.Tensor,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    b, n = data.size(0), data.size(1)
+    D, E = make_de(data)
+    V = torch.empty(b, n - 1, PANEL_SIZE, device=data.device, dtype=data.dtype)
+    W = torch.empty_like(V)
+    base_args = (data, data.clone())
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(source: torch.Tensor, work: torch.Tensor) -> None:
+        torch_tridiag_driver(source, work, D, E, V, W)
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
 
 
 def benchmark_torch_panel(
@@ -343,8 +543,11 @@ def benchmark_torch_panel(
         n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
+    # The kernel path writes D/E; the fair baseline must produce them too.
+    D, E = make_de(data)
+
     def launch(bench_data: torch.Tensor) -> None:
-        torch_dlatrd_panel(bench_data, k, V=V, W=W)
+        torch_dlatrd_panel(bench_data, panel_start, PANEL_SIZE, V=V, W=W, D=D, E=E)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -449,6 +652,13 @@ def main() -> None:
         help="Post-panel trailing rank-2k backend to validate and benchmark.",
     )
     parser.add_argument(
+        "--tri",
+        action="store_true",
+        help="Full-tridiagonalization mode: D/E gate vs the float64 blocked "
+        "recurrence, plus (with --bench) kernel driver vs fair torch driver. "
+        "One timed call is a full factorization, so use small --bench-calls.",
+    )
+    parser.add_argument(
         "--expected-preview",
         type=int,
         default=16,
@@ -473,6 +683,16 @@ def main() -> None:
         "--bench",
         action="store_true",
         help="Benchmark the direct CuTe kernel with CUDA graph replay and L2-rotated tensors.",
+    )
+    parser.add_argument(
+        "--trace-once",
+        action="store_true",
+        help="Launch exactly one panel kernel for an external intra-kernel profiler.",
+    )
+    parser.add_argument(
+        "--check-panel-only",
+        action="store_true",
+        help="Run only the panel correctness gate and exit.",
     )
     parser.add_argument(
         "--bench-sets",
@@ -512,6 +732,8 @@ def main() -> None:
         "(applied after the strict-fp32 allclose check).",
     )
     args = parser.parse_args()
+    if sum((args.bench, args.trace_once, args.check_panel_only)) > 1:
+        parser.error("--bench, --trace-once, and --check-panel-only are mutually exclusive")
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
     if args.bench_warmup_ms < 0:
@@ -538,7 +760,63 @@ def main() -> None:
     print(f"panel debug: k={args.k} panel_size={PANEL_SIZE} panel_start={panel_start}", flush=True)
     if args.batch != 1:
         print("note: current debug kernel prints only the reflector for mData[0]", flush=True)
+
+    if args.trace_once:
+        factor_panel(data, args.k, debug_printf=False)
+        torch.cuda.synchronize()
+        print("trace workload: one panel launch complete", flush=True)
+        return
+
+    if args.check_panel_only:
+        if not check_gemv_allclose(data, args.k):
+            raise SystemExit("panel correctness gate failed")
+        print("panel correctness gate passed", flush=True)
+        return
+
     # --bench implies skipping the host-side reference printout.
+    if args.tri:
+        # Full-tridiagonalization mode: D/E gate against the float64 blocked
+        # recurrence, then (with --bench) kernel driver vs the fair torch driver.
+        backend = args.update_backend if args.update_backend != "none" else "cublas"
+        if not check_tridiag(data, backend):
+            raise SystemExit(f"tridiag {backend} correctness check failed")
+        if args.bench:
+            torch.set_float32_matmul_precision(args.matmul_precision)
+            print(f"bench float32_matmul_precision={args.matmul_precision}", flush=True)
+            samples, bench_sets = benchmark_tridiag(
+                data,
+                backend,
+                args.bench_sets,
+                args.bench_calls,
+                args.bench_warmup_ms,
+                args.bench_repeats,
+            )
+            selected = select_sample(samples, args.bench_stat)
+            sample_text = ", ".join(f"{sample:.6f}" for sample in samples)
+            print(f"bench tridiag_{backend} sets={bench_sets}", flush=True)
+            print(f"bench tridiag_{backend} samples_ms=[{sample_text}]", flush=True)
+            print(
+                f"bench tridiag_{backend} {args.bench_stat}_ms={selected:.6f}", flush=True
+            )
+            torch_samples, torch_sets = benchmark_torch_tridiag(
+                data,
+                args.bench_sets,
+                args.bench_calls,
+                args.bench_warmup_ms,
+                args.bench_repeats,
+            )
+            torch_selected = select_sample(torch_samples, args.bench_stat)
+            torch_text = ", ".join(f"{sample:.6f}" for sample in torch_samples)
+            print(f"bench torch_tridiag sets={torch_sets}", flush=True)
+            print(f"bench torch_tridiag samples_ms=[{torch_text}]", flush=True)
+            print(
+                f"bench torch_tridiag {args.bench_stat}_ms={torch_selected:.6f}",
+                flush=True,
+            )
+            print(f"bench tridiag/torch ratio={torch_selected / selected:.3f}x", flush=True)
+        print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
+        return
+
     if not args.bench and not args.skip_expected:
         print_householder_reference(
             data,
@@ -627,7 +905,7 @@ def main() -> None:
         print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
         return
 
-    out = run_direct(data, args.k)
+    D, E, _, w_ws = factor_panel(data, args.k, debug_printf=True)
     torch.cuda.synchronize()
 
     if args.update_backend != "none" and not check_rank2k_backend(
@@ -635,8 +913,10 @@ def main() -> None:
     ):
         raise SystemExit(f"rank2k {args.update_backend} correctness check failed")
 
-    print(f"out: shape={tuple(out.shape)} dtype={out.dtype} device={out.device}")
-    print(f"out nan_count={torch.isnan(out).sum().item()}")
+    cols = slice(args.k * PANEL_SIZE, args.k * PANEL_SIZE + PANEL_SIZE)
+    print(f"D cols: {D[0, cols].tolist()}")
+    print(f"E cols: {E[0, cols].tolist()}")
+    print(f"w nan_count={torch.isnan(w_ws).sum().item()}")
     print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
 
 

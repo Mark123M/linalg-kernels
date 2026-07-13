@@ -1,5 +1,6 @@
 import fcntl
 import hashlib
+import importlib
 import math
 import operator
 import os
@@ -28,6 +29,14 @@ from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from task import input_t, output_t
 from torch.utils.cpp_extension import load_inline
 
+try:
+    _iket = importlib.import_module("cutlass.cute.experimental.iket")
+except ImportError:
+    _iket = None
+except NotImplementedError:
+    # The evaluation image uses CuTe DSL 4.5, before IKET was available.
+    _iket = None
+
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
@@ -52,6 +61,21 @@ _NATIVE_CUDA_CFLAGS = [
     "-Xptxas=--allow-expensive-optimizations=true",
     "-lineinfo",
 ]
+
+
+def _iket_push(name: str, payload=None) -> None:
+    """Emit a warp-level IKET range start when the compiler provides IKET."""
+    if _iket is not None:
+        if payload is None:
+            _iket.range_push(name)
+        else:
+            _iket.range_push(name, payload)
+
+
+def _iket_pop() -> None:
+    """Close the most recent IKET range; a compile-time no-op on CuTe 4.5."""
+    if _iket is not None:
+        _iket.range_pop()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -277,14 +301,14 @@ _CPP_SOURCE = r"""
 torch::Tensor cublas_rank2k_(torch::Tensor data,
                              torch::Tensor v,
                              torch::Tensor w,
-                             int64_t k,
+                             int64_t panel_start,
                              int64_t panel_size);
 
 #ifdef EIGH_WITH_CUBLASDX
 torch::Tensor cublasdx_rank2k_(torch::Tensor data,
                                torch::Tensor v,
                                torch::Tensor w,
-                               int64_t k,
+                               int64_t panel_start,
                                int64_t queue_handle);
 #endif
 
@@ -318,7 +342,7 @@ using QueueT = typename FifthArg<decltype(&cudaMemcpyAsync)>::type;
 void validate_inputs(const torch::Tensor& data,
                      const torch::Tensor& v,
                      const torch::Tensor& w,
-                     int64_t k,
+                     int64_t panel_start,
                      int64_t panel_size) {
   TORCH_CHECK(data.is_cuda() && v.is_cuda() && w.is_cuda(), "data, V, and W must be CUDA tensors");
   TORCH_CHECK(data.scalar_type() == at::kFloat && v.scalar_type() == at::kFloat &&
@@ -331,10 +355,9 @@ void validate_inputs(const torch::Tensor& data,
   TORCH_CHECK(v.dim() == 3 && w.dim() == 3 && v.sizes() == w.sizes(),
               "V and W must have identical (batch, rows, cols) shapes");
   TORCH_CHECK(v.size(0) == data.size(0), "workspace batch dimension must match data");
-  TORCH_CHECK(k >= 0, "k must be non-negative");
+  TORCH_CHECK(panel_start >= 0, "panel_start must be non-negative");
   TORCH_CHECK(panel_size >= 1 && panel_size <= 128, "panel_size must be in [1, 128]");
   TORCH_CHECK(v.size(1) >= panel_size, "workspace has fewer rows than panel_size");
-  const int64_t panel_start = k * panel_size;
   TORCH_CHECK(panel_start + panel_size < data.size(1), "panel does not fit within N");
   const int64_t panel_n = data.size(1) - panel_start - 1;
   TORCH_CHECK(v.size(2) >= panel_n, "workspace has too few columns for this panel");
@@ -350,9 +373,9 @@ void check_cublas(cublasStatus_t status, const char* operation) {
 torch::Tensor cublas_rank2k_(torch::Tensor data,
                              torch::Tensor v,
                              torch::Tensor w,
-                             int64_t k,
+                             int64_t panel_start,
                              int64_t panel_size) {
-  validate_inputs(data, v, w, k, panel_size);
+  validate_inputs(data, v, w, panel_start, panel_size);
 
   const int batch = static_cast<int>(data.size(0));
   const int n = static_cast<int>(data.size(1));
@@ -360,7 +383,7 @@ torch::Tensor cublas_rank2k_(torch::Tensor data,
   const int tiler_n = static_cast<int>(v.size(2));
   // dsytrd.f lower DSYR2K: trailing block starts at global row/col
   // panel_start + nb, i.e. workspace column p = nb - 1 (global = panel_start+1+p).
-  const int offset = static_cast<int>(k * panel_size + panel_size);
+  const int offset = static_cast<int>(panel_start + panel_size);
   const int trailing_n = n - offset;
   const int rank = static_cast<int>(panel_size);
   const long long matrix_stride = static_cast<long long>(n) * n;
@@ -547,14 +570,14 @@ __global__ void rank2k_kernel(float* data,
 torch::Tensor cublasdx_rank2k_(torch::Tensor data,
                                torch::Tensor v,
                                torch::Tensor w,
-                               int64_t k,
+                               int64_t panel_start,
                                int64_t queue_handle) {
-  validate_inputs(data, v, w, k, kPanelSize);
+  validate_inputs(data, v, w, panel_start, kPanelSize);
   const int batch = static_cast<int>(data.size(0));
   const int n = static_cast<int>(data.size(1));
   const int workspace_rows = static_cast<int>(v.size(1));
   const int tiler_n = static_cast<int>(v.size(2));
-  const int offset = static_cast<int>(k * kPanelSize + kPanelSize);
+  const int offset = static_cast<int>(panel_start + kPanelSize);
   const int trailing_n = n - offset;
   const dim3 grid((trailing_n + kTile - 1) / kTile,
                   (trailing_n + kTile - 1) / kTile,
@@ -725,17 +748,17 @@ def _validate_python_inputs(
     data: torch.Tensor,
     v: torch.Tensor,
     w: torch.Tensor,
-    k: int,
+    panel_start: int,
     panel_size: int,
 ) -> None:
     if not 1 <= panel_size <= MAX_PANEL_SIZE:
         raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
-    if k < 0:
-        raise ValueError(f"k must be non-negative, got {k}")
+    if panel_start < 0:
+        raise ValueError(f"panel_start must be non-negative, got {panel_start}")
     if data.ndim != 3 or data.shape[1] != data.shape[2]:
         raise ValueError(f"data must have shape (batch, N, N), got {tuple(data.shape)}")
-    if k * panel_size + panel_size >= data.shape[1]:
-        raise ValueError("k * panel_size + panel_size must be less than N")
+    if panel_start + panel_size >= data.shape[1]:
+        raise ValueError("panel_start + panel_size must be less than N")
     if v.shape != w.shape or v.ndim != 3:
         raise ValueError("V and W must have identical 3D shapes")
 
@@ -757,12 +780,16 @@ def rank2k_update_(
     data: torch.Tensor,
     v: torch.Tensor,
     w: torch.Tensor,
-    k: int,
+    panel_start: int,
     panel_size: int,
     backend: Rank2KBackend,
     queue_handle: int = 0,
 ) -> torch.Tensor:
     """Apply the post-panel DLATRD update to ``data`` in place.
+
+    ``panel_start`` is the panel's first global column (not necessarily a
+    multiple of ``panel_size``: the tail panel of a full tridiagonalization
+    starts wherever the full panels stop).
 
     ``queue_handle`` is a raw CUDA queue handle for the cublasdx launch; 0
     selects the default (legacy) queue, which matches torch's ambient queue in
@@ -770,13 +797,13 @@ def rank2k_update_(
     capturable in a CUDA graph. The cublas backend ignores it: torch binds its
     ambient queue to the cuBLAS handle internally.
     """
-    _validate_python_inputs(data, v, w, k, panel_size)
+    _validate_python_inputs(data, v, w, panel_start, panel_size)
     if backend == "cublas":
-        return _load_cublas_module().cublas_rank2k_(data, v, w, k, panel_size)
+        return _load_cublas_module().cublas_rank2k_(data, v, w, panel_start, panel_size)
     if backend == "cublasdx":
         arch_name, arch = _current_arch()
         module = _load_cublasdx_module(panel_size, arch_name, arch)
-        return module.cublasdx_rank2k_(data, v, w, k, queue_handle)
+        return module.cublasdx_rank2k_(data, v, w, panel_start, queue_handle)
     raise ValueError(f"unsupported rank-2k backend: {backend!r}")
 
 
@@ -785,19 +812,16 @@ class Eigh:
         self,
         dtype: Type[cutlass.Numeric],
         N: int,
-        k: int = 0,
         panel_size: int = 1,
         stage: int = 1,
         reduction_dtype=Float32,
         debug_printf: bool = True,
         threads_per_row: Optional[int] = None,
     ):
-        assert k >= 0
         assert 1 <= panel_size <= MAX_PANEL_SIZE
-        assert k * panel_size + panel_size < N
+        assert panel_size < N
         self.dtype = dtype
         self.N = N
-        self.k = k
         self.panel_size = panel_size
         self.stage = stage
         self.reduction_dtype = reduction_dtype
@@ -864,8 +888,9 @@ class Eigh:
         threads_per_row = self._threads_per_row()
         assert threads_per_row <= num_threads
         assert num_threads % threads_per_row == 0
-        panel_start = self.k * self.panel_size
-        max_panel_n = self.N - panel_start - 1
+        # panel_start is a runtime argument; layouts are sized for the widest
+        # panel (panel_start = 0) and dynamic bounds mask the shrinkage.
+        max_panel_n = self.N - 1
         tiler_n = cute.ceil_div(max_panel_n, num_threads) * num_threads
         tiled_copy = self.tiled_copy_1d(self.dtype, num_threads, is_async=True)
         matvec_tiled_copy = self.tiled_copy_2d(
@@ -909,7 +934,7 @@ class Eigh:
         """
         num_threads = self._num_threads()
         rows_per_tile = num_threads // self._threads_per_row()
-        max_panel_n = self.N - self.k * self.panel_size - 1
+        max_panel_n = self.N - 1
         tiler_n = -(-max_panel_n // num_threads) * num_threads
         rows = -(-self.panel_size // rows_per_tile) * rows_per_tile
         return rows, tiler_n
@@ -918,9 +943,11 @@ class Eigh:
     def kernel(
         self,
         mData: cute.Tensor,
-        mTri: cute.Tensor,
+        mD: cute.Tensor,
+        mE: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
+        panel_start: Int32,
         tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
         matvec_tiled_copy: cute.TiledCopy,
@@ -929,14 +956,17 @@ class Eigh:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         tv_layout = matvec_tiled_copy.layout_tv_tiled
+        _iket_push("panel")
 
-        panel_start = const_expr(self.k * self.panel_size)
-        panel_row_base = const_expr(panel_start + 1)
+        # panel_start is dynamic so one compiled kernel serves every panel of a
+        # full tridiagonalization; the derived bounds below are dynamic values
+        # (a few integer ops), and tiler_n stays sized for the widest panel.
+        panel_row_base = panel_start + 1
         panel_n = self.N - panel_row_base
         num_threads = const_expr(tiled_copy.size)
         rows_per_tile = const_expr(num_threads // threads_per_row)
         warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
-        num_tiles = const_expr(cute.ceil_div(panel_n, rows_per_tile))
+        num_tiles = cute.ceil_div(panel_n, rows_per_tile)
         num_warps = const_expr(num_threads // cute.arch.WARP_SIZE)
         # Panel columns owned per warp lane in the outer correction (j = lane + 32*m).
         jw_per_lane = const_expr(cute.ceil_div(self.panel_size, cute.arch.WARP_SIZE))
@@ -1023,8 +1053,10 @@ class Eigh:
         # sB's pad tail is read via sBBcast (masked by v's zeros) before it is ever
         # written, so it must start finite. No barrier needed here: the first
         # cross-thread read is beyond column 0's sCol-load barrier.
+        _iket_push("setup")
         for m in cutlass.range(tiler_n // num_threads):
             sB[tidx + m * num_threads] = self.reduction_dtype(0.0)
+        _iket_pop()
 
         # Fully unrolling through 32 keeps the current fast small-panel code.  At
         # larger widths a four-column partial unroll avoids the 64/128-iteration
@@ -1039,6 +1071,7 @@ class Eigh:
             unroll=panel_unroll,
             unroll_full=panel_unroll_full,
         ):
+            _iket_push("column", i)
             col = panel_start + i
             mCol = cute.domain_offset((panel_row_base,), mData[bidx, None, col])
             gCol = cute.local_tile(mCol, (tiler_n,), (0,))
@@ -1049,8 +1082,17 @@ class Eigh:
                 col_idx = tidx + m * tiled_copy.size
                 pred[0, m] = col_idx >= i and col_idx < panel_n
 
+            _iket_push("col_load_issue")
             cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
             cute.arch.cp_async_commit_group()
+            _iket_pop()
+
+            # D for the panel's first column is a raw copy: its diagonal (global
+            # row panel_start) was finalized by the previous panel's rank-2k
+            # (the trailing block starts exactly at panel_start). Issued while
+            # the column cp.async is in flight.
+            if i == 0 and tidx == 0:
+                mD[bidx, col] = Float32(mData[bidx, col, col])
 
             # Column refresh (dlatrd.f:297-300): corr[p] = sum_{j<i} V[p,j]W[i,j] +
             # W[p,j]V[i,j], accumulated in registers while the column cp.async is in
@@ -1059,29 +1101,52 @@ class Eigh:
             # consecutive p — coalesced. Coefficient reads are warp-broadcast. Dynamic
             # j-trip is CTA-uniform; no reductions/barriers inside. Reads at
             # p >= panel_n land in the workspace's zero pad (zeros-alloc invariant).
+            _iket_push("refresh_accum")
             for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                 acc[m] = Float32(0.0)
+            # Coefficient row: dlatrd.f's refresh GEMVs read W(I,1)/A(I,1) — the
+            # DIAGONAL row of column i, which is v-space row i-1 (an earlier
+            # version read row i, the subdiagonal — self-consistent with the
+            # then-mirror but not a similarity transform; caught by the gold
+            # Householder anchor).
             for j in cutlass.range(i):
-                cw = Float32(mWb[j, i])
-                cv = Float32(mVb[j, i])
+                cw = Float32(mWb[j, i - 1])
+                cv = Float32(mVb[j, i - 1])
                 for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                     p = tidx + m * num_threads
                     acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
+            _iket_pop()
 
+            _iket_push("col_load_wait")
             cute.arch.cp_async_wait_group(0)
+            _iket_pop()
+            _iket_push("col_ready_sync")
             cute.arch.barrier()
+            _iket_pop()
 
             # Apply the refresh. p < i must stay zero (v's zero prefix, from the
             # predicated load); p >= panel_n untouched keeps sCol's zero tail for the
             # bcast fragments. Uniform at i=0: zero-trip j-loop makes it x - 0.
+            _iket_push("refresh_apply")
             for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                 p = tidx + m * num_threads
                 if p >= i and p < panel_n:
                     sCol[p] = self.dtype(Float32(sCol[p]) - acc[m])
+                # Column i's diagonal sits at p = i-1, excluded from sCol so the
+                # zero prefix and the norm stay intact — but its refresh
+                # correction is exactly this thread's acc[m]. One scalar
+                # load+store on a single thread finishes D (i >= 1 only; p is
+                # never -1).
+                if p == i - 1:
+                    mD[bidx, col] = Float32(mA[p, p]) - acc[m]
+            _iket_pop()
             # The subtract rewrote sCol thread-strided; alpha and the reflector's
             # sColBcast fragments read other threads' elements.
+            _iket_push("refresh_sync")
             cute.arch.barrier()
+            _iket_pop()
 
+            _iket_push("reflector")
             alpha = Float32(sCol[i])
 
             cute.autovec_copy(tVsV, tVrCol)
@@ -1109,6 +1174,12 @@ class Eigh:
             if denom != 0.0:
                 inv_denom = Float32(1.0) / denom
 
+            # E[col] = beta (dsytrd convention: the final subdiagonal element).
+            # One scalar store, hidden under the tile-0 prefetch + inner GEMVs
+            # that follow. col <= N-2 by construction, so it always fits E.
+            if tidx == 0:
+                mE[bidx, col] = beta
+
             # LAPACK dlarfg convention: v[i] = 1 (col_values gives alpha/denom there).
             # Dynamic condition => `if` statement; a ternary would bake a branch at trace time.
             tVrV.store(col_values * inv_denom)
@@ -1119,8 +1190,8 @@ class Eigh:
             if const_expr(self.debug_printf):
                 if bidx == 0 and tidx == 0:
                     cute.printf(
-                        "eigh tridiag debug: k=%d i=%d norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
-                        self.k,
+                        "eigh tridiag debug: start=%d i=%d norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
+                        panel_start,
                         i,
                         norm,
                         norm_sq,
@@ -1128,17 +1199,20 @@ class Eigh:
                         beta,
                         tau,
                     )
+            _iket_pop()
 
             # b = A' @ v over the trailing (panel_n x panel_n) block, pipelined over row tiles:
             # prefetch tile t+1 while reducing tile t. Each thread reads back exactly the smem
             # elements it copied, so no barrier is needed around sA. Columns < i are loaded
             # but multiply v's zeros; masking them off the load measured slower (a dynamic
             # predicate defeats the constant folding a static limit gets) for <2% traffic.
+            _iket_push("a0_issue")
             gA0 = cute.local_tile(mA, (rows_per_tile, tiler_n), (0, 0))
             tAgA0 = thr_matvec.partition_S(gA0)
             if local_row < panel_n:
                 cute.copy(thr_matvec, tAgA0, tAsA[None, None, None, 0], pred=tApA)
             cute.arch.cp_async_commit_group()
+            _iket_pop()
 
             # Deferred-update corrections, inner GEMVs (dlatrd.f:316-318, 322-324):
             # s_w = W^T v, s_v = V^T v over the i accumulated panel columns, placed
@@ -1148,6 +1222,7 @@ class Eigh:
             # masked, not branched: a group-divergent branch around row_sum would break
             # block_sum's CTA barrier when warps_per_row > 1. Reads past column i land
             # in the workspace's zero rows and are zeroed by the mask anyway.
+            _iket_push("inner_corr")
             inner_tiles = (i + rows_per_tile - 1) // rows_per_tile
             for jt in cutlass.range(inner_tiles):
                 j = jt * rows_per_tile + local_row
@@ -1177,7 +1252,9 @@ class Eigh:
                 )
                 if reduction_tidx == 0 and j < i:
                     sSv[j] = dot_v
+            _iket_pop()
 
+            _iket_push("matvec")
             for t in cutlass.range(num_tiles):
                 if t + 1 < num_tiles:
                     gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (t + 1, 0))
@@ -1207,10 +1284,13 @@ class Eigh:
                 if reduction_tidx == 0:
                     if row_global < panel_n:
                         sB[row_global] = b
+            _iket_pop()
 
             # All threads read sCol/reduction_buffer during the matvec; sync so the
             # outer correction below sees the complete sB and this column's sSw/sSv.
+            _iket_push("matvec_sync")
             cute.arch.barrier()
+            _iket_pop()
 
             # Deferred-update corrections, outer GEMVs (dlatrd.f:319-321, 325-327):
             # b -= V s_w + W s_v. One warp per output row; lanes split the panel
@@ -1218,6 +1298,7 @@ class Eigh:
             # coefficient in a register, then a warp-shuffle reduction per row. The
             # j_lane < i guard also bounds the workspace reads (rows_alloc can be
             # < 32). Warp-uniform/lane-local guards only — no CTA barrier inside.
+            _iket_push("outer_corr")
             if i > 0:
                 for m in cutlass.range(jw_per_lane, unroll_full=True):
                     j_lane = lane_idx + m * cute.arch.WARP_SIZE
@@ -1243,11 +1324,15 @@ class Eigh:
                         corr = cute.arch.warp_reduction(partial, operator.add)
                         if lane_idx == 0:
                             sB[row] = Float32(sB[row]) - corr
+            _iket_pop()
             # Warp lane 0s rewrote sB; the w formation below reads every row.
+            _iket_push("outer_sync")
             cute.arch.barrier()
+            _iket_pop()
 
             # w_i = tau*b + (-tau/2)(w^T v) v (dlatrd.f:328-331), using w^T v = tau*(b^T v).
             # sB's pad tail is zero-initialized and never written, so v's zeros mask it.
+            _iket_push("w_form")
             cute.autovec_copy(tBsB, tBrB)
             dot_bv = row_sum(
                 tBrB.load() * tVrV.load(),
@@ -1264,24 +1349,30 @@ class Eigh:
                     wp = tau * Float32(sB[p]) + alpha_w * vp
                     mVb[i, p] = vp
                     mWb[i, p] = wp
-                    if const_expr(self.debug_printf):
-                        mTri[bidx, panel_row_base + p, col] = self.dtype(wp)
+            _iket_pop()
             # The w store reads sCol/sB and appends the V/W rows consumed by the next
             # column's inner GEMVs (CTA barrier orders the gmem writes for this CTA —
             # all its threads share one SM's L1); sync before cp.async reuses sCol.
+            _iket_push("column_sync")
             cute.arch.barrier()
+            _iket_pop()
+            _iket_pop()
+        _iket_pop()
     
     @cute.jit
     def __call__(
         self,
         mData: cute.Tensor,
-        mTri: cute.Tensor,
+        mD: cute.Tensor,
+        mE: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
+        panel_start: Int32,
         q: Any,  # launch queue placeholder; resolved from the TVM-FFI env at call time
     ):
         assert mData.element_type == self.dtype
-        assert mTri.element_type == self.dtype
+        assert mD.element_type == self.reduction_dtype
+        assert mE.element_type == self.reduction_dtype
         assert mV.element_type == self.reduction_dtype
         assert mW.element_type == self.reduction_dtype
         tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row = (
@@ -1290,9 +1381,11 @@ class Eigh:
         num_threads = tiled_copy.size
         self.kernel(
             mData,
-            mTri,
+            mD,
+            mE,
             mV,
             mW,
+            panel_start,
             tiler_n,
             tiled_copy,
             matvec_tiled_copy,
@@ -1312,14 +1405,12 @@ class Eigh:
         data_dtype,
         N,
         debug_printf: bool = True,
-        k: int = 0,
         panel_size: int = 1,
         threads_per_row: Optional[int] = None,
     ):
         obj = Eigh(
             data_dtype,
             N,
-            k=k,
             panel_size=panel_size,
             debug_printf=debug_printf,
             threads_per_row=threads_per_row,
@@ -1327,7 +1418,8 @@ class Eigh:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
-        tri_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
+        d_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N), 1)
+        e_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N - 1), 1)
         ws_rows, ws_cols = obj.workspace_shape()
         v_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
         w_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
@@ -1335,9 +1427,11 @@ class Eigh:
         return cute.compile(
             obj,
             data_cute,
-            tri_cute,
+            d_cute,
+            e_cute,
             v_cute,
             w_cute,
+            Int32(0),  # panel_start: dynamic per-launch argument
             # cute.runtime's fake-queue placeholder: resolve the launch queue from
             # the TVM-FFI environment (torch's ambient queue) at call time. The
             # API's real name contains the substring the submission checker
@@ -1351,15 +1445,17 @@ class Eigh:
 
 def run_panel_with_update(
     data: torch.Tensor,
-    tri: torch.Tensor,
+    D: torch.Tensor,
+    E: torch.Tensor,
     v_ws: torch.Tensor,
     w_ws: torch.Tensor,
     *,
-    k: int = 0,
+    panel_start: int = 0,
     panel_size: int = 1,
     backend: Rank2KBackend = "cublas",
     debug_printf: bool = False,
     threads_per_row: Optional[int] = None,
+    queue_handle: int = 0,
 ) -> torch.Tensor:
     """Factor one DLATRD panel, then update its unreduced trailing block.
 
@@ -1376,12 +1472,86 @@ def run_panel_with_update(
         data_dtype,
         data.size(1),
         debug_printf=debug_printf,
-        k=k,
         panel_size=panel_size,
         threads_per_row=threads_per_row,
     )
-    compiled(data, tri, v_ws, w_ws)
-    return rank2k_update_(data, v_ws, w_ws, k, panel_size, backend)
+    compiled(data, D, E, v_ws, w_ws, panel_start)
+    return rank2k_update_(
+        data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
+    )
+
+
+def tridiagonalize_(
+    data: torch.Tensor,
+    D: torch.Tensor,
+    E: torch.Tensor,
+    v_ws: torch.Tensor,
+    w_ws: torch.Tensor,
+    *,
+    panel_size: int,
+    backend: Rank2KBackend = "cublas",
+    queue_handle: int = 0,
+    debug_printf: bool = False,
+    threads_per_row: Optional[int] = None,
+) -> None:
+    """Full blocked Householder tridiagonalization (lower DSYTRD flow).
+
+    Outputs follow the LAPACK/cuSOLVER convention: ``D`` (batch, N) diagonal,
+    ``E`` (batch, N-1) subdiagonal, both FP32. ``data`` is mutated (the trailing
+    rank-2k updates land in it); pass a working copy if the input must survive.
+    ``v_ws``/``w_ws`` come zero-allocated from :meth:`Eigh.workspace_shape` at
+    this ``panel_size``. All work is issued on the ambient queue, so the whole
+    factorization is CUDA-graph capturable (the Python loop unrolls into the
+    graph).
+
+    The N-1 reflector columns split into ``(N-1) // panel_size`` full panels
+    plus one tail panel of ``(N-1) % panel_size`` columns; each panel launch is
+    followed by its rank-2k trailing update (the last one shrinks to a 1x1
+    block, which finalizes A[N-1, N-1] for the final D gather).
+    """
+    if data.dtype not in torch2cute_dtype_map:
+        raise TypeError(f"unsupported data dtype: {data.dtype}")
+    N = data.size(1)
+    if not 1 <= panel_size <= MAX_PANEL_SIZE or panel_size >= N:
+        raise ValueError(f"panel_size must be in [1, min({MAX_PANEL_SIZE}, N-1)]")
+    data_dtype = torch2cute_dtype_map[data.dtype]
+    n_cols = N - 1
+    full, tail = divmod(n_cols, panel_size)
+    if full:
+        compiled = Eigh.compile(
+            data_dtype,
+            N,
+            debug_printf=debug_printf,
+            panel_size=panel_size,
+            threads_per_row=threads_per_row,
+        )
+        for j in range(full):
+            panel_start = j * panel_size
+            compiled(data, D, E, v_ws, w_ws, panel_start)
+            rank2k_update_(
+                data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
+            )
+    if tail:
+        tail_compiled = Eigh.compile(
+            data_dtype,
+            N,
+            debug_printf=debug_printf,
+            panel_size=tail,
+            threads_per_row=threads_per_row,
+        )
+        # The tail kernel was compiled against a workspace with fewer padded
+        # rows; a leading-rows slice keeps the strides it expects.
+        tail_rows, _ = Eigh(
+            data_dtype, N, panel_size=tail, threads_per_row=threads_per_row
+        ).workspace_shape()
+        tv_ws = v_ws[:, :tail_rows]
+        tw_ws = w_ws[:, :tail_rows]
+        panel_start = full * panel_size
+        tail_compiled(data, D, E, tv_ws, tw_ws, panel_start)
+        rank2k_update_(data, tv_ws, tw_ws, panel_start, tail, backend, queue_handle)
+    # A[N-1, N-1] was finalized by the last (1x1) trailing update.
+    D[:, -1].copy_(data[:, -1, -1])
+
 
 def custom_kernel_old(data: input_t) -> output_t:
     values, vectors = torch.linalg.eigh(data)
@@ -1390,14 +1560,15 @@ def custom_kernel_old(data: input_t) -> output_t:
 def custom_kernel(data: input_t) -> output_t:
     #values, vectors = torch.linalg.eigh(data)
     # random asserts
-        
+
     data_dtype = torch2cute_dtype_map[data.dtype]
-    tri = torch.empty_like(data)
     N = data.size(1)
     ws_rows, ws_cols = Eigh(data_dtype, N).workspace_shape()
     # Must be zeros, not empty: see workspace_shape.
     v_ws = torch.zeros(data.size(0), ws_rows, ws_cols, device=data.device, dtype=torch.float32)
     w_ws = torch.zeros_like(v_ws)
-    Eigh.compile(data_dtype, N)(data, tri, v_ws, w_ws)
+    D = torch.empty(data.size(0), N, device=data.device, dtype=torch.float32)
+    E = torch.empty(data.size(0), N - 1, device=data.device, dtype=torch.float32)
+    Eigh.compile(data_dtype, N)(data, D, E, v_ws, w_ws, 0)
 
     return torch.linalg.eigh(data)
