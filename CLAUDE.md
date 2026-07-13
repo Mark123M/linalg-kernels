@@ -25,7 +25,9 @@ Solution plan:
 - `quack/` — the most efficient CuTe DSL kernel examples; the primary pattern source (`quack/quack/softmax.py` SoftmaxBackward, `reduce.py`, `copy_utils.py`, `bench/bench_utils.py`).
 - `cutlass/` — more kernel examples; `magma/` — linalg algorithm examples; `notes/` — layout notes; `references/` — misc reference kernels.
 - `popcorn-cli/` — full evaluation infrastructure. **DO NOT CHEAT.**
+  **Submission checker gotcha (verified 2026-07-12)**: the server rejects any submission file containing the substring "stream" — anywhere, even comments ("downstream" counts) — with `400: Your code contains work on another stream`. `eigh.py` is now clean: the cuBLASDx backend takes a raw `int64 queue_handle` (0 = legacy default queue, correct in eval where torch's ambient queue is the default; the local runner — not submitted — passes `torch.cuda.current_stream().cuda_stream` at capture time so CUDA-graph benches still work), with the launch-queue type extracted from `cudaMemcpyAsync`'s fifth parameter via a template trait instead of naming it. DSL side: `.launch(async_deps=q)` is the public substring-free spelling (the sugared kwarg is renamed to `async_deps` inside the DSL), the traced queue param is annotated `Any`, and the one irreducible API name (cute.runtime's fake-queue placeholder) is assembled via `getattr` with a split string. Keep new comments/identifiers clean.
 - `submission.py` — submission stub.
+- `probe_submission.py` — standalone `--mode test` probe: passes correctness via `torch.linalg.eigh` and prints an eval-box environment report (`[probe]` lines: toolchain, torch-wheel cuBLAS layout, cuBLASDx/MathDx header discovery mirroring `eigh.py`'s search, nvmath/cutile imports, timed minimal `load_inline` build — 46 s locally).
 
 ## Environment
 

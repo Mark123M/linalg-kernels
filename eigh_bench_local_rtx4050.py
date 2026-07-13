@@ -125,7 +125,18 @@ def benchmark_rank2k(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(work: torch.Tensor) -> None:
-        eigh.rank2k_update_(work, v_ws, w_ws, k, PANEL_SIZE, backend)
+        # Evaluated at capture time, so this resolves to the capture stream —
+        # required for the cublasdx backend, whose default queue_handle=0 (legacy
+        # stream) is not capturable in a CUDA graph.
+        eigh.rank2k_update_(
+            work,
+            v_ws,
+            w_ws,
+            k,
+            PANEL_SIZE,
+            backend,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
+        )
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -172,7 +183,16 @@ def benchmark_panel_with_update(
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
         compiled(work, tri, v_ws, w_ws)
-        eigh.rank2k_update_(work, v_ws, w_ws, k, PANEL_SIZE, backend)
+        # Capture-time current stream: see benchmark_rank2k.
+        eigh.rank2k_update_(
+            work,
+            v_ws,
+            w_ws,
+            k,
+            PANEL_SIZE,
+            backend,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
+        )
 
     samples = [
         _bench_cuda_graph_l2_rotate(
