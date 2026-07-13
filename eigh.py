@@ -36,6 +36,23 @@ MAX_PANEL_SIZE = 128
 Rank2KBackend = Literal["cublas", "cublasdx"]
 _BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_rank2k_native"
 
+# Shared release/code-generation flags for CUDA sources in the torch native
+# extensions.  --use_fast_math includes FTZ, approximate FP32 division/sqrt,
+# and FMA contraction.  PTXAS -O3 plus allow-expensive-optimizations makes the
+# device back end explicit rather than relying on NVCC defaults.
+_NATIVE_CFLAGS = ["-O3", "-DNDEBUG", "-std=c++17"]
+_NATIVE_CUDA_CFLAGS = [
+    "-O3",
+    "-DNDEBUG",
+    "-std=c++17",
+    "--use_fast_math",
+    "--extra-device-vectorization",
+    "--restrict",
+    "-Xptxas=-O3",
+    "-Xptxas=--allow-expensive-optimizations=true",
+    "-lineinfo",
+]
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -662,14 +679,14 @@ def _build_directory(name: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load_cublas_module():
-    name = "eigh_rank2k_cublas_v2"
+    name = "eigh_rank2k_cublas_v3"
     return load_inline(
         name,
         cpp_sources=_CPP_SOURCE,
         cuda_sources=_COMMON_CUDA_SOURCE,
         functions=None,
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+        extra_cflags=_NATIVE_CFLAGS,
+        extra_cuda_cflags=_NATIVE_CUDA_CFLAGS,
         extra_ldflags=_cublas_link_flags(),
         build_directory=_build_directory(name),
         verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
@@ -678,12 +695,9 @@ def _load_cublas_module():
 
 @lru_cache(maxsize=None)
 def _load_cublasdx_module(panel_size: int, arch_name: str, arch: int):
-    name = f"eigh_rank2k_cublasdx_ps{panel_size}_{arch_name}_v4"
+    name = f"eigh_rank2k_cublasdx_ps{panel_size}_{arch_name}_v5"
     cuda_source = _COMMON_CUDA_SOURCE + _CUBLASDX_CUDA_SOURCE
-    flags = [
-        "-O3",
-        "-std=c++17",
-        "-lineinfo",
+    flags = _NATIVE_CUDA_CFLAGS + [
         f"-DEIGH_PANEL_SIZE={panel_size}",
         f"-DEIGH_DX_ARCH={arch}",
         "-DEIGH_WITH_CUBLASDX=1",
@@ -699,7 +713,7 @@ def _load_cublasdx_module(panel_size: int, arch_name: str, arch: int):
             cuda_sources=cuda_source,
             functions=None,
             extra_include_paths=_mathdx_include_paths(),
-            extra_cflags=["-O3", "-std=c++17", "-DEIGH_WITH_CUBLASDX=1"],
+            extra_cflags=_NATIVE_CFLAGS + ["-DEIGH_WITH_CUBLASDX=1"],
             extra_cuda_cflags=flags,
             extra_ldflags=_cublas_link_flags(),
             build_directory=_build_directory(name),
