@@ -53,6 +53,77 @@ def make_de(data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return D, E
 
 
+def make_htev_outputs(D: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, n = D.shape
+    V = torch.empty(batch, n, n, device=D.device, dtype=torch.float32)
+    info = torch.empty(batch, device=D.device, dtype=torch.int32)
+    return V, info
+
+
+def validate_htev_result(
+    D_input: torch.Tensor,
+    E_input: torch.Tensor,
+    D: torch.Tensor,
+    E: torch.Tensor,
+    V: torch.Tensor,
+    info: torch.Tensor,
+    *,
+    label: str,
+) -> bool:
+    bad = torch.nonzero(info, as_tuple=False).flatten().tolist()
+    finite = bool(torch.isfinite(D).all().item() and torch.isfinite(V).all().item())
+    sorted_values = bool((D[:, 1:] >= D[:, :-1]).all().item())
+    e_zero = bool((E == 0).all().item())
+
+    vd = V.double()
+    tv = D_input.double().unsqueeze(2) * vd
+    ed = E_input.double().unsqueeze(2)
+    tv[:, 1:, :] += ed * vd[:, :-1, :]
+    tv[:, :-1, :] += ed * vd[:, 1:, :]
+    vl = vd * D.double().unsqueeze(1)
+    eig_scale = torch.maximum(tv.abs().amax(), vl.abs().amax()).clamp_min(1e-30)
+    eig_rel = ((tv - vl).abs().amax() / eig_scale).item()
+
+    gram = torch.bmm(vd.transpose(1, 2), vd)
+    identity = torch.eye(D.size(1), device=D.device, dtype=torch.float64).expand_as(gram)
+    orth_rel = (gram - identity).abs().amax().item()
+    ok = not bad and finite and sorted_values and e_zero and eig_rel <= 2e-3 and orth_rel <= 2e-3
+    print(
+        f"{label}: ok={ok} mode={eigh.htev_execution_mode(D.size(1))} "
+        f"info_bad={bad} finite={finite} sorted={sorted_values} E_zero={e_zero} "
+        f"eig_rel={eig_rel:.3e} orth_max={orth_rel:.3e}",
+        flush=True,
+    )
+    return ok
+
+
+def check_tridiag_htev(data: torch.Tensor, backend: str) -> bool:
+    work = data.clone()
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
+    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    D_tri, E_tri = D.clone(), E.clone()
+    V, info = make_htev_outputs(D)
+    eigh.htev_all_vectors_(D, E, V, info)
+    torch.cuda.synchronize()
+    htev_ok = validate_htev_result(D_tri, E_tri, D, E, V, info, label="tridiag+htev")
+
+    spectrum_rel = 0.0
+    for row in range(min(3, data.size(0))):
+        expected = torch.linalg.eigvalsh(data[row].double())
+        spectrum_rel = max(
+            spectrum_rel,
+            ((D[row].double() - expected).abs().max() / expected.abs().max().clamp_min(1e-30)).item(),
+        )
+    spectrum_ok = spectrum_rel <= 1e-4
+    print(
+        f"tridiag+htev spectrum: ok={spectrum_ok} rel={spectrum_rel:.3e} "
+        f"(first {min(3, data.size(0))} matrices)",
+        flush=True,
+    )
+    return htev_ok and spectrum_ok
+
+
 def factor_panel(
     data: torch.Tensor,
     k: int,
@@ -489,6 +560,122 @@ def benchmark_tridiag(
     return samples, n_sets
 
 
+def benchmark_htev(
+    D_input: torch.Tensor,
+    E_input: torch.Tensor,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    eigh.warm_htev(D_input.size(1))
+    D = D_input.clone()
+    E = E_input.clone()
+    V, info = make_htev_outputs(D)
+    base_args = (D_input, E_input, D, E, V, info)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(
+        source_d: torch.Tensor,
+        source_e: torch.Tensor,
+        work_d: torch.Tensor,
+        work_e: torch.Tensor,
+        vectors: torch.Tensor,
+        status: torch.Tensor,
+    ) -> None:
+        work_d.copy_(source_d)
+        work_e.copy_(source_e)
+        eigh.htev_all_vectors_(
+            work_d,
+            work_e,
+            vectors,
+            status,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def benchmark_tridiag_htev(
+    data: torch.Tensor,
+    backend: str,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    D, E = make_de(data)
+    V, info = make_htev_outputs(D)
+    v_ws, w_ws = make_workspace(data)
+    eigh.warm_rank2k_backend(PANEL_SIZE, backend)
+    tail = (data.size(1) - 1) % PANEL_SIZE
+    if tail and backend == "cublasdx":
+        eigh.warm_rank2k_backend(tail, backend)
+    eigh.warm_htev(data.size(1))
+    base_args = (data, data.clone(), D, E, V, info, v_ws, w_ws)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(
+        source: torch.Tensor,
+        work: torch.Tensor,
+        values: torch.Tensor,
+        offdiag: torch.Tensor,
+        vectors: torch.Tensor,
+        status: torch.Tensor,
+        panel_v: torch.Tensor,
+        panel_w: torch.Tensor,
+    ) -> None:
+        queue_handle = torch.cuda.current_stream().cuda_stream
+        work.copy_(source)
+        eigh.tridiagonalize_(
+            work,
+            values,
+            offdiag,
+            panel_v,
+            panel_w,
+            panel_size=PANEL_SIZE,
+            backend=backend,
+            queue_handle=queue_handle,
+        )
+        eigh.htev_all_vectors_(
+            values,
+            offdiag,
+            vectors,
+            status,
+            queue_handle=queue_handle,
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
 def benchmark_torch_tridiag(
     data: torch.Tensor,
     n_sets: int,
@@ -659,6 +846,11 @@ def main() -> None:
         "One timed call is a full factorization, so use small --bench-calls.",
     )
     parser.add_argument(
+        "--tri-solve",
+        action="store_true",
+        help="Run full tridiagonalization followed by cuSolverDx HTEV all-vectors.",
+    )
+    parser.add_argument(
         "--expected-preview",
         type=int,
         default=16,
@@ -732,6 +924,8 @@ def main() -> None:
         "(applied after the strict-fp32 allclose check).",
     )
     args = parser.parse_args()
+    if args.tri and args.tri_solve:
+        parser.error("--tri and --tri-solve are mutually exclusive")
     if sum((args.bench, args.trace_once, args.check_panel_only)) > 1:
         parser.error("--bench, --trace-once, and --check-panel-only are mutually exclusive")
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
@@ -771,6 +965,55 @@ def main() -> None:
         if not check_gemv_allclose(data, args.k):
             raise SystemExit("panel correctness gate failed")
         print("panel correctness gate passed", flush=True)
+        return
+
+    if args.tri_solve:
+        backend = args.update_backend if args.update_backend != "none" else "cublas"
+        if not check_tridiag(data, backend):
+            raise SystemExit(f"tridiag {backend} correctness check failed")
+        if not check_tridiag_htev(data, backend):
+            raise SystemExit(f"tridiag+HTEV {backend} correctness check failed")
+        if args.bench:
+            work = data.clone()
+            D_input, E_input = make_de(data)
+            v_ws, w_ws = make_workspace(data)
+            eigh.tridiagonalize_(
+                work,
+                D_input,
+                E_input,
+                v_ws,
+                w_ws,
+                panel_size=PANEL_SIZE,
+                backend=backend,
+            )
+            htev_samples, htev_sets = benchmark_htev(
+                D_input.clone(),
+                E_input.clone(),
+                args.bench_sets,
+                args.bench_calls,
+                args.bench_warmup_ms,
+                args.bench_repeats,
+            )
+            combined_samples, combined_sets = benchmark_tridiag_htev(
+                data,
+                backend,
+                args.bench_sets,
+                args.bench_calls,
+                args.bench_warmup_ms,
+                args.bench_repeats,
+            )
+            htev_selected = select_sample(htev_samples, args.bench_stat)
+            combined_selected = select_sample(combined_samples, args.bench_stat)
+            print(
+                f"bench htev sets={htev_sets} samples_ms={htev_samples} "
+                f"{args.bench_stat}_ms={htev_selected:.6f}",
+                flush=True,
+            )
+            print(
+                f"bench tridiag_htev_{backend} sets={combined_sets} "
+                f"samples_ms={combined_samples} {args.bench_stat}_ms={combined_selected:.6f}",
+                flush=True,
+            )
         return
 
     # --bench implies skipping the host-side reference printout.

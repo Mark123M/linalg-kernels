@@ -48,6 +48,8 @@ image = (
             "EIGH_ENABLE_DISK_CACHE": "1",
             "EIGH_CUTE_CACHE_DIR": "/cache/cute",
             "TMPDIR": "/cache/tmp",
+            "CC": "gcc",
+            "CXX": "g++",
         }
     )
     # Runtime mounts: synced on every `modal run`, no rebuild.
@@ -87,6 +89,8 @@ trace_image = (
             # exported object would bypass instrumentation, so disk caching is off.
             "EIGH_ENABLE_DISK_CACHE": "0",
             "TMPDIR": "/cache/tmp",
+            "CC": "gcc",
+            "CXX": "g++",
         }
     )
     .add_local_file("eigh.py", "/workspace/eigh.py", copy=False)
@@ -175,6 +179,7 @@ def bench(
     seed: int,
     bench_eigh: bool,
     tri: bool,
+    tri_solve: bool,
 ) -> None:
     import os
     import sys
@@ -215,6 +220,53 @@ def bench(
         # Gates run under strict fp32 matmul (reset per case: a previous case's
         # timed phase may have lowered it).
         torch.set_float32_matmul_precision("highest")
+
+        if tri_solve:
+            tri_backends = backends or ["cublas"]
+            parts = [f"htev_mode={runner.eigh.htev_execution_mode(n)}"]
+            case_ok = True
+            for be in tri_backends:
+                if not runner.check_tridiag(data, be) or not runner.check_tridiag_htev(data, be):
+                    case_ok = False
+                    break
+                work = data.clone()
+                D_input, E_input = runner.make_de(data)
+                panel_v, panel_w = runner.make_workspace(data)
+                runner.eigh.tridiagonalize_(
+                    work,
+                    D_input,
+                    E_input,
+                    panel_v,
+                    panel_w,
+                    panel_size=panel_size,
+                    backend=be,
+                )
+                htev_samples, htev_sets = runner.benchmark_htev(
+                    D_input.clone(), E_input.clone(), sets, calls, warmup_ms, repeats
+                )
+                combined_samples, combined_sets = runner.benchmark_tridiag_htev(
+                    data, be, sets, calls, warmup_ms, repeats
+                )
+                htev_ms = runner.select_sample(htev_samples, stat)
+                combined_ms = runner.select_sample(combined_samples, stat)
+                print(
+                    f"htev sets={htev_sets} samples_ms={[f'{s:.4f}' for s in htev_samples]}",
+                    flush=True,
+                )
+                print(
+                    f"tridiag_htev_{be} sets={combined_sets} "
+                    f"samples_ms={[f'{s:.4f}' for s in combined_samples]}",
+                    flush=True,
+                )
+                parts.extend((f"htev={htev_ms:.4f}ms", f"tridiag_htev_{be}={combined_ms:.4f}ms"))
+            if not case_ok:
+                summaries.append(f"{label}: TRIDIAG+HTEV GATE FAILED")
+                failed = True
+            else:
+                summaries.append(f"{label}: " + " ".join(parts))
+            del data
+            torch.cuda.empty_cache()
+            continue
 
         if tri:
             # Full-tridiagonalization mode: D/E gate, then graph-captured
@@ -436,10 +488,13 @@ def main(
     seed: int = 0,
     bench_eigh: bool = False,
     tri: bool = False,
+    tri_solve: bool = False,
     trace: bool = False,
     trace_batch: int = 1,
     trace_output: str = "profiles/eigh_iket",
 ) -> None:
+    if tri and tri_solve:
+        raise SystemExit("--tri and --tri-solve are mutually exclusive")
     parsed_cases = []
     for item in cases.split(","):
         batch, _, n = item.strip().lower().partition("x")
@@ -487,4 +542,5 @@ def main(
         seed,
         bench_eigh,
         tri,
+        tri_solve,
     )

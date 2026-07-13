@@ -14,8 +14,9 @@ The report answers, for the eval box:
   - whether nvcc + ninja + g++ exist (load_inline viability) and how long a
     minimal CUDA extension build takes,
   - which torch-wheel cuBLAS layout exists (eigh.py's _cublas_link_flags probe),
-  - where (if anywhere) cuBLASDx/MathDx headers are discoverable
+  - where (if anywhere) cuBLASDx/cuSolverDx/MathDx headers are discoverable
     (same search order as eigh.py's _mathdx_include_paths),
+  - whether separate cuBLASDx and no-op cuSolverDx extensions compile and run,
   - whether nvmath-python / cutile / cutlass DSL are importable.
 """
 
@@ -104,21 +105,25 @@ def _mathdx_root_ok(root: Path) -> bool:
     ).is_dir()
 
 
-def _probe_mathdx() -> list[list[str]]:
+def _probe_mathdx() -> tuple[list[list[str]], list[list[str]]]:
     # Same search order as eigh.py's _mathdx_include_paths. Returns candidate
-    # include-path lists usable for an actual cuBLASDx build attempt.
-    hits: list[str] = []
-    includes: list[list[str]] = []
+    # include-path lists usable for cuBLASDx and cuSolverDx build attempts.
+    blas_hits: list[str] = []
+    solver_hits: list[str] = []
+    blas_includes: list[list[str]] = []
+    solver_includes: list[list[str]] = []
 
     def _try_root(root: Path, label: str) -> None:
         if _mathdx_root_ok(root):
-            hits.append(f"{label} {root}")
-            includes.append(
-                [
-                    str((root / "include").resolve()),
-                    str((root / "external" / "cutlass" / "include").resolve()),
-                ]
-            )
+            paths = [
+                str((root / "include").resolve()),
+                str((root / "external" / "cutlass" / "include").resolve()),
+            ]
+            blas_hits.append(f"{label} {root}")
+            blas_includes.append(paths)
+            if (root / "include" / "cusolverdx.hpp").is_file():
+                solver_hits.append(f"{label} {root}")
+                solver_includes.append(paths)
 
     configured = os.environ.get("MATHDX_ROOT")
     if configured:
@@ -136,8 +141,11 @@ def _probe_mathdx() -> list[list[str]]:
     cute_dirs = [str(p.resolve()) for p in candidates if (p / "cute" / "tensor.hpp").is_file()]
     for path in candidates:
         if (path / "cublasdx.hpp").is_file():
-            hits.append(f"include dir {path}")
-            includes.append([str(path.resolve()), *cute_dirs])
+            blas_hits.append(f"include dir {path}")
+            blas_includes.append([str(path.resolve()), *cute_dirs])
+        if (path / "cusolverdx.hpp").is_file():
+            solver_hits.append(f"include dir {path}")
+            solver_includes.append([str(path.resolve()), *cute_dirs])
     # Last resort: is a MathDx tree lying around anywhere obvious? Bounded
     # depth — a recursive glob over $HOME could take minutes.
     for base in (Path("/opt"), Path("/usr/local"), Path.home()):
@@ -149,16 +157,21 @@ def _probe_mathdx() -> list[list[str]]:
         ):
             try:
                 for found in base.glob(pattern):
-                    hits.append(f"filesystem hit {found}")
+                    blas_hits.append(f"filesystem hit {found}")
                     _try_root(found.parent.parent, "filesystem root")
             except OSError:
                 pass
-    if hits:
-        for hit in hits:
+    if blas_hits:
+        for hit in blas_hits:
             _p(f"cublasdx headers: {hit}")
     else:
         _p("cublasdx headers: NOT FOUND anywhere probed")
-    return includes
+    if solver_hits:
+        for hit in solver_hits:
+            _p(f"cusolverdx headers: {hit}")
+    else:
+        _p("cusolverdx headers: NOT FOUND in any cuBLASDx/MathDx root probed")
+    return blas_includes, solver_includes
 
 
 def _probe_load_inline() -> None:
@@ -309,6 +322,77 @@ def _probe_cublasdx_build(include_candidates: list[list[str]]) -> None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = old_arch_list
 
 
+_CUSOLVERDX_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <cusolverdx.hpp>
+
+__global__ void probe_cusolverdx_kernel(int* out) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    out[0] = CUSOLVERDX_VERSION;
+  }
+}
+
+torch::Tensor probe_cusolverdx(torch::Tensor out) {
+  probe_cusolverdx_kernel<<<1, 1>>>(out.data_ptr<int>());
+  TORCH_CHECK(cudaPeekAtLastError() == cudaSuccess,
+              "probe_cusolverdx launch failed");
+  return out;
+}
+"""
+
+
+def _probe_cusolverdx_build(include_candidates: list[list[str]]) -> None:
+    # A deliberately no-op cuSolverDx extension: including cusolverdx.hpp makes
+    # nvcc parse the cuSolverDx API and the launched kernel reports its version.
+    # Actual Solver::execute calls additionally require cuSolverDx's LTO library.
+    if shutil.which("nvcc") is None:
+        _p("cusolverdx build: skipped (no nvcc)")
+        return
+    if not include_candidates:
+        _p("cusolverdx build: skipped (no header candidates)")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    arch_list = "10.0a" if (major, minor) == (10, 0) else f"{major}.{minor}"
+    old_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        start = time.perf_counter()
+        module = load_inline(
+            "probe_cusolverdx_ext",
+            cpp_sources="torch::Tensor probe_cusolverdx(torch::Tensor out);",
+            cuda_sources=_CUSOLVERDX_CUDA_SOURCE,
+            functions=["probe_cusolverdx"],
+            extra_include_paths=include_candidates[0],
+            extra_cuda_cflags=[
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+            ],
+        )
+        elapsed = time.perf_counter() - start
+        out = torch.zeros(1, device="cuda", dtype=torch.int32)
+        module.probe_cusolverdx(out)
+        torch.cuda.synchronize()
+        encoded = out.item()
+        version = f"{encoded // 10000}.{encoded // 100 % 100}.{encoded % 100}"
+        _p(
+            f"cusolverdx build: OK build_s={elapsed:.1f} "
+            f"includes={include_candidates[0]} version={version} encoded={encoded}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _p(f"cusolverdx build: FAILED ({type(exc).__name__}: {str(exc)[:600]})")
+    finally:
+        if old_arch_list is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = old_arch_list
+
+
 _probe_done = False
 
 
@@ -321,12 +405,14 @@ def _run_probe() -> None:
         _probe_versions()
         _probe_python_packages()
         _probe_cublas_layout()
-        dx_includes = _probe_mathdx()
+        blas_includes, solver_includes = _probe_mathdx()
         # Slowest steps last so a per-case timeout still surfaces everything above.
         _p("starting minimal load_inline build...")
         _probe_load_inline()
         _p("starting cublasdx build...")
-        _probe_cublasdx_build(dx_includes)
+        _probe_cublasdx_build(blas_includes)
+        _p("starting cusolverdx no-op build...")
+        _probe_cusolverdx_build(solver_includes)
         _p("probe complete")
     except Exception as exc:  # noqa: BLE001 - the probe must never break the submission
         _p(f"probe crashed: {type(exc).__name__}: {exc}")

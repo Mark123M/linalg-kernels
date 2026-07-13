@@ -44,6 +44,7 @@ CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 MAX_PANEL_SIZE = 128
 Rank2KBackend = Literal["cublas", "cublasdx"]
 _BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_rank2k_native"
+_HTEV_BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_htev_native"
 
 # Shared release/code-generation flags for CUDA sources in the torch native
 # extensions.  --use_fast_math includes FTZ, approximate FP32 division/sqrt,
@@ -605,6 +606,177 @@ torch::Tensor cublasdx_rank2k_(torch::Tensor data,
 """
 
 
+_HTEV_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+void htev_all_vectors_native_(torch::Tensor d,
+                              torch::Tensor e,
+                              torch::Tensor v,
+                              torch::Tensor info,
+                              int64_t queue_handle);
+void prepare_htev_native();
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("htev_all_vectors_", &htev_all_vectors_native_, "Batched tridiagonal eigensolver");
+  m.def("prepare_htev", &prepare_htev_native, "Prepare batched tridiagonal eigensolver");
+}
+"""
+
+
+_HTEV_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <cusolverdx.hpp>
+
+namespace {
+
+template <class F>
+struct FifthArg;
+template <class R, class A, class B, class C, class D, class E>
+struct FifthArg<R (*)(A, B, C, D, E)> {
+  using type = E;
+};
+using QueueT = typename FifthArg<decltype(&cudaMemcpyAsync)>::type;
+
+constexpr int kN = EIGH_HTEV_N;
+constexpr int kArch = EIGH_HTEV_ARCH;
+constexpr int kThreads = 32;
+
+using namespace cusolverdx;
+#if EIGH_HTEV_BLOCK
+using HTEVSolver = decltype(Size<kN>() + Precision<float>() + Type<type::real>() +
+                            Function<htev>() + SM<kArch>() + Block() +
+                            Job<job::all_vectors>() + Arrangement<row_major>());
+#else
+using HTEVSolver = decltype(Size<kN>() + Precision<float>() + Type<type::real>() +
+                            Function<htev>() + SM<kArch>() + Thread() +
+                            Job<job::all_vectors>() + Arrangement<row_major>());
+#endif
+
+static_assert(sizeof(typename HTEVSolver::status_type) == sizeof(int),
+              "HTEV status type must be int32");
+
+void validate_htev_inputs(const torch::Tensor& d,
+                          const torch::Tensor& e,
+                          const torch::Tensor& v,
+                          const torch::Tensor& info) {
+  TORCH_CHECK(d.is_cuda() && e.is_cuda() && v.is_cuda() && info.is_cuda(),
+              "D, E, V, and info must be CUDA tensors");
+  TORCH_CHECK(d.scalar_type() == at::kFloat && e.scalar_type() == at::kFloat &&
+                  v.scalar_type() == at::kFloat,
+              "D, E, and V must be FP32");
+  TORCH_CHECK(info.scalar_type() == at::kInt, "info must be int32");
+  TORCH_CHECK(d.is_contiguous() && e.is_contiguous() && v.is_contiguous() &&
+                  info.is_contiguous(),
+              "D, E, V, and info must be contiguous");
+  TORCH_CHECK(d.dim() == 2 && d.size(1) == kN, "D must have shape (batch, N)");
+  TORCH_CHECK(e.dim() == 2 && e.size(0) == d.size(0) && e.size(1) == kN - 1,
+              "E must have shape (batch, N-1)");
+  TORCH_CHECK(v.dim() == 3 && v.size(0) == d.size(0) && v.size(1) == kN &&
+                  v.size(2) == kN,
+              "V must have shape (batch, N, N)");
+  TORCH_CHECK(info.dim() == 1 && info.size(0) == d.size(0),
+              "info must have shape (batch,)");
+  TORCH_CHECK(d.device() == e.device() && d.device() == v.device() &&
+                  d.device() == info.device(),
+              "D, E, V, and info must be on the same device");
+  TORCH_CHECK(d.size(0) > 0, "batch must be positive");
+}
+
+#if EIGH_HTEV_BLOCK
+constexpr int align16(int bytes) { return (bytes + 15) & ~15; }
+constexpr int kDBytes = align16(kN * static_cast<int>(sizeof(float)));
+constexpr int kEBytes = align16((kN - 1) * static_cast<int>(sizeof(float)));
+constexpr int kVBytes = align16(kN * kN * static_cast<int>(sizeof(float)));
+static_assert(kDBytes + kEBytes + kVBytes == HTEVSolver::shared_memory_size,
+              "HTEV shared-memory layout mismatch");
+
+__launch_bounds__(HTEVSolver::max_threads_per_block)
+__global__ void htev_block_kernel(float* d, float* e, float* v, int* info, int batch) {
+  CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(HTEVSolver);
+  const int batch_idx = static_cast<int>(blockIdx.x);
+  if (batch_idx >= batch) {
+    return;
+  }
+
+  extern __shared__ __align__(16) unsigned char storage[];
+  float* d_shared = reinterpret_cast<float*>(storage);
+  float* e_shared = reinterpret_cast<float*>(storage + kDBytes);
+  float* v_shared = reinterpret_cast<float*>(storage + kDBytes + kEBytes);
+  const int tid = static_cast<int>(threadIdx.x);
+  const long long d_base = static_cast<long long>(batch_idx) * kN;
+  const long long e_base = static_cast<long long>(batch_idx) * (kN - 1);
+  const long long v_base = static_cast<long long>(batch_idx) * kN * kN;
+
+  for (int i = tid; i < kN; i += kThreads) {
+    d_shared[i] = d[d_base + i];
+  }
+  for (int i = tid; i < kN - 1; i += kThreads) {
+    e_shared[i] = e[e_base + i];
+  }
+  __syncthreads();
+  HTEVSolver().execute(d_shared, e_shared, v_shared, kN, info + batch_idx);
+  __syncthreads();
+
+  for (int i = tid; i < kN; i += kThreads) {
+    d[d_base + i] = d_shared[i];
+  }
+  for (int i = tid; i < kN - 1; i += kThreads) {
+    e[e_base + i] = e_shared[i];
+  }
+  for (int i = tid; i < kN * kN; i += kThreads) {
+    v[v_base + i] = v_shared[i];
+  }
+}
+#else
+__global__ void htev_thread_kernel(float* d, float* e, float* v, int* info, int batch) {
+  CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(HTEVSolver);
+  const int batch_idx = static_cast<int>(blockIdx.x) * kThreads +
+                        static_cast<int>(threadIdx.x);
+  if (batch_idx >= batch) {
+    return;
+  }
+  HTEVSolver().execute(d + static_cast<long long>(batch_idx) * kN,
+                       e + static_cast<long long>(batch_idx) * (kN - 1),
+                       v + static_cast<long long>(batch_idx) * kN * kN,
+                       info + batch_idx);
+}
+#endif
+
+}  // namespace
+
+void prepare_htev_native() {
+#if EIGH_HTEV_BLOCK
+  auto status = cudaFuncSetAttribute(htev_block_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     HTEVSolver::shared_memory_size);
+  TORCH_CHECK(status == cudaSuccess, "HTEV shared-memory setup failed: ",
+              cudaGetErrorString(status));
+#endif
+}
+
+void htev_all_vectors_native_(torch::Tensor d,
+                              torch::Tensor e,
+                              torch::Tensor v,
+                              torch::Tensor info,
+                              int64_t queue_handle) {
+  validate_htev_inputs(d, e, v, info);
+  const int batch = static_cast<int>(d.size(0));
+  const QueueT queue = reinterpret_cast<QueueT>(queue_handle);
+#if EIGH_HTEV_BLOCK
+  htev_block_kernel<<<batch, HTEVSolver::block_dim, HTEVSolver::shared_memory_size, queue>>>(
+      d.data_ptr<float>(), e.data_ptr<float>(), v.data_ptr<float>(),
+      info.data_ptr<int>(), batch);
+#else
+  htev_thread_kernel<<<(batch + kThreads - 1) / kThreads, kThreads, 0, queue>>>(
+      d.data_ptr<float>(), e.data_ptr<float>(), v.data_ptr<float>(),
+      info.data_ptr<int>(), batch);
+#endif
+  auto status = cudaPeekAtLastError();
+  TORCH_CHECK(status == cudaSuccess, "HTEV launch failed: ", cudaGetErrorString(status));
+}
+"""
+
+
 def _cublas_link_flags() -> list[str]:
     # Known pip-wheel layouts: consolidated cu13 wheels, then per-library cu12/cu13
     # wheels. Fall back to the toolkit's libcublas on the default linker path.
@@ -670,6 +842,57 @@ def _mathdx_include_paths() -> list[str]:
     )
 
 
+def _cusolverdx_root_assets(root: Path) -> Optional[tuple[list[str], str]]:
+    include_dir = root / "include"
+    cutlass_dir = root / "external" / "cutlass" / "include"
+    fatbin = root / "lib" / "libcusolverdx.fatbin"
+    if (
+        (include_dir / "cusolverdx.hpp").is_file()
+        and cutlass_dir.is_dir()
+        and fatbin.is_file()
+    ):
+        return [str(include_dir.resolve()), str(cutlass_dir.resolve())], str(fatbin.resolve())
+    return None
+
+
+@lru_cache(maxsize=1)
+def _cusolverdx_assets() -> tuple[list[str], str]:
+    configured = os.environ.get("MATHDX_ROOT")
+    if configured:
+        root = Path(configured).expanduser()
+        assets = _cusolverdx_root_assets(root)
+        if assets is None:
+            raise RuntimeError(
+                f"MATHDX_ROOT={root} does not contain cusolverdx.hpp, the bundled "
+                "CUTLASS headers, and lib/libcusolverdx.fatbin"
+            )
+        return assets
+
+    site_mathdx = Path(torch.__file__).resolve().parent.parent / "nvidia" / "mathdx"
+    if site_mathdx.is_dir():
+        for root in (site_mathdx, *sorted(site_mathdx.iterdir(), reverse=True)):
+            assets = _cusolverdx_root_assets(root)
+            if assets is not None:
+                return assets
+
+    roots: list[Path] = []
+    for variable in ("CPATH", "CPLUS_INCLUDE_PATH"):
+        for entry in os.environ.get(variable, "").split(os.pathsep):
+            if entry:
+                include_dir = Path(entry).expanduser()
+                roots.append(include_dir.parent if include_dir.name == "include" else include_dir)
+    roots.extend((Path("/usr/local"), Path("/usr")))
+    for root in roots:
+        assets = _cusolverdx_root_assets(root)
+        if assets is not None:
+            return assets
+    raise RuntimeError(
+        "A complete cuSolverDx installation is required. Set MATHDX_ROOT to a "
+        "MathDx 26.06 root containing include/, external/cutlass/include/, and "
+        "lib/libcusolverdx.fatbin."
+    )
+
+
 def _current_arch() -> tuple[str, int]:
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (8, 9):
@@ -677,7 +900,7 @@ def _current_arch() -> tuple[str, int]:
     if (major, minor) == (10, 0):
         return "sm100a", 1000
     raise RuntimeError(
-        f"cuBLASDx rank-2k currently supports SM89 and B200 SM100a, got SM{major}{minor}"
+        f"native Dx backends currently support SM89 and B200 SM100a, got SM{major}{minor}"
     )
 
 
@@ -698,6 +921,105 @@ def _build_directory(name: str) -> str:
     path = _BUILD_ROOT / name
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+def _load_extension_file(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not create an import specification for {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _build_htev_extension(
+    name: str,
+    n: int,
+    arch_name: str,
+    arch: int,
+    mode: str,
+):
+    from setuptools import Distribution
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    include_paths, fatbin = _cusolverdx_assets()
+    build_root = _HTEV_BUILD_ROOT / name
+    build_root.mkdir(parents=True, exist_ok=True)
+    cpp_path = build_root / "binding.cpp"
+    cuda_path = build_root / "htev.cu"
+    cpp_path.write_text(_HTEV_CPP_SOURCE)
+    cuda_path.write_text(_HTEV_CUDA_SOURCE)
+
+    nvcc_flags = [flag for flag in _NATIVE_CUDA_CFLAGS if flag != "--use_fast_math"] + [
+        "-rdc=true",
+        (
+            "-gencode=arch=compute_100a,code=lto_100a"
+            if arch_name == "sm100a"
+            else "-gencode=arch=compute_89,code=lto_89"
+        ),
+        f"-DEIGH_HTEV_N={n}",
+        f"-DEIGH_HTEV_ARCH={arch}",
+        f"-DEIGH_HTEV_BLOCK={int(mode == 'block')}",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+    ]
+    extension = CUDAExtension(
+        name=name,
+        sources=[str(cpp_path), str(cuda_path)],
+        include_dirs=include_paths,
+        extra_compile_args={
+            "cxx": _NATIVE_CFLAGS,
+            "nvcc": nvcc_flags,
+            # BuildExtension uses this key to emit the required device-link
+            # edge. Supplying the complete flags here avoids forwarding the
+            # unsupported ``dlink`` keyword to setuptools.Extension.
+            "nvcc_dlink": [fatbin, "-dlink", "-dlto"],
+        },
+    )
+    distribution = Distribution({"name": name, "ext_modules": [extension]})
+    distribution.cmdclass = {
+        "build_ext": BuildExtension.with_options(use_ninja=True, no_python_abi_suffix=False)
+    }
+    command = distribution.get_command_obj("build_ext")
+    command.ensure_finalized()
+    command.build_lib = str(build_root)
+    command.build_temp = str(build_root / "objects")
+    command.inplace = False
+    command.force = False
+    with _extension_arch(arch_name):
+        command.run()
+    output_path = Path(command.get_ext_fullpath(name))
+    if not output_path.is_file():
+        matches = sorted(build_root.glob(f"{name}*.so"))
+        if not matches:
+            raise RuntimeError(f"HTEV extension build produced no module under {build_root}")
+        output_path = matches[-1]
+    return _load_extension_file(name, output_path)
+
+
+def _htev_shared_memory_size(n: int) -> int:
+    align16 = lambda size: (size + 15) & ~15
+    return align16(4 * n) + align16(4 * (n - 1)) + align16(4 * n * n)
+
+
+def _htev_execution_mode(n: int, arch_name: str) -> str:
+    shared_limit = {"sm89": 101376, "sm100a": 232448}[arch_name]
+    return "block" if _htev_shared_memory_size(n) <= shared_limit else "thread"
+
+
+def htev_execution_mode(n: int) -> str:
+    """Return the cuSolverDx execution policy selected for matrix size ``n``."""
+    if n < 2:
+        raise ValueError(f"HTEV requires N >= 2, got {n}")
+    arch_name, _ = _current_arch()
+    return _htev_execution_mode(n, arch_name)
 
 
 @lru_cache(maxsize=1)
@@ -744,6 +1066,29 @@ def _load_cublasdx_module(panel_size: int, arch_name: str, arch: int):
         )
 
 
+@lru_cache(maxsize=None)
+def _load_htev_module(n: int, arch_name: str, arch: int):
+    mode = _htev_execution_mode(n, arch_name)
+    source_tag = hashlib.sha256(
+        (_HTEV_CPP_SOURCE + _HTEV_CUDA_SOURCE).encode()
+    ).hexdigest()[:10]
+    name = f"eigh_htev_n{n}_{arch_name}_{mode}_v3_{source_tag}"
+    build_root = _HTEV_BUILD_ROOT / name
+    build_root.mkdir(parents=True, exist_ok=True)
+    lock_path = build_root / "build.lock"
+    with FileLock(lock_path, exclusive=True, timeout=max(LOCK_TIMEOUT, 600)):
+        if name in sys.modules:
+            module = sys.modules[name]
+        else:
+            matches = sorted(build_root.glob(f"{name}*.so"))
+            if matches:
+                module = _load_extension_file(name, matches[-1])
+            else:
+                module = _build_htev_extension(name, n, arch_name, arch, mode)
+    module.prepare_htev()
+    return module
+
+
 def _validate_python_inputs(
     data: torch.Tensor,
     v: torch.Tensor,
@@ -774,6 +1119,69 @@ def warm_rank2k_backend(panel_size: int, backend: Rank2KBackend) -> None:
         _load_cublasdx_module(panel_size, arch_name, arch)
     else:
         raise ValueError(f"unsupported rank-2k backend: {backend!r}")
+
+
+def warm_htev(n: int) -> None:
+    """Compile and prepare the HTEV specialization before graph capture."""
+    if n < 2:
+        raise ValueError(f"HTEV requires N >= 2, got {n}")
+    arch_name, arch = _current_arch()
+    _load_htev_module(n, arch_name, arch)
+
+
+def _validate_htev_python_inputs(
+    D: torch.Tensor,
+    E: torch.Tensor,
+    V: torch.Tensor,
+    info: torch.Tensor,
+) -> int:
+    if D.ndim != 2:
+        raise ValueError(f"D must have shape (batch, N), got {tuple(D.shape)}")
+    batch, n = D.shape
+    if n < 2:
+        raise ValueError(f"HTEV requires N >= 2, got {n}")
+    if E.shape != (batch, n - 1):
+        raise ValueError(f"E must have shape {(batch, n - 1)}, got {tuple(E.shape)}")
+    if V.shape != (batch, n, n):
+        raise ValueError(f"V must have shape {(batch, n, n)}, got {tuple(V.shape)}")
+    if info.shape != (batch,):
+        raise ValueError(f"info must have shape {(batch,)}, got {tuple(info.shape)}")
+    if D.dtype != torch.float32 or E.dtype != torch.float32 or V.dtype != torch.float32:
+        raise TypeError("D, E, and V must be torch.float32")
+    if info.dtype != torch.int32:
+        raise TypeError("info must be torch.int32")
+    tensors = (D, E, V, info)
+    if not all(tensor.is_cuda for tensor in tensors):
+        raise ValueError("D, E, V, and info must be CUDA tensors")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("D, E, V, and info must be contiguous")
+    if not all(tensor.device == D.device for tensor in tensors[1:]):
+        raise ValueError("D, E, V, and info must be on the same device")
+    if batch <= 0:
+        raise ValueError("batch must be positive")
+    return n
+
+
+def htev_all_vectors_(
+    D: torch.Tensor,
+    E: torch.Tensor,
+    V: torch.Tensor,
+    info: torch.Tensor,
+    *,
+    queue_handle: int = 0,
+) -> None:
+    """Solve a batch of real symmetric tridiagonal eigenproblems in place.
+
+    ``D`` and ``E`` contain the diagonal and subdiagonal on entry. cuSolverDx
+    overwrites ``D`` with ascending eigenvalues, zeros ``E``, fills the columns
+    of row-major ``V`` with eigenvectors, and writes one convergence status to
+    ``info``. The call is asynchronous; a nonzero status is left to the caller
+    to inspect after synchronization.
+    """
+    n = _validate_htev_python_inputs(D, E, V, info)
+    arch_name, arch = _current_arch()
+    module = _load_htev_module(n, arch_name, arch)
+    module.htev_all_vectors_(D, E, V, info, queue_handle)
 
 
 def rank2k_update_(
@@ -1300,6 +1708,7 @@ class Eigh:
             # < 32). Warp-uniform/lane-local guards only — no CTA barrier inside.
             _iket_push("outer_corr")
             if i > 0:
+                _iket_push("outer_corr_load")
                 for m in cutlass.range(jw_per_lane, unroll_full=True):
                     j_lane = lane_idx + m * cute.arch.WARP_SIZE
                     sw_val = Float32(0.0)
@@ -1309,6 +1718,7 @@ class Eigh:
                         sv_val = Float32(sSv[j_lane])
                     coef_sw[m] = sw_val
                     coef_sv[m] = sv_val
+                _iket_pop()
                 for row_tile in cutlass.range(cute.ceil_div(panel_n, num_warps)):
                     row = row_tile * num_warps + warp_idx
                     if row < panel_n:
