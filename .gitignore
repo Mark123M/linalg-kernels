@@ -219,3 +219,4 @@ __marimo__/
 nvidia-mathdx-*/
 *.deb
 *.tar.gz
+profiles/

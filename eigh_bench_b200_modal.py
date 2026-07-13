@@ -461,7 +461,6 @@ def main(
         from pathlib import Path
 
         destination = Path(trace_output) / run_name
-        cache_vol.reload()
         downloaded: list[Path] = []
         for relative, remote_path in artifacts:
             local_path = destination / relative
