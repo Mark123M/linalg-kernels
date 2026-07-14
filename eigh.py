@@ -1284,6 +1284,13 @@ constexpr int kDcThreads = 256;
 constexpr int kDcMaxMerge = 4096;
 constexpr int kDcSecularIters = 40;
 constexpr float kDcEps = 1.1920929e-07f;
+// Smallest magnitude allowed for a pole-to-iterate / pole-to-pole gap before a
+// division. A degenerate near-zero cluster (e.g. rank-deficient inputs) can make
+// such a gap round to exactly 0 in FP32; dividing by it yields Inf that poisons
+// the whole secular step into NaN. This floor sits far below any meaningful gap
+// (FP32 O(1) rounding noise is ~1e-7) yet keeps the reciprocal well within FP32
+// range, so it is inert on non-degenerate inputs.
+constexpr float kDcDivFloor = 1.0e-16f;
 
 // One CTA per (merge g, matrix b). Implements dlaed1/dlaed2/dlaed3/dlaed4 for
 // the rank-1 merge T = Q (diag(d) + rho z z^T) Q^T entirely on device,
@@ -1524,7 +1531,10 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
       for (int it = 0; it < kDcSecularIters; ++it) {
         float wv = rhoinv, dwv = 0.0f, dphi = 0.0f;
         for (int i = 0; i < k; ++i) {
-          const float dif = (sdl[i] - dorg) - tau;
+          float dif = (sdl[i] - dorg) - tau;
+          // Keep the iterate off a coincident pole so t1 stays finite; an Inf
+          // here would cascade the whole step to NaN (FP32 degenerate clusters).
+          if (fabsf(dif) < kDcDivFloor) dif = dif < 0.0f ? -kDcDivFloor : kDcDivFloor;
           const float t1 = sw[i] / dif;
           wv += sw[i] * t1;
           const float t2 = t1 * t1;
@@ -1562,10 +1572,17 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
         if (cq == 0.0f || !isfinite(eta)) eta = newton;
         if (wv * eta >= 0.0f) eta = newton;
         const float cand = tau + eta;
-        if (cand > hi || cand < lo)
+        // NaN-robust bracketing: the negated form also fires when eta/cand is
+        // non-finite (e.g. a coincident pole slipped through), forcing a finite
+        // bisection step instead of silently accepting a NaN that no subsequent
+        // comparison can catch. Identical to `cand > hi || cand < lo` when cand
+        // is finite, so non-degenerate inputs are unaffected.
+        if (!(cand <= hi && cand >= lo))
           eta = wneg ? 0.5f * (hi - tau) : 0.5f * (lo - tau);
         tau += eta;
-        if (tau == 0.0f) tau = 0.5f * (lo + hi);
+        // Final safety net: if tau still went non-finite (or hit 0), snap to the
+        // bracket midpoint, which is always finite.
+        if (!isfinite(tau) || tau == 0.0f) tau = 0.5f * (lo + hi);
         // Converged: the step no longer moves tau in FP32, so further
         // iterations are no-ops (a 2-cycle cannot produce a tiny eta).
         // Lanes are independent here; kDcSecularIters stays the safety cap.
@@ -1586,7 +1603,9 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     const float di = sdl[i];
     for (int j = 0; j < k; ++j) {
       const float del = (di - sdl[sorig[j]]) - smu[j];
-      prod *= j == i ? del : del / (di - sdl[j]);
+      float denom = di - sdl[j];
+      if (fabsf(denom) < kDcDivFloor) denom = denom < 0.0f ? -kDcDivFloor : kDcDivFloor;
+      prod *= j == i ? del : del / denom;
     }
     sw[i] = copysignf(sqrtf(fmaxf(-prod, 0.0f)), sw[i]);
   }
@@ -1636,13 +1655,15 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     } else {
       float nrm = 0.0f;
       for (int i = 0; i < k; ++i) {
-        const float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        if (fabsf(del) < kDcDivFloor) del = del < 0.0f ? -kDcDivFloor : kDcDivFloor;
         const float v = sw[i] / del;
         nrm += v * v;
       }
-      const float inv = rsqrtf(nrm);
+      const float inv = nrm > 0.0f ? rsqrtf(nrm) : 0.0f;
       for (int i = 0; i < k; ++i) {
-        const float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        if (fabsf(del) < kDcDivFloor) del = del < 0.0f ? -kDcDivFloor : kDcDivFloor;
         s_g[(long long)surv[i] * n_full + c] = (sw[i] / del) * inv;
       }
     }
@@ -1758,7 +1779,7 @@ def _load_dc_module():
     # per-phase cycle counts (see DC_PHASE_MARK); separate module name so the
     # release build is never polluted.
     timers = _env_flag("EIGH_DC_TIMERS")
-    name = "eigh_dc_prep_v2_timers" if timers else "eigh_dc_prep_v2"
+    name = "eigh_dc_prep_v3_timers" if timers else "eigh_dc_prep_v3"
     cuda_flags = [f for f in _NATIVE_CUDA_CFLAGS if f != "--use_fast_math"]
     if timers:
         cuda_flags.append("-DEIGH_DC_PHASE_TIMERS=1")
@@ -1907,6 +1928,24 @@ def tridiag_eig_dc_(
             for gi, off in enumerate(group.offs):
                 group.d[:, gi].copy_(D[:, off : off + size])
                 group.e[:, gi].copy_(E[:, off : off + size - 1])
+        # cuSolverDx htev returns NaN eigenpairs (with info == 0) on a numerically
+        # singular leaf — one whose spectrum touches ~0, e.g. a rank-deficient
+        # input's null space landing in this block. Shift each leaf to positive
+        # definite so no eigenvalue sits at 0, dodging the failure. The shift is
+        # exactly correctable: T + sigma*I has the same eigenvectors and its
+        # eigenvalues are sigma above T's, so subtracting sigma afterwards
+        # restores the true spectrum. Uniform (no data-dependent branch or host
+        # sync), so it stays CUDA-graph capturable. Gershgorin bounds |lambda| by
+        # radius, and shifting by radius + max(radius, 1e-3) leaves the whole
+        # shifted spectrum in [max(radius, 1e-3), ~], comfortably clear of 0.
+        # Inert on well-separated leaves (round-trips through +/- sigma in FP32).
+        leaf_shift = None
+        if size > 1:
+            radius = group.d.abs().amax(dim=2, keepdim=True) + 2.0 * group.e.abs().amax(
+                dim=2, keepdim=True
+            )
+            leaf_shift = radius + radius.clamp_min(1.0e-3)
+            group.d.add_(leaf_shift)
         with _dc_range(f"dc_htev_{size}x{len(group.offs)}"):
             htev_all_vectors_(
                 group.d.view(batch * len(group.offs), size),
@@ -1915,6 +1954,8 @@ def tridiag_eig_dc_(
                 group.info,
                 queue_handle=queue_handle,
             )
+        if leaf_shift is not None:
+            group.d.sub_(leaf_shift)
         v_view = group.v.view(batch, len(group.offs), size, size)
         with _dc_range(f"dc_leaf_scatter_{size}x{len(group.offs)}"):
             for gi, off in enumerate(group.offs):
