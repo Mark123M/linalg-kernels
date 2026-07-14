@@ -207,6 +207,7 @@ def bench(
     bench_eigh: bool,
     tri: bool,
     tri_solve: bool,
+    stages: str = "",
 ) -> None:
     import os
     import sys
@@ -319,18 +320,27 @@ def bench(
             torch.set_float32_matmul_precision(matmul_precision)
             parts = []
             first_ms = None
+            # Empty -> single run at the kernel default; a list sweeps the matvec
+            # cp.async prefetch depth K (correctness is K-invariant).
+            stage_list = [int(x) for x in stages.split(",") if x.strip()] or [None]
             for be in tri_backends:
-                samples, n_sets = runner.benchmark_tridiag(
-                    data, be, sets, calls, warmup_ms, repeats
-                )
-                tri_ms = runner.select_sample(samples, stat)
-                if first_ms is None:
-                    first_ms = tri_ms
-                print(
-                    f"tridiag_{be} sets={n_sets} samples_ms={[f'{s:.4f}' for s in samples]}",
-                    flush=True,
-                )
-                parts.append(f"tridiag_{be}={tri_ms:.4f}ms")
+                for st in stage_list:
+                    runner.STAGE = st
+                    samples, n_sets = runner.benchmark_tridiag(
+                        data, be, sets, calls, warmup_ms, repeats
+                    )
+                    tri_ms = runner.select_sample(samples, stat)
+                    if first_ms is None:
+                        first_ms = tri_ms
+                    tag = "" if st is None else f" stage={st}"
+                    print(
+                        f"tridiag_{be}{tag} sets={n_sets} "
+                        f"samples_ms={[f'{s:.4f}' for s in samples]}",
+                        flush=True,
+                    )
+                    key = be if st is None else f"{be}@k{st}"
+                    parts.append(f"tridiag_{key}={tri_ms:.4f}ms")
+            runner.STAGE = None
             samples, n_sets = runner.benchmark_torch_tridiag(
                 data, sets, calls, warmup_ms, repeats
             )
@@ -681,7 +691,7 @@ def profile_nsys_pipeline(
 def main(
     cases: str = "640x512",
     panel_size: int = 8,
-    leaf_size: int = 128,
+    leaf_size: int = 32,
     k: int = 0,
     backends: str = "cublas,cublasdx",
     sets: int = 0,
@@ -694,6 +704,7 @@ def main(
     bench_eigh: bool = False,
     tri: bool = False,
     tri_solve: bool = False,
+    stages: str = "",
     trace: bool = False,
     trace_batch: int = 1,
     trace_output: str = "profiles/eigh_iket",
@@ -799,4 +810,5 @@ def main(
         bench_eigh,
         tri,
         tri_solve,
+        stages,
     )

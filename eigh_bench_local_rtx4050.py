@@ -30,6 +30,9 @@ from quack.bench.bench_utils import (  # noqa: E402
 DTYPE = torch.float32
 PANEL_SIZE = 1
 DC_LEAF_SIZE = 32
+# Matvec cp.async prefetch depth K forwarded to tridiagonalize_; None -> eigh's
+# own default. Set by the --stages sweep (and the modal runner) per run.
+STAGE = None
 
 
 def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -576,6 +579,38 @@ def check_tridiag(data: torch.Tensor, backend: str) -> bool:
     return close
 
 
+def sweep_tridiag_stages(data, backend, stage_list, args) -> None:
+    """Time the full tridiagonalization at each matvec prefetch depth K in
+    ``stage_list`` and print one line per K plus the best. Correctness is
+    K-invariant (verified separately), so only the timings are swept."""
+    global STAGE
+    print(f"bench tridiag stage sweep {stage_list} (backend={backend})", flush=True)
+    results = []
+    try:
+        for st in stage_list:
+            STAGE = st
+            samples, n_sets = benchmark_tridiag(
+                data, backend, args.bench_sets, args.bench_calls,
+                args.bench_warmup_ms, args.bench_repeats,
+            )
+            selected = select_sample(samples, args.bench_stat)
+            results.append((st, selected))
+            sample_text = ", ".join(f"{s:.4f}" for s in samples)
+            print(
+                f"bench tridiag_{backend} stage={st} sets={n_sets} "
+                f"samples_ms=[{sample_text}] {args.bench_stat}_ms={selected:.6f}",
+                flush=True,
+            )
+    finally:
+        STAGE = None
+    best = min(results, key=lambda r: r[1])
+    print(
+        f"bench tridiag stage sweep best: stage={best[0]} "
+        f"{args.bench_stat}_ms={best[1]:.4f}",
+        flush=True,
+    )
+
+
 def benchmark_tridiag(
     data: torch.Tensor,
     backend: str,
@@ -596,6 +631,9 @@ def benchmark_tridiag(
         n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
+    # STAGE=None defers to tridiagonalize_'s own default; a set value sweeps K.
+    stage_kwargs = {} if STAGE is None else {"stage": STAGE}
+
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
         # Capture-time current stream: see benchmark_rank2k.
@@ -608,6 +646,7 @@ def benchmark_tridiag(
             panel_size=PANEL_SIZE,
             backend=backend,
             queue_handle=torch.cuda.current_stream().cuda_stream,
+            **stage_kwargs,
         )
 
     samples = [
@@ -1224,6 +1263,13 @@ def main() -> None:
         help="torch.set_float32_matmul_precision for the timed torch baseline "
         "(applied after the strict-fp32 allclose check).",
     )
+    parser.add_argument(
+        "--stages",
+        default="",
+        help="Comma-separated matvec cp.async prefetch depths K to sweep in "
+        "--tri --bench mode (e.g. '2,3,4'). Empty -> single run at the kernel "
+        "default. Each K reports its own tridiag time; correctness is K-invariant.",
+    )
     args = parser.parse_args()
     if args.tri and args.tri_solve:
         parser.error("--tri and --tri-solve are mutually exclusive")
@@ -1345,6 +1391,11 @@ def main() -> None:
         if args.bench:
             torch.set_float32_matmul_precision(args.matmul_precision)
             print(f"bench float32_matmul_precision={args.matmul_precision}", flush=True)
+            stage_list = [int(x) for x in args.stages.split(",") if x.strip()]
+            if stage_list:
+                sweep_tridiag_stages(data, backend, stage_list, args)
+                print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
+                return
             samples, bench_sets = benchmark_tridiag(
                 data,
                 backend,

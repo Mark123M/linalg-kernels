@@ -1295,6 +1295,18 @@ constexpr float kDcEps = 1.1920929e-07f;
 // the rank-1 merge T = Q (diag(d) + rho z z^T) Q^T entirely on device,
 // emitting the merged ascending eigenvalues into lam (in place, own slice
 // only) and the m x m S_eff block into s_out at (off, off).
+// Debug phase timers (compile with -DEIGH_DC_PHASE_TIMERS=1): CTA (0, 0)
+// prints per-phase cycle counts. Default off; timing only, no output change.
+#ifndef EIGH_DC_PHASE_TIMERS
+#define EIGH_DC_PHASE_TIMERS 0
+#endif
+#if EIGH_DC_PHASE_TIMERS
+#define DC_PHASE_MARK(slot) \
+  do { if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) dc_phase_t[slot] = clock64(); } while (0)
+#else
+#define DC_PHASE_MARK(slot) do { } while (0)
+#endif
+
 __global__ void dc_prep_kernel(const float* __restrict__ e,
                                float* __restrict__ lam,
                                const float* __restrict__ z_cur,
@@ -1303,6 +1315,9 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
                                int* __restrict__ ibuf,
                                const int* __restrict__ merges,
                                int n_full) {
+#if EIGH_DC_PHASE_TIMERS
+  __shared__ long long dc_phase_t[10];
+#endif
   const int g = blockIdx.x;
   const int b = blockIdx.y;
   const int tid = threadIdx.x;
@@ -1338,6 +1353,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
   float* lam_g = lam + (long long)b * n_full + off;
   float* s_g = s_out + ((long long)b * n_full + off) * n_full + off;
 
+  DC_PHASE_MARK(0);
   // Phase A: gather z = (last row of Q1, sign(e) * first row of Q2)/sqrt(2)
   // and the two halves' eigenvalues. dlaed1.f:231-234 + dlaed2.f:281-293.
   const float ecut = e[(long long)b * (n_full - 1) + off + n1 - 1];
@@ -1350,6 +1366,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     dw[i] = lam_g[i];
   }
   __syncthreads();
+  DC_PHASE_MARK(1);
 
   // Phase B: deflation tolerance = 8 eps max(|d|max, |z|max) (dlaed2.f:313).
   float local_max = 0.0f;
@@ -1376,6 +1393,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
     __syncthreads();
   }
+  DC_PHASE_MARK(2);
 
   // Phase C (single thread): merge-sort the two ascending halves, then the
   // dlaed2 deflation scan (rule A: negligible z; rule B: close eigenvalues
@@ -1456,6 +1474,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     sh_r = r;
   }
   __syncthreads();
+  DC_PHASE_MARK(3);
 
   const int k = sh_k;
   const int r = sh_r;
@@ -1553,12 +1572,18 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
           eta = wneg ? 0.5f * (hi - tau) : 0.5f * (lo - tau);
         tau += eta;
         if (tau == 0.0f) tau = 0.5f * (lo + hi);
+        // Converged: the step no longer moves tau in FP32, so further
+        // iterations are no-ops (a 2-cycle cannot produce a tiny eta).
+        // Lanes are independent here; kDcSecularIters stays the safety cap.
+        else if (fabsf(eta) <= 9.5367432e-7f * fabsf(tau))
+          break;
       }
       smu[j] = tau;
       sorig[j] = org;
     }
   }
   __syncthreads();
+  DC_PHASE_MARK(4);
 
   // Phase E: Loewner z-hat recompute (dlaed3.f:260-290); overwrites sw with
   // z-hat (each lane touches only its own indices).
@@ -1572,10 +1597,18 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     sw[i] = copysignf(sqrtf(fmaxf(-prod, 0.0f)), sw[i]);
   }
 
-  // Phase F1: zero the S block.
-  for (long long idx = tid; idx < (long long)m * m; idx += nthr)
-    s_g[(idx / m) * n_full + idx % m] = 0.0f;
+#if EIGH_DC_PHASE_TIMERS
+  __syncthreads();  // timers build only: split Phase E from F1
+  DC_PHASE_MARK(9);
+#endif
+  // Phase F1: zero the S block. Row-major loops: coalesced stores, and no
+  // per-element 64-bit div/mod (which dominated this phase's cycle count).
+  for (int row = 0; row < m; ++row) {
+    float* srow = s_g + (long long)row * n_full;
+    for (int c = tid; c < m; c += nthr) srow[c] = 0.0f;
+  }
   __syncthreads();
+  DC_PHASE_MARK(5);
 
   // Phase F2 (single thread): merge secular roots (ascending by interlacing)
   // with the ascending deflated values into the output order + eigenvalues.
@@ -1598,6 +1631,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     }
   }
   __syncthreads();
+  DC_PHASE_MARK(6);
 
   // Phase F3: write S_eff columns — normalized secular eigenvectors scattered
   // through the survivor map (dlaed3.f:281-290), unit columns for deflated.
@@ -1620,6 +1654,7 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
     }
   }
   __syncthreads();
+  DC_PHASE_MARK(7);
 
   // Phase F4: fold the Givens rotations, S_eff = G1 ... Gr S0, applied in
   // reverse record order. Each thread owns a fixed column set for every
@@ -1636,6 +1671,18 @@ __global__ void dc_prep_kernel(const float* __restrict__ e,
       s_g[rn + c] = sn * xp + cn * xn;
     }
   }
+#if EIGH_DC_PHASE_TIMERS
+  __syncthreads();
+  DC_PHASE_MARK(8);
+  if (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0)
+    printf("dc_prep g=%d m=%d k=%d cyc A=%lld B=%lld C=%lld D=%lld E=%lld F1=%lld F2=%lld F3=%lld F4=%lld\n",
+           g, m, k,
+           dc_phase_t[1] - dc_phase_t[0], dc_phase_t[2] - dc_phase_t[1],
+           dc_phase_t[3] - dc_phase_t[2], dc_phase_t[4] - dc_phase_t[3],
+           dc_phase_t[9] - dc_phase_t[4], dc_phase_t[5] - dc_phase_t[9],
+           dc_phase_t[6] - dc_phase_t[5],
+           dc_phase_t[7] - dc_phase_t[6], dc_phase_t[8] - dc_phase_t[7]);
+#endif
 }
 
 void validate_dc_inputs(const torch::Tensor& e,
@@ -1713,15 +1760,23 @@ void dc_prep_native_(torch::Tensor e,
 
 @lru_cache(maxsize=1)
 def _load_dc_module():
+    # EIGH_DC_TIMERS=1 builds a debug variant where CTA (0,0) printfs
+    # per-phase cycle counts (see DC_PHASE_MARK); separate module name so the
+    # release build is never polluted.
+    timers = _env_flag("EIGH_DC_TIMERS")
+    name = "eigh_dc_prep_v2_timers" if timers else "eigh_dc_prep_v2"
+    cuda_flags = [f for f in _NATIVE_CUDA_CFLAGS if f != "--use_fast_math"]
+    if timers:
+        cuda_flags.append("-DEIGH_DC_PHASE_TIMERS=1")
     module = load_inline(
-        "eigh_dc_prep_v1",
+        name,
         cpp_sources=_DC_CPP_SOURCE,
         cuda_sources=_DC_CUDA_SOURCE,
         functions=None,
         extra_cflags=_NATIVE_CFLAGS,
         # No fast math: the secular iteration needs exact FP32 division.
-        extra_cuda_cflags=[f for f in _NATIVE_CUDA_CFLAGS if f != "--use_fast_math"],
-        build_directory=_build_directory("eigh_dc_prep_v1"),
+        extra_cuda_cflags=cuda_flags,
+        build_directory=_build_directory(name),
         verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
     )
     module.prepare_dc()
@@ -1938,7 +1993,15 @@ class Eigh:
         dtype: Type[cutlass.Numeric],
         N: int,
         panel_size: int = 1,
-        stage: int = 1,
+        # Matvec cp.async pipeline depth K (row tiles of the trailing block kept in
+        # flight; K=2 double-buffers). Default 2: on B200 the panel kernel is
+        # occupancy-bound, NOT DRAM-bandwidth-bound (nsys b640_n512_ps32: DRAM read
+        # ~25% avg / 55% peak, warps-in-flight ~13%), so higher K only adds smem and
+        # cuts CTAs/SM (K=6 -> 53.5 KB -> 4 CTAs/SM vs K=2 -> ~20 KB -> 6) and
+        # measured SLOWER (52 ms vs 44 ms). The local RTX 4050 2x at K=6 was a
+        # low-bandwidth artifact. Sweep K in {2,3,4} on B200 (all stay 6 CTAs/SM,
+        # register-limited) for a possible small gain; K>=5 drops occupancy.
+        stage: int = 2,
         reduction_dtype=Float32,
         debug_printf: bool = True,
         threads_per_row: Optional[int] = None,
@@ -1948,10 +2011,10 @@ class Eigh:
         self.dtype = dtype
         self.N = N
         self.panel_size = panel_size
-        self.stage = stage
         self.reduction_dtype = reduction_dtype
         self.debug_printf = debug_printf
         self.threads_per_row_override = threads_per_row
+        self.stage = stage
 
     def _threads_per_row(self):
         if self.threads_per_row_override is not None:
@@ -2030,8 +2093,10 @@ class Eigh:
             if cute.rank(tv_layout.shape[0]) == 1
             else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
         )
+        # One stage suffices: every reduction indexes [.., .., 0]. `stage` now
+        # sizes the matvec cp.async pipeline (sA), not this buffer.
         return cute.make_ordered_layout(
-            (num_warps // warps_per_row, warps_per_row, self.stage),
+            (num_warps // warps_per_row, warps_per_row, 1),
             order=(1, 0, 2),
         )
             
@@ -2092,6 +2157,7 @@ class Eigh:
         rows_per_tile = const_expr(num_threads // threads_per_row)
         warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
         num_tiles = cute.ceil_div(panel_n, rows_per_tile)
+        num_stages = const_expr(self.stage)  # matvec cp.async pipeline depth K
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -2107,7 +2173,9 @@ class Eigh:
         )
         sA = smem.allocate_tensor(
             mData.element_type,
-            cute.make_ordered_layout((rows_per_tile, tiler_n, 2), order=(1, 0, 2)),
+            cute.make_ordered_layout(
+                (rows_per_tile, tiler_n, num_stages), order=(1, 0, 2)
+            ),
             byte_alignment=16,
         )
         reduction_buffer = smem.allocate_tensor(
@@ -2171,10 +2239,8 @@ class Eigh:
         # sB's pad tail is read via sBBcast (masked by v's zeros) before it is ever
         # written, so it must start finite. No barrier needed here: the first
         # cross-thread read is beyond column 0's sCol-load barrier.
-        _iket_push("setup")
         for m in cutlass.range(tiler_n // num_threads):
             sB[tidx + m * num_threads] = self.reduction_dtype(0.0)
-        _iket_pop()
 
         # Fully unrolling through 32 keeps the current fast small-panel code.  At
         # larger widths a four-column partial unroll avoids the 64/128-iteration
@@ -2200,10 +2266,10 @@ class Eigh:
                 col_idx = tidx + m * tiled_copy.size
                 pred[0, m] = col_idx >= i and col_idx < panel_n
 
-            _iket_push("col_load_issue")
+            #_iket_push("col_load_issue")
             cute.copy(thr_copy, tCgCol, tCsCol, pred=pred)
             cute.arch.cp_async_commit_group()
-            _iket_pop()
+            #_iket_pop()
 
             # D for the panel's first column is a raw copy: its diagonal (global
             # row panel_start) was finalized by the previous panel's rank-2k
@@ -2235,17 +2301,15 @@ class Eigh:
                     acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
             _iket_pop()
 
-            _iket_push("col_load_wait")
+            #_iket_push("col_load_wait")
             cute.arch.cp_async_wait_group(0)
-            _iket_pop()
-            _iket_push("col_ready_sync")
             cute.arch.barrier()
-            _iket_pop()
+            #_iket_pop()
 
             # Apply the refresh. p < i must stay zero (v's zero prefix, from the
             # predicated load); p >= panel_n untouched keeps sCol's zero tail for the
             # bcast fragments. Uniform at i=0: zero-trip j-loop makes it x - 0.
-            _iket_push("refresh_apply")
+            #_iket_push("refresh_apply")
             for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                 p = tidx + m * num_threads
                 if p >= i and p < panel_n:
@@ -2257,12 +2321,12 @@ class Eigh:
                 # never -1).
                 if p == i - 1:
                     mD[bidx, col] = Float32(mA[p, p]) - acc[m]
-            _iket_pop()
+            #_iket_pop()
             # The subtract rewrote sCol thread-strided; alpha and the reflector's
             # sColBcast fragments read other threads' elements.
-            _iket_push("refresh_sync")
+            #_iket_push("refresh_sync")
             cute.arch.barrier()
-            _iket_pop()
+            #_iket_pop()
 
             _iket_push("reflector")
             alpha = Float32(sCol[i])
@@ -2319,18 +2383,26 @@ class Eigh:
                     )
             _iket_pop()
 
-            # b = A' @ v over the trailing (panel_n x panel_n) block, pipelined over row tiles:
-            # prefetch tile t+1 while reducing tile t. Each thread reads back exactly the smem
-            # elements it copied, so no barrier is needed around sA. Columns < i are loaded
-            # but multiply v's zeros; masking them off the load measured slower (a dynamic
-            # predicate defeats the constant folding a static limit gets) for <2% traffic.
-            _iket_push("a0_issue")
-            gA0 = cute.local_tile(mA, (rows_per_tile, tiler_n), (0, 0))
-            tAgA0 = thr_matvec.partition_S(gA0)
-            if local_row < panel_n:
-                cute.copy(thr_matvec, tAgA0, tAsA[None, None, None, 0], pred=tApA)
-            cute.arch.cp_async_commit_group()
-            _iket_pop()
+            # b = A' @ v over the trailing (panel_n x panel_n) block, marched over row
+            # tiles with a K = num_stages deep cp.async pipeline (K-1 tiles in flight).
+            # Prologue: issue the first K-1 tiles here, *before* the inner GEMVs, so those
+            # loads proceed while the corrections run and the matvec opens at steady state.
+            # Each thread reads back exactly the smem it copied, so no barrier is needed
+            # around sA. Columns < i are loaded but multiply v's zeros; masking them off
+            # measured slower (a dynamic predicate defeats the static-limit constant
+            # folding) for <2% traffic. The whole-tile row guard also skips the
+            # out-of-range local_tile for panels with fewer than K-1 tiles.
+            #_iket_push("prefetch")
+            for s in cutlass.range_constexpr(num_stages - 1):
+                if s < num_tiles:
+                    gAs = cute.local_tile(mA, (rows_per_tile, tiler_n), (s, 0))
+                    tAgAs = thr_matvec.partition_S(gAs)
+                    if s * rows_per_tile + local_row < panel_n:
+                        cute.copy(
+                            thr_matvec, tAgAs, tAsA[None, None, None, s], pred=tApA
+                        )
+                cute.arch.cp_async_commit_group()
+            #_iket_pop()
 
             # Deferred-update corrections, inner GEMVs (dlatrd.f:316-318, 322-324):
             # s_w = W^T v, s_v = V^T v over the i accumulated panel columns, placed
@@ -2374,28 +2446,32 @@ class Eigh:
 
             _iket_push("matvec")
             for t in cutlass.range(num_tiles):
+                # Issue the tile K-1 ahead of the one being consumed, keeping K-1
+                # cp.async groups in flight; wait_group(K-1) below then guarantees
+                # tile t (buffer t % K) has landed while t+1..t+K-1 keep flowing.
                 #_iket_push("matvec_async_load")
-                if t + 1 < num_tiles:
-                    gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (t + 1, 0))
+                nxt = t + (num_stages - 1)
+                if nxt < num_tiles:
+                    gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (nxt, 0))
                     tAgA_next = thr_matvec.partition_S(gA_next)
-                    if (t + 1) * rows_per_tile + local_row < panel_n:
+                    if nxt * rows_per_tile + local_row < panel_n:
                         cute.copy(
                             thr_matvec,
                             tAgA_next,
-                            tAsA[None, None, None, (t + 1) % 2],
+                            tAsA[None, None, None, nxt % num_stages],
                             pred=tApA,
                         )
                 cute.arch.cp_async_commit_group()
                 #_iket_pop()
                 
-                cute.arch.cp_async_wait_group(1)
+                cute.arch.cp_async_wait_group(num_stages - 1)
                 
                 #_iket_push("matvec_reg_load")
                 if const_expr(warps_per_row > 1):
                     # Keep a fast row group from overwriting reduction_buffer before slow
                     # warps have read the previous reduction.
                     cute.arch.barrier()
-                cute.autovec_copy(tAsA[None, None, None, t % 2], tArA)
+                cute.autovec_copy(tAsA[None, None, None, t % num_stages], tArA)
                 #_iket_pop()
                 
                 #_iket_push("matvec_reduce")
@@ -2414,9 +2490,9 @@ class Eigh:
 
             # All threads read sCol/reduction_buffer during the matvec; sync so the
             # outer correction below sees the complete sB and this column's sSw/sSv.
-            _iket_push("matvec_sync")
+            #_iket_push("matvec_sync")
             cute.arch.barrier()
-            _iket_pop()
+            #_iket_pop()
 
             # Deferred-update corrections, outer GEMVs (dlatrd.f:319-321, 325-327):
             # b -= V s_w + W s_v. Same thread-per-row / serial-j register
@@ -2430,7 +2506,7 @@ class Eigh:
             # exact sB rows it writes.
             _iket_push("outer_corr")
             if i > 0:
-                _iket_push("outer_corr_accum")
+                #_iket_push("outer_corr_accum")
                 for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                     acc[m] = Float32(0.0)
                 for j in cutlass.range(i):
@@ -2439,18 +2515,18 @@ class Eigh:
                     for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                         p = tidx + m * num_threads
                         acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
-                _iket_pop()
-                _iket_push("outer_corr_apply")
+                #_iket_pop()
+                #_iket_push("outer_corr_apply")
                 for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                     p = tidx + m * num_threads
                     if p < panel_n:
                         sB[p] = Float32(sB[p]) - acc[m]
-                _iket_pop()
+                #_iket_pop()
             _iket_pop()
             # Warp lane 0s rewrote sB; the w formation below reads every row.
-            _iket_push("outer_sync")
+            #_iket_push("outer_sync")
             cute.arch.barrier()
-            _iket_pop()
+            #_iket_pop()
 
             # w_i = tau*b + (-tau/2)(w^T v) v (dlatrd.f:328-331), using w^T v = tau*(b^T v).
             # sB's pad tail is zero-initialized and never written, so v's zeros mask it.
@@ -2475,9 +2551,9 @@ class Eigh:
             # The w store reads sCol/sB and appends the V/W rows consumed by the next
             # column's inner GEMVs (CTA barrier orders the gmem writes for this CTA —
             # all its threads share one SM's L1); sync before cp.async reuses sCol.
-            _iket_push("column_sync")
+            #_iket_push("column_sync")
             cute.arch.barrier()
-            _iket_pop()
+            #_iket_pop()
             _iket_pop()
         _iket_pop()
     
@@ -2529,6 +2605,7 @@ class Eigh:
         debug_printf: bool = True,
         panel_size: int = 1,
         threads_per_row: Optional[int] = None,
+        stage: int = 2,
     ):
         obj = Eigh(
             data_dtype,
@@ -2536,6 +2613,7 @@ class Eigh:
             panel_size=panel_size,
             debug_printf=debug_printf,
             threads_per_row=threads_per_row,
+            stage=stage,
         )
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
@@ -2577,6 +2655,7 @@ def run_panel_with_update(
     backend: Rank2KBackend = "cublas",
     debug_printf: bool = False,
     threads_per_row: Optional[int] = None,
+    stage: int = 2,
     queue_handle: int = 0,
 ) -> torch.Tensor:
     """Factor one DLATRD panel, then update its unreduced trailing block.
@@ -2596,6 +2675,7 @@ def run_panel_with_update(
         debug_printf=debug_printf,
         panel_size=panel_size,
         threads_per_row=threads_per_row,
+        stage=stage,
     )
     compiled(data, D, E, v_ws, w_ws, panel_start)
     return rank2k_update_(
@@ -2615,6 +2695,7 @@ def tridiagonalize_(
     queue_handle: int = 0,
     debug_printf: bool = False,
     threads_per_row: Optional[int] = None,
+    stage: int = 2,
 ) -> None:
     """Full blocked Householder tridiagonalization (lower DSYTRD flow).
 
@@ -2646,6 +2727,7 @@ def tridiagonalize_(
             debug_printf=debug_printf,
             panel_size=panel_size,
             threads_per_row=threads_per_row,
+            stage=stage,
         )
         for j in range(full):
             panel_start = j * panel_size
@@ -2660,6 +2742,7 @@ def tridiagonalize_(
             debug_printf=debug_printf,
             panel_size=tail,
             threads_per_row=threads_per_row,
+            stage=stage,
         )
         # The tail kernel was compiled against a workspace with fewer padded
         # rows; a leading-rows slice keeps the strides it expects.
