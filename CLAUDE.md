@@ -100,6 +100,30 @@ The connected graph gate also passed on B200 at 2×35 ps=8/bt=16/leaf=32 for ran
 
 The largest pure-custom loss remaining is 20×32 launch overhead (equal geomean leverage to the fixed 2048 case: bringing it to torch parity is worth ~+0.12 aggregate; a fused small-N single-kernel path is the known lever). The 8×2048 CTA starvation is fixed by the cluster panel (0.35× → 1.44×); its residual budget is tridiag 77 ms (see cluster section — 8→16 CTAs only gained 9%, so per-column serial/redundant floor and rank2k are the next levers there) + dc_prep m=2048 merge ~12 ms + BacktransformT ~9 ms (both 8-CTA-starved, same pattern as the panel was). 60×1024 remains ~1.05× — try cluster_size=2 (knob exists, pure sweep). Shape fallback is deliberately not part of the current implementation.
 
+## Fused 20×32 HEEV specialization
+
+`custom_kernel` now dispatches exact `(batch, N) == (20, 32)` inputs to a separate native cuSolverDx HEEV extension. One CTA handles one matrix and performs dense tridiagonalization, HTEV, and eigenvector formation inside a single device launch; the general panel/D&C/backtransform pipeline and its workspaces are not entered. The extension allocates and returns Q/L from its C++ binding and reuses a cached 20-entry status buffer.
+
+Each CTA loads the input once into shared memory and computes the maximum absolute row sum `scale`. It solves `A / scale + 2I` (`scale=1` for the zero matrix), then returns `(lambda-2)*scale`; this keeps the internal spectrum in `[1,3]`, avoids the known zero-spectrum HTEV failure, preserves the input, and retains FP32 output. `EIGH_SMALL_HEEV_NT={32,64,128,256,512,1024}` and `EIGH_SMALL_HEEV_FILL={lower,upper}` are cache-keyed sweep controls.
+
+**B200 sweep (2026-07-14, JSON `profiles/eigh_small_heev/small_heev_20260714T214258Z.json`)**: all six width/triangle configurations passed 11 stress families with zero HEEV statuses, including zero/rank-deficient/clustered and high/low-magnitude inputs. The best observed configuration, now the production default, was **NT=128/upper: 0.147886 ms custom vs 0.153777 ms torch = 1.040×**. This is a **2.11× reduction** from the stable pre-fusion 0.313 ms custom baseline and is worth about a 5.9% aggregate-geomean improvement by itself. The torch control varied 0.148–0.159 ms across separately timed configurations, so the 4% head-to-head edge is not yet a robust win; the harness now alternates provider order per repeat for confirmation. NT=128 was directionally better than NT=32 (0.152–0.148 vs 0.157 ms), while the upper-vs-lower difference was negligible except in the final NT=128 run.
+
+**Wider-CTA confirmation (JSON `profiles/eigh_small_heev/small_heev_20260714T215203Z.json`)**: provider order alternated and the corrected final status read was all zeros. Upper-triangle custom means were **NT128 0.148212**, NT256 0.154673, NT512 0.156889, NT1024 0.177967 ms, so 128 is the clear optimum; extra warps/barriers dominate beyond it. Torch was anomalously high for the first variant (0.163848) and stable near 0.1543 for the other three, so the printed 1.105× NT128 ratio overstates the robust advantage; use the repeated ~1.04× comparison from the two sessions. No wider HEEV CTA work remains.
+
+Focused harnesses:
+
+```bash
+# Local GPU: 11 stress families, status inspection, and exact 50-input timing.
+MATHDX_ROOT=$PWD/nvidia-mathdx-26.06.0-cuda13/nvidia/mathdx/26.06 \
+  .venv/bin/python eigh_bench_local_rtx4050.py --small-heev --bench \
+  --bench-repeats 5
+
+# B200: correctness + evaluator-faithful sweep of CTA widths and triangle choice.
+.venv/bin/modal run eigh_bench_b200_modal.py --small-heev --repeats 5
+```
+
+After the first six-way sweep selected NT=128/upper, the default Modal sweep was narrowed to upper-triangle NT ∈ {128,256,512,1024}; the measured 32→64→128 trend was still improving, so these wider CTAs are the next low-risk tuning pass before considering a custom Jacobi algorithm.
+
 ## D&C tridiagonal eigensolver (`tridiag_eig_dc_` in `eigh.py`)
 
 Batched divide & conquer (LAPACK dstedc/dlaed0-4 chain) for step 2, fully on-device and CUDA-graph capturable — the deflation count K never reaches the host. Motivating profile (2026-07-14 nsys, `profiles/eigh_nsys/b640_n512_ps16_cublas_*`): raw cuSolverDx htev at N=512 silently fell to `Thread()` execution (one thread solves one 512×512 problem serially, 1 MB gmem eigenvector matrix per thread) and took **38 s** vs 43 ms tridiag. Block-mode htev with `Job<all_vectors>` is smem-resident by design: `4N² ≲ smem` caps it at **N ≤ ~240 on B200, ~157 on sm89** — `_load_htev_module` now **raises** on the thread-mode fallback instead of compiling the ~1000x-slower path.

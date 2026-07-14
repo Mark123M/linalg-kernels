@@ -866,6 +866,167 @@ void htev_all_vectors_native_(at::Tensor d,
 """
 
 
+_SMALL_HEEV_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+std::tuple<at::Tensor, at::Tensor> small_heev_native(
+    at::Tensor data, at::Tensor info, int64_t queue_handle);
+void prepare_small_heev_native();
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("small_heev", &small_heev_native, "Fused 20x32 symmetric eigensolver");
+  m.def("prepare_small_heev", &prepare_small_heev_native,
+        "Prepare fused 20x32 symmetric eigensolver");
+}
+"""
+
+
+_SMALL_HEEV_CUDA_SOURCE = r"""
+#include <ATen/ATen.h>
+#include <cusolverdx.hpp>
+#include <cusolverdx_io.hpp>
+
+namespace {
+
+using QueueT = """ + _QUEUE_TYPE + r""";
+
+constexpr int kBatch = 20;
+constexpr int kN = 32;
+constexpr int kArch = EIGH_SMALL_HEEV_ARCH;
+constexpr int kThreads = EIGH_SMALL_HEEV_NT;
+constexpr float kShift = 2.0f;
+
+using namespace cusolverdx;
+#if EIGH_SMALL_HEEV_LOWER
+constexpr auto kFill = fill_mode::lower;
+#else
+constexpr auto kFill = fill_mode::upper;
+#endif
+
+using SmallHEEV = decltype(
+    Size<kN>() + Precision<float>() + Type<type::real>() + Function<heev>() +
+    FillMode<kFill>() + Arrangement<arrangement::row_major>() +
+    Job<job::overwrite_vectors>() + SM<kArch>() + Block() +
+    BlockDim<kThreads>() + BatchesPerBlock<1>());
+
+static_assert(SmallHEEV::block_dim.x == kThreads && SmallHEEV::block_dim.y == 1 &&
+                  SmallHEEV::block_dim.z == 1,
+              "HEEV block dimensions do not match the fixed launch");
+static_assert(sizeof(typename SmallHEEV::status_type) == sizeof(int),
+              "HEEV status type must be int32");
+
+constexpr int align16(int bytes) { return (bytes + 15) & ~15; }
+constexpr int kSharedBytes = align16(SmallHEEV::shared_memory_size) + 16;
+
+__global__ void small_heev_kernel(const float* data, float* q, float* values,
+                                  int* info) {
+  CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(SmallHEEV);
+  const int batch_idx = static_cast<int>(blockIdx.x);
+  const int tid = static_cast<int>(threadIdx.x);
+  const long long base = static_cast<long long>(batch_idx) * kN * kN;
+
+  extern __shared__ __align__(16) unsigned char storage[];
+  auto [a_shared, lambda_shared, work_shared] =
+      cusolverdx::shared_memory::slice<float, float, float>(
+          storage, alignof(float), SmallHEEV::lda * kN, alignof(float), kN,
+          alignof(float));
+  float* scale_shared = reinterpret_cast<float*>(
+      storage + align16(SmallHEEV::shared_memory_size));
+
+  if (tid == 0) {
+    *scale_shared = 0.0f;
+  }
+  __syncthreads();
+
+  // One warp loads each contiguous row and computes its absolute row sum.
+  // The maximum row sum bounds the spectral radius after normalization.
+  if (tid < 32) {
+#pragma unroll
+    for (int row = 0; row < kN; ++row) {
+      const float x = data[base + row * kN + tid];
+      a_shared[row * SmallHEEV::lda + tid] = x;
+      float row_sum = fabsf(x);
+#pragma unroll
+      for (int delta = 16; delta > 0; delta >>= 1) {
+        row_sum += __shfl_down_sync(0xffffffffu, row_sum, delta);
+      }
+      if (tid == 0) {
+        *scale_shared = fmaxf(*scale_shared, row_sum);
+      }
+    }
+  }
+  __syncthreads();
+
+  float scale = *scale_shared;
+  if (scale == 0.0f) {
+    scale = 1.0f;
+  }
+  for (int idx = tid; idx < kN * kN; idx += kThreads) {
+    const int row = idx / kN;
+    const int col = idx - row * kN;
+    float x = a_shared[row * SmallHEEV::lda + col] / scale;
+    if (row == col) {
+      x += kShift;
+    }
+    a_shared[row * SmallHEEV::lda + col] = x;
+  }
+  __syncthreads();
+
+  SmallHEEV().execute(a_shared, SmallHEEV::lda, lambda_shared, work_shared,
+                      info + batch_idx);
+  __syncthreads();
+
+  for (int idx = tid; idx < kN * kN; idx += kThreads) {
+    const int row = idx / kN;
+    const int col = idx - row * kN;
+    q[base + idx] = a_shared[row * SmallHEEV::lda + col];
+  }
+  for (int col = tid; col < kN; col += kThreads) {
+    values[batch_idx * kN + col] = (lambda_shared[col] - kShift) * scale;
+  }
+}
+
+void validate_small_heev_inputs(const at::Tensor& data, const at::Tensor& info) {
+  TORCH_CHECK(data.is_cuda() && info.is_cuda(), "data and info must be CUDA tensors");
+  TORCH_CHECK(data.scalar_type() == at::kFloat, "data must be FP32");
+  TORCH_CHECK(info.scalar_type() == at::kInt, "info must be int32");
+  TORCH_CHECK(data.is_contiguous() && info.is_contiguous(),
+              "data and info must be contiguous");
+  TORCH_CHECK(data.dim() == 3 && data.size(0) == kBatch && data.size(1) == kN &&
+                  data.size(2) == kN,
+              "data must have shape (20, 32, 32)");
+  TORCH_CHECK(info.dim() == 1 && info.size(0) == kBatch,
+              "info must have shape (20,)");
+  TORCH_CHECK(data.device() == info.device(), "data and info must share a device");
+}
+
+}  // namespace
+
+void prepare_small_heev_native() {
+  auto status = cudaFuncSetAttribute(small_heev_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     kSharedBytes);
+  TORCH_CHECK(status == cudaSuccess, "small HEEV shared-memory setup failed: ",
+              cudaGetErrorString(status));
+}
+
+std::tuple<at::Tensor, at::Tensor> small_heev_native(
+    at::Tensor data, at::Tensor info, int64_t queue_handle) {
+  validate_small_heev_inputs(data, info);
+  auto q = at::empty_like(data);
+  auto values = at::empty({kBatch, kN}, data.options());
+  const QueueT queue = reinterpret_cast<QueueT>(queue_handle);
+  small_heev_kernel<<<kBatch, SmallHEEV::block_dim, kSharedBytes, queue>>>(
+      data.data_ptr<float>(), q.data_ptr<float>(), values.data_ptr<float>(),
+      info.data_ptr<int>());
+  auto status = cudaPeekAtLastError();
+  TORCH_CHECK(status == cudaSuccess, "small HEEV launch failed: ",
+              cudaGetErrorString(status));
+  return {q, values};
+}
+"""
+
+
 def _cublas_link_flags() -> list[str]:
     # Known pip-wheel layouts: consolidated cu13 wheels, then per-library cu12/cu13
     # wheels. Fall back to the toolkit's libcublas on the default linker path.
@@ -1119,6 +1280,117 @@ def _build_htev_extension(
     return _load_extension_file(name, output_path)
 
 
+def _small_heev_config() -> tuple[int, bool]:
+    nt = int(os.environ.get("EIGH_SMALL_HEEV_NT", "128"))
+    valid_nt = (32, 64, 128, 256, 512, 1024)
+    if nt not in valid_nt:
+        raise ValueError(
+            f"EIGH_SMALL_HEEV_NT must be one of {valid_nt}, got {nt}"
+        )
+    fill = os.environ.get("EIGH_SMALL_HEEV_FILL", "upper").strip().lower()
+    if fill not in ("lower", "upper"):
+        raise ValueError(
+            f"EIGH_SMALL_HEEV_FILL must be 'lower' or 'upper', got {fill!r}"
+        )
+    return nt, fill == "lower"
+
+
+def _build_small_heev_extension(
+    name: str,
+    arch_name: str,
+    arch: int,
+    nt: int,
+    lower: bool,
+):
+    from setuptools import Distribution
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    include_paths, fatbin = _cusolverdx_assets()
+    build_root = _SMALL_HEEV_BUILD_ROOT / name
+    build_root.mkdir(parents=True, exist_ok=True)
+    cpp_path = build_root / "binding.cpp"
+    cuda_path = build_root / "small_heev.cu"
+    cpp_path.write_text(_SMALL_HEEV_CPP_SOURCE)
+    cuda_path.write_text(_SMALL_HEEV_CUDA_SOURCE)
+
+    nvcc_flags = [flag for flag in _NATIVE_CUDA_CFLAGS if flag != "--use_fast_math"] + [
+        "-rdc=true",
+        (
+            "-gencode=arch=compute_100a,code=lto_100a"
+            if arch_name == "sm100a"
+            else "-gencode=arch=compute_89,code=lto_89"
+        ),
+        f"-DEIGH_SMALL_HEEV_ARCH={arch}",
+        f"-DEIGH_SMALL_HEEV_NT={nt}",
+        f"-DEIGH_SMALL_HEEV_LOWER={int(lower)}",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+    ]
+    extension = CUDAExtension(
+        name=name,
+        sources=[str(cpp_path), str(cuda_path)],
+        include_dirs=include_paths,
+        extra_compile_args={
+            "cxx": _NATIVE_CFLAGS,
+            "nvcc": nvcc_flags,
+            "nvcc_dlink": [fatbin, "-dlink", "-dlto"],
+        },
+    )
+    distribution = Distribution({"name": name, "ext_modules": [extension]})
+    distribution.cmdclass = {
+        "build_ext": BuildExtension.with_options(use_ninja=True, no_python_abi_suffix=False)
+    }
+    command = distribution.get_command_obj("build_ext")
+    command.ensure_finalized()
+    command.build_lib = str(build_root)
+    command.build_temp = str(build_root / "objects")
+    command.inplace = False
+    command.force = False
+    with _extension_arch(arch_name):
+        command.run()
+    output_path = Path(command.get_ext_fullpath(name))
+    if not output_path.is_file():
+        matches = sorted(build_root.glob(f"{name}*.so"))
+        if not matches:
+            raise RuntimeError(
+                f"small HEEV extension build produced no module under {build_root}"
+            )
+        output_path = matches[-1]
+    return _load_extension_file(name, output_path)
+
+
+@lru_cache(maxsize=None)
+def _load_small_heev_module(
+    arch_name: str,
+    arch: int,
+    nt: int,
+    lower: bool,
+):
+    source_tag = hashlib.sha256(
+        (_SMALL_HEEV_CPP_SOURCE + _SMALL_HEEV_CUDA_SOURCE).encode()
+    ).hexdigest()[:10]
+    fill_tag = "lo" if lower else "up"
+    name = f"eigh_small_heev_20x32_{arch_name}_nt{nt}_{fill_tag}_{source_tag}"
+    build_root = _SMALL_HEEV_BUILD_ROOT / name
+    build_root.mkdir(parents=True, exist_ok=True)
+    lock_path = build_root / "build.lock"
+    with FileLock(lock_path, exclusive=True, timeout=max(LOCK_TIMEOUT, 600)):
+        if name in sys.modules:
+            module = sys.modules[name]
+        else:
+            matches = sorted(build_root.glob(f"{name}*.so"))
+            if matches:
+                module = _load_extension_file(name, matches[-1])
+            else:
+                module = _build_small_heev_extension(
+                    name, arch_name, arch, nt, lower
+                )
+    module.prepare_small_heev()
+    return module
+
+
 def _htev_shared_memory_size(n: int) -> int:
     align16 = lambda size: (size + 15) & ~15
     return align16(4 * n) + align16(4 * (n - 1)) + align16(4 * n * n)
@@ -1257,6 +1529,52 @@ def warm_htev(n: int) -> None:
         raise ValueError(f"HTEV requires N >= 2, got {n}")
     arch_name, arch = _current_arch()
     _load_htev_module(n, arch_name, arch)
+
+
+_SMALL_HEEV_INFO_CACHE: dict[tuple[str, Optional[int]], torch.Tensor] = {}
+
+
+def warm_small_heev_20x32() -> None:
+    """Compile and prepare the exact 20x32 fused HEEV specialization."""
+    arch_name, arch = _current_arch()
+    nt, lower = _small_heev_config()
+    _load_small_heev_module(arch_name, arch, nt, lower)
+
+
+def _small_heev_info(device: torch.device) -> torch.Tensor:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (device.type, device.index)
+    info = _SMALL_HEEV_INFO_CACHE.get(key)
+    if info is None:
+        info = torch.empty(20, device=device, dtype=torch.int32)
+        _SMALL_HEEV_INFO_CACHE[key] = info
+    return info
+
+
+def small_heev_20x32(
+    data: torch.Tensor,
+    *,
+    queue_handle: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed-shape fused HEEV path and return ``(Q, L)``."""
+    if (
+        data.shape != (20, 32, 32)
+        or data.dtype != torch.float32
+        or not data.is_cuda
+        or not data.is_contiguous()
+    ):
+        raise ValueError("small HEEV requires contiguous CUDA FP32 data shaped (20, 32, 32)")
+    arch_name, arch = _current_arch()
+    nt, lower = _small_heev_config()
+    module = _load_small_heev_module(arch_name, arch, nt, lower)
+    return module.small_heev(data, _small_heev_info(data.device), queue_handle)
+
+
+def small_heev_info_20x32(device: torch.device) -> torch.Tensor:
+    """Return the reusable status buffer; inspect only after synchronization."""
+    return _small_heev_info(device)
 
 
 def _validate_htev_python_inputs(
@@ -3901,6 +4219,8 @@ def _custom_workspace(data: torch.Tensor) -> FullEighWorkspace:
 
 def custom_kernel(data: input_t) -> output_t:
     batch, n, _ = data.shape
+    if batch == 20 and n == 32:
+        return small_heev_20x32(data)
     if n == 1:
         return torch.ones_like(data), data[:, 0, 0].clone()
     vectors = torch.empty_like(data)

@@ -1519,6 +1519,97 @@ def check_full_eigh(
     return random_ok and zero_ok and divisible_ok
 
 
+_SMALL_HEEV_STRESS_CASES = (
+    ("dense", 1),
+    ("lapack_zero", 0),
+    ("lapack_identity", 0),
+    ("lapack_diag_geometric_spectrum", 0),
+    ("rankdef", 0),
+    ("nearrank", 0),
+    ("repeated", 0),
+    ("clustered", 0),
+    ("rowscale", 4),
+    ("lapack_random_symmetric_high_magnitude", 0),
+    ("lapack_random_symmetric_low_magnitude", 0),
+)
+
+
+def check_small_heev_20x32() -> bool:
+    """Validate the fixed fused path across the ranked stress families."""
+    all_ok = True
+    for index, (case, cond) in enumerate(_SMALL_HEEV_STRESS_CASES):
+        data = generate_input(20, 32, cond, 91000 + index, case=case)
+        before = data.clone()
+        Q, L = eigh.small_heev_20x32(data)
+        torch.cuda.synchronize()
+        bad = torch.nonzero(
+            eigh.small_heev_info_20x32(data.device), as_tuple=False
+        ).flatten().tolist()
+        good, message = check_implementation(data, (Q, L))
+        preserved = bool(torch.equal(data, before))
+        case_ok = good and not bad and preserved
+        print(
+            f"small HEEV case={case} ok={case_ok} info_bad={bad} "
+            f"input_preserved={preserved} {message}",
+            flush=True,
+        )
+        all_ok &= case_ok
+    return all_ok
+
+
+def benchmark_small_heev_20x32(repeats: int = 5) -> dict[str, list[float]]:
+    """Time the exact 50-input evaluator workload for fused HEEV and torch."""
+    spec = dict(OFFICIAL_BENCHMARK_CASES[0])
+    data_list = []
+    for _ in range(50):
+        spec["seed"] += 42
+        data_list.append(generate_input(**spec))
+
+    def custom_provider(data: torch.Tensor):
+        return eigh.small_heev_20x32(data)
+
+    def torch_provider(data: torch.Tensor):
+        values, vectors = torch.linalg.eigh(data)
+        return vectors, values
+
+    def clear_l2() -> None:
+        scratch = torch.empty((32, 1024, 1024), device="cuda", dtype=torch.int64)
+        scratch.fill_(42)
+
+    providers = {"custom": custom_provider, "torch": torch_provider}
+    for name, provider in providers.items():
+        outputs = [provider(data) for data in data_list]
+        torch.cuda.synchronize()
+        good, message = check_implementation(data_list[0], outputs[0])
+        if not good:
+            raise RuntimeError(f"small HEEV benchmark preflight failed for {name}: {message}")
+
+    # Alternate provider order so slow host/GPU drift cannot systematically
+    # favor the provider timed second in every repeat.
+    results: dict[str, list[float]] = {"custom": [], "torch": []}
+    for repeat in range(repeats):
+        order = ("custom", "torch") if repeat % 2 == 0 else ("torch", "custom")
+        for name in order:
+            provider = providers[name]
+            torch.cuda.synchronize()
+            clear_l2()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            outputs = [provider(data) for data in data_list]
+            end.record()
+            torch.cuda.synchronize()
+            results[name].append(start.elapsed_time(end) / len(data_list))
+
+    for name, samples in results.items():
+        print(
+            f"small HEEV bench provider={name} samples_ms={samples} "
+            f"mean_ms={mean(samples):.6f}",
+            flush=True,
+        )
+    return results
+
+
 def torch_tridiag_reference(data: torch.Tensor, panel_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """float64 D/E ground truth: the full blocked DLATRD + DSYR2K recurrence."""
     A = data.double().clone()
@@ -2564,6 +2655,12 @@ def main() -> None:
         "and blocked eigenvector backtransform.",
     )
     parser.add_argument(
+        "--small-heev",
+        action="store_true",
+        help="Validate the exact fused 20x32 HEEV path; combine with --bench "
+        "for the evaluator-faithful 50-input comparison.",
+    )
+    parser.add_argument(
         "--backtransform-t",
         action="store_true",
         help="Factor the input and validate the reverse-blocked compact-WY "
@@ -2695,12 +2792,13 @@ def main() -> None:
             args.tri,
             args.tri_solve,
             args.full_eigh,
+            args.small_heev,
             args.backtransform_t,
             args.backtransform,
         )
     ) > 1:
         parser.error(
-            "--tri, --tri-solve, --full-eigh, --backtransform-t, and "
+            "--tri, --tri-solve, --full-eigh, --small-heev, --backtransform-t, and "
             "--backtransform are mutually exclusive"
         )
     if args.backtransform_t and any(
@@ -2780,6 +2878,25 @@ def main() -> None:
         torch.empty((), device=device)
     except Exception as exc:
         raise SystemExit(f"CUDA device allocation failed: {exc}") from exc
+    if args.small_heev:
+        nt, lower = eigh._small_heev_config()
+        print(
+            f"small HEEV config: nt={nt} fill={'lower' if lower else 'upper'}",
+            flush=True,
+        )
+        if not check_small_heev_20x32():
+            raise SystemExit("small HEEV correctness gate failed")
+        print("small HEEV correctness gate passed", flush=True)
+        if args.bench:
+            results = benchmark_small_heev_20x32(args.bench_repeats)
+            custom_mean = mean(results["custom"])
+            torch_mean = mean(results["torch"])
+            print(
+                f"small HEEV speedup={torch_mean / custom_mean:.4f}x "
+                f"custom_mean_ms={custom_mean:.6f} torch_mean_ms={torch_mean:.6f}",
+                flush=True,
+            )
+        return
     data = make_input(args.batch, args.n, DTYPE, device)
 
     print(f"input: shape={tuple(data.shape)} dtype={data.dtype} device={data.device}", flush=True)

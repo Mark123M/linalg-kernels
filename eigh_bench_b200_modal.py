@@ -24,6 +24,8 @@ Usage:
     # exact ranked evaluator comparison (all 13 cases):
     modal run eigh_bench_b200_modal.py --official-eigh --panel-size 16 \
         --backtransform-block-size 16 --leaf-size 32 --backends cublas
+    # exact 20x32 fused HEEV correctness and six-configuration sweep:
+    modal run eigh_bench_b200_modal.py --small-heev --repeats 5
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
 """
@@ -438,6 +440,55 @@ def bench_official_eigh(
     }
     print("=== official comparison summary ===", flush=True)
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    _report_env("end")
+    cache_vol.commit()
+    return payload
+
+
+@app.function(gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
+def bench_small_heev_variant(nt: int, fill: str, repeats: int) -> dict:
+    """Validate and time one exact-shape fused HEEV configuration."""
+    import os
+    import sys
+    import types
+
+    os.makedirs("/cache/tmp", exist_ok=True)
+    os.makedirs("/cache/cute", exist_ok=True)
+    os.environ["EIGH_SMALL_HEEV_NT"] = str(nt)
+    os.environ["EIGH_SMALL_HEEV_FILL"] = fill
+    sys.path.insert(0, "/workspace")
+
+    import bench_utils
+    import torch
+
+    for name, mod in (
+        ("quack", types.ModuleType("quack")),
+        ("quack.bench", types.ModuleType("quack.bench")),
+        ("quack.bench.bench_utils", bench_utils),
+    ):
+        sys.modules.setdefault(name, mod)
+
+    import eigh_bench_local_rtx4050 as runner
+
+    _report_env("start")
+    if not runner.check_small_heev_20x32():
+        raise RuntimeError(f"small HEEV correctness failed for nt={nt} fill={fill}")
+    samples = runner.benchmark_small_heev_20x32(repeats)
+    custom_mean = sum(samples["custom"]) / len(samples["custom"])
+    torch_mean = sum(samples["torch"]) / len(samples["torch"])
+    info = runner.eigh.small_heev_info_20x32(torch.device("cuda")).tolist()
+    payload = {
+        "nt": nt,
+        "fill": fill,
+        "repeats": repeats,
+        "custom_samples_ms": samples["custom"],
+        "torch_samples_ms": samples["torch"],
+        "custom_mean_ms": custom_mean,
+        "torch_mean_ms": torch_mean,
+        "speedup_torch_over_custom": torch_mean / custom_mean,
+        "info": info,
+    }
+    print(payload, flush=True)
     _report_env("end")
     cache_vol.commit()
     return payload
@@ -1021,6 +1072,9 @@ def main(
     bench_eigh: bool = False,
     tri: bool = False,
     tri_solve: bool = False,
+    small_heev: bool = False,
+    small_variants: str = "128:upper,256:upper,512:upper,1024:upper",
+    small_output: str = "profiles/eigh_small_heev",
     official_eigh: bool = False,
     official_output: str = "profiles/eigh_official",
     stages: str = "",
@@ -1041,15 +1095,17 @@ def main(
     nsys_gpu_metrics_frequency: int = 10000,
     nsys_output: str = "profiles/eigh_nsys",
 ) -> None:
-    if sum((tri, tri_solve, official_eigh)) > 1:
-        raise SystemExit("--tri, --tri-solve, and --official-eigh are mutually exclusive")
-    if nsys and (trace or tri or tri_solve or official_eigh):
+    if sum((tri, tri_solve, small_heev, official_eigh)) > 1:
+        raise SystemExit(
+            "--tri, --tri-solve, --small-heev, and --official-eigh are mutually exclusive"
+        )
+    if nsys and (trace or tri or tri_solve or small_heev or official_eigh):
         raise SystemExit(
             "--nsys is mutually exclusive with --trace, --tri, --tri-solve, "
-            "and --official-eigh"
+            "--small-heev, and --official-eigh"
         )
-    if trace and official_eigh:
-        raise SystemExit("--trace and --official-eigh are mutually exclusive")
+    if trace and (small_heev or official_eigh):
+        raise SystemExit("--trace is mutually exclusive with --small-heev and --official-eigh")
     parsed_cases = []
     for item in cases.split(","):
         batch, _, n = item.strip().lower().partition("x")
@@ -1075,6 +1131,51 @@ def main(
         raise SystemExit("--clusters sweeps are only supported with --tri")
     if any(not 1 <= x <= 16 for x in cluster_list):
         raise SystemExit("--clusters entries must be in [1, 16]")
+    if small_heev:
+        variants = []
+        for item in small_variants.split(","):
+            nt_text, separator, fill = item.strip().partition(":")
+            if not separator or int(nt_text) not in (
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+            ) or fill not in (
+                "lower",
+                "upper",
+            ):
+                raise SystemExit(
+                    "--small-variants entries must be NT:fill with NT in "
+                    "{32,64,128,256,512,1024} and fill in {lower,upper}"
+                )
+            variants.append((int(nt_text), fill))
+        if not variants:
+            raise SystemExit("--small-variants must not be empty")
+        rows = [
+            bench_small_heev_variant.remote(nt, fill, repeats)
+            for nt, fill in variants
+        ]
+        import json
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        payload = {"timestamp_utc": timestamp, "variants": rows}
+        output_dir = Path(small_output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"small_heev_{timestamp}.json"
+        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        best = min(rows, key=lambda row: row["custom_mean_ms"])
+        print(f"small HEEV sweep JSON: {output_path}")
+        print(
+            f"best nt={best['nt']} fill={best['fill']} "
+            f"custom_mean_ms={best['custom_mean_ms']:.6f} "
+            f"torch_mean_ms={best['torch_mean_ms']:.6f} "
+            f"speedup={best['speedup_torch_over_custom']:.4f}x"
+        )
+        return
     if official_eigh:
         if backend_list != ["cublas"]:
             raise SystemExit("--official-eigh requires --backends cublas")
