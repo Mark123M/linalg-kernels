@@ -2928,6 +2928,19 @@ def warm_backtransform(n: int, backtransform_block_size: int) -> None:
     warm_backtransform_t(n, backtransform_block_size)
 
 
+def _form_backtransform_t_unchecked_(
+    data: torch.Tensor,
+    tau: torch.Tensor,
+    T: torch.Tensor,
+    panel_start: int,
+    panel_width: int,
+) -> None:
+    compiled = BacktransformT.compile(
+        torch2cute_dtype_map[data.dtype], data.size(1), T.size(1), panel_width
+    )
+    compiled(data, tau, T, panel_start)
+
+
 def form_backtransform_t_(
     data: torch.Tensor,
     tau: torch.Tensor,
@@ -2976,10 +2989,56 @@ def form_backtransform_t_(
             f"start={panel_start}, width={panel_width}, N={n}"
         )
 
-    compiled = BacktransformT.compile(
-        torch2cute_dtype_map[data.dtype], n, block_size, panel_width
-    )
-    compiled(data, tau, T, panel_start)
+    _form_backtransform_t_unchecked_(data, tau, T, panel_start, panel_width)
+
+
+def _backtransform_eigenvectors_unchecked_(
+    data: torch.Tensor,
+    tau: torch.Tensor,
+    Z: torch.Tensor,
+    T: torch.Tensor,
+    dc_ws: DCWorkspace,
+) -> None:
+    batch, n, _ = data.shape
+    block_size = T.size(1)
+    s_flat = dc_ws.s.view(-1)
+    z_alt_flat = dc_ws.z_alt.view(-1)
+    for panel_start, panel_width in backtransform_panel_spans(n, block_size):
+        active_rows = n - panel_start - 1
+        with _bt_range(
+            f"backtransform_panel_start{panel_start}_width{panel_width}_rows{active_rows}"
+        ):
+            with _bt_range("form_T"):
+                _form_backtransform_t_unchecked_(
+                    data, tau, T, panel_start, panel_width
+                )
+
+            V_source = data[
+                :, panel_start + 1 :, panel_start : panel_start + panel_width
+            ]
+            v_elems = batch * active_rows * panel_width
+            y_elems = batch * panel_width * n
+            if v_elems + y_elems > z_alt_flat.numel():
+                raise ValueError(
+                    "backtransform block is too wide for the reused D&C scratch: "
+                    f"start={panel_start}, width={panel_width}, N={n}"
+                )
+            V = z_alt_flat[:v_elems].view(batch, active_rows, panel_width)
+            Y = z_alt_flat[v_elems : v_elems + y_elems].view(
+                batch, panel_width, n
+            )
+            with _bt_range("mask_V"):
+                V.copy_(V_source)
+                V.tril_()
+
+            Z_active = Z[:, panel_start + 1 :, :]
+            W = s_flat[:y_elems].view(batch, panel_width, n)
+            with _bt_range("VtZ"):
+                torch.bmm(V.transpose(1, 2), Z_active, out=W)
+            with _bt_range("TW"):
+                torch.bmm(T[:, :panel_width, :panel_width], W, out=Y)
+            with _bt_range("update_Z"):
+                Z_active.baddbmm_(V, Y, beta=1.0, alpha=-1.0)
 
 
 def backtransform_eigenvectors_(
@@ -3047,48 +3106,7 @@ def backtransform_eigenvectors_(
                 f"{name} must be a contiguous CUDA tensor on data's device"
             )
 
-    s_flat = dc_ws.s.view(-1)
-    z_alt_flat = dc_ws.z_alt.view(-1)
-    for panel_start, panel_width in backtransform_panel_spans(n, block_size):
-        active_rows = n - panel_start - 1
-        with _bt_range(
-            f"backtransform_panel_start{panel_start}_width{panel_width}_rows{active_rows}"
-        ):
-            with _bt_range("form_T"):
-                form_backtransform_t_(
-                    data,
-                    tau,
-                    T,
-                    panel_start=panel_start,
-                    panel_width=panel_width,
-                )
-
-            V_source = data[
-                :, panel_start + 1 :, panel_start : panel_start + panel_width
-            ]
-            v_elems = batch * active_rows * panel_width
-            y_elems = batch * panel_width * n
-            if v_elems + y_elems > z_alt_flat.numel():
-                raise ValueError(
-                    "backtransform block is too wide for the reused D&C scratch: "
-                    f"start={panel_start}, width={panel_width}, N={n}"
-                )
-            V = z_alt_flat[:v_elems].view(batch, active_rows, panel_width)
-            Y = z_alt_flat[v_elems : v_elems + y_elems].view(
-                batch, panel_width, n
-            )
-            with _bt_range("mask_V"):
-                V.copy_(V_source)
-                V.tril_()
-
-            Z_active = Z[:, panel_start + 1 :, :]
-            W = s_flat[:y_elems].view(batch, panel_width, n)
-            with _bt_range("VtZ"):
-                torch.bmm(V.transpose(1, 2), Z_active, out=W)
-            with _bt_range("TW"):
-                torch.bmm(T[:, :panel_width, :panel_width], W, out=Y)
-            with _bt_range("update_Z"):
-                Z_active.baddbmm_(V, Y, beta=1.0, alpha=-1.0)
+    _backtransform_eigenvectors_unchecked_(data, tau, Z, T, dc_ws)
 
 
 def run_panel_with_update(
@@ -3227,25 +3245,223 @@ def tridiagonalize_(
     D[:, -1].copy_(data[:, -1, -1])
 
 
-def custom_kernel_old(data: input_t) -> output_t:
-    values, vectors = torch.linalg.eigh(data)
-    return vectors, values
+FullEighWorkspace = namedtuple(
+    "FullEighWorkspace",
+    [
+        "work",
+        "offdiag",
+        "tau",
+        "panel_v",
+        "panel_w",
+        "T",
+        "dc",
+        "panel_size",
+        "backtransform_block_size",
+        "leaf_size",
+    ],
+)
+
+
+def _effective_eigh_sizes(
+    n: int, panel_size: int, backtransform_block_size: int, leaf_size: int
+) -> tuple[int, int, int]:
+    if n < 2:
+        raise ValueError(f"full eigensolve requires N >= 2, got {n}")
+    if not 1 <= panel_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}]")
+    if not 1 <= backtransform_block_size <= MAX_PANEL_SIZE:
+        raise ValueError(
+            "backtransform_block_size must be in "
+            f"[1, {MAX_PANEL_SIZE}]"
+        )
+    if leaf_size < 3:
+        raise ValueError("leaf_size must be at least 3")
+    return (
+        min(panel_size, n - 1),
+        min(backtransform_block_size, n - 1),
+        min(leaf_size, n),
+    )
+
+
+def full_eigh_workspace(
+    batch: int,
+    n: int,
+    device: torch.device,
+    *,
+    panel_size: int = 16,
+    backtransform_block_size: int = 16,
+    leaf_size: int = 32,
+) -> FullEighWorkspace:
+    """Allocate reusable scratch for the connected FP32 eigensolver."""
+    if batch < 1:
+        raise ValueError(f"batch must be positive, got {batch}")
+    panel_size, backtransform_block_size, leaf_size = _effective_eigh_sizes(
+        n, panel_size, backtransform_block_size, leaf_size
+    )
+    device = torch.device(device)
+    f32 = dict(device=device, dtype=torch.float32)
+    rows, cols = Eigh(
+        Float32, n, panel_size=panel_size
+    ).workspace_shape()
+    panel_v = torch.zeros(batch, rows, cols, **f32)
+    return FullEighWorkspace(
+        torch.empty(batch, n, n, **f32),
+        torch.empty(batch, n - 1, **f32),
+        torch.empty(batch, n - 1, **f32),
+        panel_v,
+        torch.zeros_like(panel_v),
+        torch.empty(batch, backtransform_block_size, backtransform_block_size, **f32),
+        dc_workspace(batch, n, device, leaf_size=leaf_size),
+        panel_size,
+        backtransform_block_size,
+        leaf_size,
+    )
+
+
+def warm_full_eigh(
+    n: int,
+    *,
+    panel_size: int = 16,
+    backtransform_block_size: int = 16,
+    leaf_size: int = 32,
+    backend: Rank2KBackend = "cublas",
+) -> None:
+    """Compile and load every specialization used by the connected driver."""
+    panel_size, backtransform_block_size, leaf_size = _effective_eigh_sizes(
+        n, panel_size, backtransform_block_size, leaf_size
+    )
+    widths = {panel_size}
+    tail = (n - 1) % panel_size
+    if tail:
+        widths.add(tail)
+    for width in sorted(widths):
+        Eigh.compile(Float32, n, panel_size=width)
+    warm_rank2k_backend(panel_size, backend)
+    if tail and backend == "cublasdx":
+        warm_rank2k_backend(tail, backend)
+    warm_dc(n, leaf_size)
+    warm_backtransform(n, backtransform_block_size)
+
+
+def _full_eigh_out_unchecked_(
+    data: torch.Tensor,
+    Q: torch.Tensor,
+    L: torch.Tensor,
+    workspace: FullEighWorkspace,
+    backend: Rank2KBackend,
+    queue_handle: int,
+) -> None:
+    workspace.work.copy_(data)
+    tridiagonalize_(
+        workspace.work,
+        L,
+        workspace.offdiag,
+        workspace.panel_v,
+        workspace.panel_w,
+        panel_size=workspace.panel_size,
+        backend=backend,
+        queue_handle=queue_handle,
+        tau=workspace.tau,
+    )
+    tridiag_eig_dc_(
+        L,
+        workspace.offdiag,
+        Q,
+        workspace.dc,
+        leaf_size=workspace.leaf_size,
+        queue_handle=queue_handle,
+    )
+    _backtransform_eigenvectors_unchecked_(
+        workspace.work, workspace.tau, Q, workspace.T, workspace.dc
+    )
+
+
+def full_eigh_out_(
+    data: torch.Tensor,
+    Q: torch.Tensor,
+    L: torch.Tensor,
+    workspace: FullEighWorkspace,
+    *,
+    backend: Rank2KBackend = "cublas",
+    queue_handle: int = 0,
+) -> None:
+    """Write the connected symmetric eigendecomposition into ``Q`` and ``L``.
+
+    The input is preserved. ``Q`` receives eigenvectors in columns and ``L``
+    receives ascending eigenvalues. All fields in ``workspace`` are reusable
+    scratch and are overwritten; overlapping calls must use distinct scratch.
+    """
+    if data.dtype != torch.float32 or data.ndim != 3:
+        raise ValueError("data must be a batch x N x N FP32 tensor")
+    batch, n, m = data.shape
+    if n != m or not data.is_cuda or not data.is_contiguous():
+        raise ValueError("data must be square, contiguous, and CUDA-resident")
+    if Q.shape != (batch, n, n) or Q.dtype != torch.float32:
+        raise ValueError(f"Q must have shape {(batch, n, n)} and dtype FP32")
+    if L.shape != (batch, n) or L.dtype != torch.float32:
+        raise ValueError(f"L must have shape {(batch, n)} and dtype FP32")
+    if (
+        not Q.is_cuda
+        or not L.is_cuda
+        or not Q.is_contiguous()
+        or not L.is_contiguous()
+        or Q.device != data.device
+        or L.device != data.device
+    ):
+        raise ValueError("Q and L must be contiguous CUDA tensors on data's device")
+    if workspace.work.shape != (batch, n, n) or workspace.work.device != data.device:
+        raise ValueError("workspace does not match data shape and device")
+    if workspace.offdiag.shape != (batch, n - 1):
+        raise ValueError("workspace offdiagonal buffer has the wrong shape")
+    if workspace.tau.shape != (batch, n - 1):
+        raise ValueError("workspace tau buffer has the wrong shape")
+    if workspace.T.shape != (
+        batch,
+        workspace.backtransform_block_size,
+        workspace.backtransform_block_size,
+    ):
+        raise ValueError("workspace T buffer has the wrong shape")
+    _full_eigh_out_unchecked_(data, Q, L, workspace, backend, queue_handle)
+
+
+_CUSTOM_PANEL_SIZE = 16
+_CUSTOM_BACKTRANSFORM_BLOCK_SIZE = 16
+_CUSTOM_LEAF_SIZE = 32
+_FULL_EIGH_WORKSPACE_CACHE: dict[tuple[Any, ...], FullEighWorkspace] = {}
+
+
+def _custom_workspace(data: torch.Tensor) -> FullEighWorkspace:
+    key = (
+        data.device.type,
+        data.device.index,
+        data.size(0),
+        data.size(1),
+        data.dtype,
+        _CUSTOM_PANEL_SIZE,
+        _CUSTOM_BACKTRANSFORM_BLOCK_SIZE,
+        _CUSTOM_LEAF_SIZE,
+    )
+    workspace = _FULL_EIGH_WORKSPACE_CACHE.get(key)
+    if workspace is None:
+        workspace = full_eigh_workspace(
+            data.size(0),
+            data.size(1),
+            data.device,
+            panel_size=_CUSTOM_PANEL_SIZE,
+            backtransform_block_size=_CUSTOM_BACKTRANSFORM_BLOCK_SIZE,
+            leaf_size=_CUSTOM_LEAF_SIZE,
+        )
+        _FULL_EIGH_WORKSPACE_CACHE[key] = workspace
+    return workspace
+
 
 def custom_kernel(data: input_t) -> output_t:
-    #values, vectors = torch.linalg.eigh(data)
-    # random asserts
-
-    data_dtype = torch2cute_dtype_map[data.dtype]
-    N = data.size(1)
-    ws_rows, ws_cols = Eigh(data_dtype, N).workspace_shape()
-    # Must be zeros, not empty: see workspace_shape.
-    v_ws = torch.zeros(data.size(0), ws_rows, ws_cols, device=data.device, dtype=torch.float32)
-    w_ws = torch.zeros_like(v_ws)
-    D = torch.empty(data.size(0), N, device=data.device, dtype=torch.float32)
-    E = torch.empty(data.size(0), N - 1, device=data.device, dtype=torch.float32)
-    tau = torch.empty_like(E)
-    # The panel kernel now persists reflectors into its input's lower
-    # triangle, so it must run on a work copy — `data` feeds eigh below.
-    Eigh.compile(data_dtype, N)(data.clone(), D, E, tau, v_ws, w_ws, 0)
-
-    return torch.linalg.eigh(data)
+    batch, n, _ = data.shape
+    if n == 1:
+        return torch.ones_like(data), data[:, 0, 0].clone()
+    vectors = torch.empty_like(data)
+    values = torch.empty(batch, n, device=data.device, dtype=torch.float32)
+    _full_eigh_out_unchecked_(
+        data, vectors, values, _custom_workspace(data), "cublas", 0
+    )
+    return vectors, values

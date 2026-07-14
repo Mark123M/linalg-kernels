@@ -21,6 +21,9 @@ Usage:
     #   --nsys-stage backtransform-t --backtransform-block-size 16
     # complete eigenvector backtransform only: use --nsys-stage backtransform
     # hardware SM/memory/tensor metrics at 10 kHz: add --nsys-gpu-metrics
+    # exact ranked evaluator comparison (all 13 cases):
+    modal run eigh_bench_b200_modal.py --official-eigh --panel-size 16 \
+        --backtransform-block-size 16 --leaf-size 32 --backends cublas
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
 """
@@ -191,6 +194,246 @@ def _bench_torch_eigh(data, n_calls: int, repeats: int):
         torch.cuda.synchronize()
         samples.append(start.elapsed_time(end) / n_calls)
     return samples, n_sets
+
+
+@app.function(gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
+def bench_official_eigh(
+    panel_size: int,
+    backtransform_block_size: int,
+    leaf_size: int,
+    backend: str,
+) -> dict:
+    """Compare both providers with the ranked evaluator's timing contract."""
+    import json
+    import math
+    import os
+    import sys
+    import time
+    import types
+    from datetime import datetime, timezone
+
+    os.makedirs("/cache/tmp", exist_ok=True)
+    os.makedirs("/cache/cute", exist_ok=True)
+    sys.path.insert(0, "/workspace")
+
+    import bench_utils
+    import torch
+
+    for name, mod in (
+        ("quack", types.ModuleType("quack")),
+        ("quack.bench", types.ModuleType("quack.bench")),
+        ("quack.bench.bench_utils", bench_utils),
+    ):
+        sys.modules.setdefault(name, mod)
+
+    import eigh_bench_local_rtx4050 as runner
+    eigh = runner.eigh
+
+    if (panel_size, backtransform_block_size, leaf_size, backend) != (
+        16,
+        16,
+        32,
+        "cublas",
+    ):
+        raise ValueError(
+            "the official custom_kernel comparison requires "
+            "panel_size=16, backtransform_block_size=16, leaf_size=32, "
+            "backend=cublas"
+        )
+
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.preferred_linalg_library("default")
+    _report_env("start")
+
+    max_iterations = 50
+    input_bytes_target = 256 * 1024 * 1024
+
+    def batch_count(spec: dict) -> int:
+        size = spec["batch"] * spec["n"] * spec["n"] * 4
+        return max(1, min(max_iterations, input_bytes_target // size))
+
+    def make_data_batch(spec: dict) -> list[torch.Tensor]:
+        args = dict(spec)
+        result = []
+        for _ in range(batch_count(spec)):
+            args["seed"] += 42
+            result.append(runner.generate_input(**args))
+        return result
+
+    def clear_l2_cache() -> None:
+        dummy = torch.empty(
+            (32, 1024, 1024), dtype=torch.int64, device="cuda"
+        )
+        dummy.fill_(42)
+        del dummy
+
+    def torch_provider(data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        values, vectors = torch.linalg.eigh(data)
+        return vectors, values
+
+    providers = {
+        "custom": eigh.custom_kernel,
+        "torch": torch_provider,
+    }
+
+    def calculate_stats(durations: list[float]) -> dict:
+        runs = len(durations)
+        mean = sum(durations) / runs
+        variance = sum((value - mean) ** 2 for value in durations)
+        std = math.sqrt(variance / (runs - 1)) if runs > 1 else 0.0
+        return {
+            "runs": runs,
+            "mean_ns": mean,
+            "std_ns": std,
+            "err_ns": std / math.sqrt(runs),
+            "best_ns": min(durations),
+            "worst_ns": max(durations),
+        }
+
+    def run_provider(
+        provider_name: str,
+        spec: dict,
+        *,
+        recheck: bool,
+        max_repeats: int,
+        max_time_ns: float,
+    ) -> dict:
+        provider = providers[provider_name]
+        data_list = make_data_batch(spec)
+        check_copy = [item.clone() for item in data_list]
+        outputs = [provider(item.clone()) for item in data_list]
+        torch.cuda.synchronize()
+        for reference_data, output in zip(check_copy, outputs):
+            good, message = runner.check_implementation(reference_data, output)
+            if not good:
+                raise RuntimeError(
+                    f"{provider_name} preflight failed for {spec}: {message}"
+                )
+
+        durations = []
+        wall_start = time.perf_counter_ns()
+        for iteration in range(max_repeats):
+            torch.cuda.synchronize()
+            clear_l2_cache()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            outputs = [provider(item) for item in data_list]
+            end.record()
+            torch.cuda.synchronize()
+            durations.append(start.elapsed_time(end) * 1.0e6 / len(data_list))
+
+            if recheck:
+                for reference_data, output in zip(check_copy, outputs):
+                    good, message = runner.check_implementation(reference_data, output)
+                    if not good:
+                        raise RuntimeError(
+                            f"{provider_name} timed result failed for {spec}: {message}"
+                        )
+
+            wall_elapsed = time.perf_counter_ns() - wall_start
+            if iteration > 1 and wall_elapsed > 1.0e8:
+                stats = calculate_stats(durations)
+                if (
+                    stats["err_ns"] / stats["mean_ns"] < 0.001
+                    or stats["mean_ns"] * stats["runs"] > max_time_ns
+                    or wall_elapsed > 120.0e9
+                ):
+                    break
+        result = calculate_stats(durations)
+        result["input_count"] = len(data_list)
+        return result
+
+    cases = [dict(spec) for spec in runner.OFFICIAL_BENCHMARK_CASES]
+    print("=== evaluator-faithful preliminary warm sweep ===", flush=True)
+    for index, spec in enumerate(cases):
+        for provider_name in ("custom", "torch"):
+            print(f"warm case={index} provider={provider_name} spec={spec}", flush=True)
+            run_provider(
+                provider_name,
+                spec,
+                recheck=False,
+                max_repeats=1000,
+                max_time_ns=5.0e8,
+            )
+
+    rows = []
+    print("=== evaluator-faithful ranked sweep ===", flush=True)
+    for index, spec in enumerate(cases):
+        order = ("custom", "torch") if index % 2 == 0 else ("torch", "custom")
+        measured = {}
+        for provider_name in order:
+            measured[provider_name] = run_provider(
+                provider_name,
+                spec,
+                recheck=True,
+                max_repeats=1000,
+                max_time_ns=30.0e9,
+            )
+        custom_ms = measured["custom"]["mean_ns"] / 1.0e6
+        torch_ms = measured["torch"]["mean_ns"] / 1.0e6
+        row = {
+            "index": index,
+            "spec": spec,
+            "custom": measured["custom"],
+            "torch": measured["torch"],
+            "speedup_torch_over_custom": torch_ms / custom_ms,
+        }
+        rows.append(row)
+        custom_stats = measured["custom"]
+        torch_stats = measured["torch"]
+        print(
+            f"case={index} spec={spec} custom_ms={custom_ms:.6f} "
+            f"torch_ms={torch_ms:.6f} speedup={torch_ms / custom_ms:.4f}x "
+            f"custom_runs={custom_stats['runs']} "
+            f"custom_std_ms={custom_stats['std_ns'] / 1.0e6:.6f} "
+            f"custom_err_ms={custom_stats['err_ns'] / 1.0e6:.6f} "
+            f"custom_best_ms={custom_stats['best_ns'] / 1.0e6:.6f} "
+            f"custom_worst_ms={custom_stats['worst_ns'] / 1.0e6:.6f} "
+            f"torch_runs={torch_stats['runs']} "
+            f"torch_std_ms={torch_stats['std_ns'] / 1.0e6:.6f} "
+            f"torch_err_ms={torch_stats['err_ns'] / 1.0e6:.6f} "
+            f"torch_best_ms={torch_stats['best_ns'] / 1.0e6:.6f} "
+            f"torch_worst_ms={torch_stats['worst_ns'] / 1.0e6:.6f}",
+            flush=True,
+        )
+
+    custom_geom_ms = math.exp(
+        sum(math.log(row["custom"]["mean_ns"] / 1.0e6) for row in rows)
+        / len(rows)
+    )
+    torch_geom_ms = math.exp(
+        sum(math.log(row["torch"]["mean_ns"] / 1.0e6) for row in rows)
+        / len(rows)
+    )
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "source": "gpu-mode/reference-kernels problems/linalg/eigh_py",
+        "timing_contract": "popcorn leaderboard",
+        "configuration": {
+            "panel_size": panel_size,
+            "backtransform_block_size": backtransform_block_size,
+            "leaf_size": leaf_size,
+            "backend": backend,
+            "matmul_precision": torch.get_float32_matmul_precision(),
+            "preferred_linalg_library": str(
+                torch.backends.cuda.preferred_linalg_library()
+            ),
+            "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        },
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cases": rows,
+        "custom_geomean_ms": custom_geom_ms,
+        "torch_geomean_ms": torch_geom_ms,
+        "aggregate_speedup_torch_over_custom": torch_geom_ms / custom_geom_ms,
+    }
+    print("=== official comparison summary ===", flush=True)
+    print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    _report_env("end")
+    cache_vol.commit()
+    return payload
 
 
 @app.function(gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
@@ -605,7 +848,7 @@ def profile_nsys_pipeline(
     elif stage == "backtransform":
         workload.append("--backtransform")
     else:
-        workload.append("--tri-solve" if stage == "full" else "--tri")
+        workload.append("--full-eigh" if stage == "full" else "--tri")
     workload.extend(("--update-backend", backend))
 
     _report_env("nsys")
@@ -739,6 +982,8 @@ def main(
     bench_eigh: bool = False,
     tri: bool = False,
     tri_solve: bool = False,
+    official_eigh: bool = False,
+    official_output: str = "profiles/eigh_official",
     stages: str = "",
     min_ctas: str = "",
     trace: bool = False,
@@ -751,10 +996,15 @@ def main(
     nsys_gpu_metrics_frequency: int = 10000,
     nsys_output: str = "profiles/eigh_nsys",
 ) -> None:
-    if tri and tri_solve:
-        raise SystemExit("--tri and --tri-solve are mutually exclusive")
-    if nsys and (trace or tri or tri_solve):
-        raise SystemExit("--nsys is mutually exclusive with --trace, --tri, and --tri-solve")
+    if sum((tri, tri_solve, official_eigh)) > 1:
+        raise SystemExit("--tri, --tri-solve, and --official-eigh are mutually exclusive")
+    if nsys and (trace or tri or tri_solve or official_eigh):
+        raise SystemExit(
+            "--nsys is mutually exclusive with --trace, --tri, --tri-solve, "
+            "and --official-eigh"
+        )
+    if trace and official_eigh:
+        raise SystemExit("--trace and --official-eigh are mutually exclusive")
     parsed_cases = []
     for item in cases.split(","):
         batch, _, n = item.strip().lower().partition("x")
@@ -773,6 +1023,32 @@ def main(
         raise SystemExit("--nsys-gpu-metrics-frequency must be in [10, 200000] Hz")
     if stat not in ("min", "mean", "median"):
         raise SystemExit(f"unknown stat: {stat}")
+    if official_eigh:
+        if backend_list != ["cublas"]:
+            raise SystemExit("--official-eigh requires --backends cublas")
+        payload = bench_official_eigh.remote(
+            panel_size,
+            backtransform_block_size,
+            leaf_size,
+            "cublas",
+        )
+        import json
+        from pathlib import Path
+
+        output_dir = Path(official_output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"official_eigh_{payload['timestamp_utc']}.json"
+        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        if output_path.stat().st_size == 0:
+            raise RuntimeError(f"wrote empty official result: {output_path}")
+        print(f"official comparison JSON: {output_path}")
+        print(
+            f"custom_geomean_ms={payload['custom_geomean_ms']:.6f} "
+            f"torch_geomean_ms={payload['torch_geomean_ms']:.6f} "
+            "speedup="
+            f"{payload['aggregate_speedup_torch_over_custom']:.4f}x"
+        )
+        return
     if nsys:
         if len(parsed_cases) != 1:
             raise SystemExit("--nsys requires exactly one --cases entry")

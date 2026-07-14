@@ -7,7 +7,7 @@ Build an efficient **batched real symmetric eigendecomposition** (`eigh`) for th
 Solution plan:
 1. Blocked Householder tridiagonalization (**done**: panel kernel + `tridiagonalize_` driver in `eigh.py`, D/E outputs, verified on B200; perf tuning continues)
 2. Divide and conquer eigensolver (**done**: `tridiag_eig_dc_` — htev leaves + native prep kernel + bmm merges; see "D&C tridiagonal eigensolver" section)
-3. Backtransform for eigenvectors (**next**; prerequisites DONE 2026-07-14: the panel kernel persists each reflector into `data`'s lower triangle (dsytrd layout — explicit unit at the subdiagonal + explicit zeros above it within the panel band, so V panel slices `data[:, ps+1:, ps:ps+nb]` are directly GEMM-usable without a tril mask) and stores tau into a (B, N-1) buffer. Verified by fp64 Q-reconstruction (`QᵀAQ` vs `tridiag(D,E)` resid ≈ 1e-6, orth ≈ 3e-7; scratchpad `test_backxform_prereq.py`) at N ∈ {65, 67, 128, 512} × ps ∈ {8, 16, 32} incl. tail panels and `threads_per_row=64`; all existing gates re-run green incl. graph capture. Remaining work: the dormtr-style blocked larfb itself — per panel build the ps×ps T from V/tau, then two bmm's against Z)
+3. Backtransform for eigenvectors (**done**: reverse compact-WY T builder + batched cuBLAS applications, connected through `full_eigh_out_` and the production `custom_kernel`; official 13-case B200 gates all pass)
 
 ## Problem spec (condensed from AGENTS.md)
 
@@ -19,9 +19,9 @@ Solution plan:
 
 ## Repo layout
 
-- `eigh.py` — the kernel under development (CuTe DSL), single-file native cuBLAS/cuBLASDx rank-2k backends, jit/disk-cache plumbing (`EIGH_ENABLE_DISK_CACHE`, `EIGH_CUTE_CACHE_DIR` env vars), and `custom_kernel` entry point.
-- `eigh_bench_local_rtx4050.py` — local runner/benchmark (CUDA-graph replay + L2-rotated tensor sets via quack's bench utils). `--panel-size` selects ps for both sides; the baseline (`torch_dlatrd_panel`) runs the full DLATRD panel op sequence through cuBLAS bmm (refresh, reflector, matvec, inner/outer corrections, w, V/W appends, D/E writes) so the comparison is fair at any ps; the allclose gate checks every panel column's w (read from the gmem W workspace) plus the panel's D/E columns. `--tri` switches to full-tridiagonalization mode: `check_tridiag` gates D/E against the float64 blocked-recurrence mirror (`torch_tridiag_reference`), and with `--bench` runs graph-captured `benchmark_tridiag` (kernel driver) vs `benchmark_torch_tridiag` (`torch_tridiag_driver` — same op sequence per panel incl. the two bmm rank-2k updates). One timed tri call is a full factorization: keep `--bench-calls` small (~20). `--tri-solve` runs the full pipeline (tridiagonalization + the batched D&C tridiagonal eigensolve): `check_tridiag_dc` residual-gates L/Z against the tridiagonal in fp64 plus a spectrum check vs `eigvalsh(A)`, and with `--bench` runs graph-captured `benchmark_dc` (solve only, pre-factored inputs) and `benchmark_tridiag_dc` (combined); `--leaf-size` sets the D&C leaf (default 32; B200-tuned).
-- `eigh_bench_b200_modal.py` — thin Modal B200 launcher (`modal run eigh_bench_b200_modal.py --cases 640x512 --panel-size 8 --backends cublas,cublasdx`). Imports the local runner's bench core remotely (gates → graph benches; `quack.bench.bench_utils` satisfied from a flat-mounted copy via sys.modules stubs), so it always benches the current working-tree `eigh.py` (runtime mounts, no image rebuild). `--tri` runs the full-tridiagonalization mode instead of the panel benches (D/E gate per backend, then `tridiag_<backend>` vs `torch_tridiag`; use `--calls 20`). `--tri-solve` runs the full pipeline mode (tridiag gate + D&C gate, then `dc` and `tridiag_dc_<backend>` benches; combine with `--bench-eigh` for the cuSOLVER yardstick); `--leaf-size` sets the D&C leaf in both bench and nsys modes. `--nsys` profiles one warmed full pipeline (NVTX ranges input_copy/tridiagonalization/dc_solve, plus per-phase dc_* ranges from `eigh.DC_NVTX`). MathDx headers baked from the local `nvidia-mathdx-26.06.0-cuda13/` tarball dir for exact parity; DSL disk cache + `load_inline` build root persist on the `eigh-b200-cache` volume (`TMPDIR=/cache/tmp`). Optional `--bench-eigh` times `torch.linalg.eigh` with a plain event loop (cuSOLVER's host-side syncs break graph capture). One-time setup: `.venv/bin/pip3 install modal && modal setup`. Never submitted — free to contain "stream".
+- `eigh.py` — the connected eigensolver (CuTe DSL tridiagonalization/T formation, native D&C prep and HTEV leaves, cuBLAS updates), reusable `FullEighWorkspace`, jit/disk-cache plumbing, and the pure-custom `custom_kernel` entry point. Production defaults are ps=16, backtransform block=16, leaf=32, cuBLAS.
+- `eigh_bench_local_rtx4050.py` — local stage harness plus `--full-eigh` connected correctness/graph mode. It also carries an exact snapshot of the public ranked input generator/checker used by the B200 comparison. Existing `--tri`, `--tri-solve`, `--backtransform-t`, and `--backtransform` diagnostics remain separate.
+- `eigh_bench_b200_modal.py` — B200 stage launcher and `--official-eigh` comparison. The latter mirrors the public Popcorn generator, checker, input-count rule, L2 flush, warm sweep, CUDA-event loop, rechecks, and stopping rule for both `custom_kernel` and native torch, then writes a JSON artifact. `--nsys-stage full` now profiles all three stages.
 - `lapack/` — golden correctness references (e.g. `dsytd2`/`dsytrd` for tridiagonalization, `TESTING/EIG/ddrvst.f` for test matrix types).
 - `quack/` — the most efficient CuTe DSL kernel examples; the primary pattern source (`quack/quack/softmax.py` SoftmaxBackward, `reduce.py`, `copy_utils.py`, `bench/bench_utils.py`).
 - `cutlass/` — more kernel examples; `magma/` — linalg algorithm examples; `notes/` — layout notes; `references/` — misc reference kernels.
@@ -78,19 +78,25 @@ Conclusions: (1) **Backend settled: cuBLAS.** rank2k_cublasdx lost at every ps (
 
 ## Eval timing & leaderboard math (read from the server's eval.py, 2026-07-14)
 
-The popcorn API (`GET {POPCORN_API_URL}/leaderboards`, id 775 "eigh", deadline **2026-07-15T00:00Z**) returns the full task incl. `eval.py`. Timing method: per ranked shape, `custom_kernel` is called on `count = max(1, min(50, 256 MB // input_bytes))` pre-generated inputs inside ONE CUDA-event window (count = 1 for every 512/1024/2048 shape, 50 at 20×32, 12 at 40×352), `clear_l2_cache()` (256 MB fill) before each repeat, repeats until stderr/mean < 0.1% or time budget; score = mean µs per call. **No CUDA graphs — per-call Python/launch/allocation overhead counts** (cache workspaces per shape across calls in `custom_kernel`). **Leaderboard score = geometric mean (seconds) of the 13 per-shape means** (popcorn-cli service/mod.rs:1266): five 640×512 variants, four 60×1024 variants, plus 20×32, 40×176, 40×352, 8×2048 — so ~47 ms "median submission" on gpumode.com is a geomean, NOT a 640×512 time; a plain `torch.linalg.eigh` wrapper geomeans to ~59 ms (measured per-shape on B200).
+The Popcorn timing method calls `custom_kernel` on `count = max(1, min(50, 256 MiB // input_bytes))` pre-generated inputs inside one CUDA-event window, clears L2 with a 256 MiB fill before every repeat, and stops on relative standard error or its time limits. There are no CUDA graphs; normal output allocations and launch gaps count. Actual counts include 50 at 20×32 and 40×176, 13 at 40×352, 1 at 512/1024, and 2 at 8×2048.
 
-Measured per-shape (B200 2026-07-14, ours = tridiag ps=16 + D&C leaf=128, no backtransform yet):
-| shape | ours ms | torch.eigh ms |
-|---|---|---|
-| 20×32 | 0.262 | 0.151 |
-| 40×176 | 2.675 | 5.761 |
-| 40×352 | 9.011 | 18.474 |
-| 640×512 | 94.6 | 192.9 |
-| 60×1024 | 110.7 | 111.0 |
-| 8×2048 | **454.2** | 172.6 |
+**Authoritative connected result (B200, 2026-07-14, ps=16/bt=16/leaf=32/cuBLAS, exact 13-case evaluator replica): all official correctness rechecks passed. Custom geomean 40.933 ms vs native torch 53.772 ms = 1.314× aggregate speedup.** JSON: `profiles/eigh_official/official_eigh_20260714T120328Z.json`.
 
-(Table predates the leaf=32 D&C default: 640×512 is now 63.7 ms, 60×1024 102.6 — smaller shapes also gain but are unmeasured.) Geomeans over the 13 ranked shapes (512/1024 stress variants ≈ their plain shapes): ours ≈ 45 ms (≈ 48 with a ~5 ms backtransform allowance) vs torch ≈ 59 — i.e. right at the current leaderboard median even before optimization. Biggest levers, in log-weight order: (1) **8×2048 is latency-starved** (tridiag ≈ 400 of the 454 ms: batch 8 = 8 CTAs on 148 SMs × 128 sequential panel+rank2k rounds) — fixing to torch-parity alone is -7% geomean; a per-shape hybrid dispatch (use `torch.linalg.eigh` where it wins: 20×32, 8×2048) projects ≈ 41 ms; (2) the D&C's 50 ms at 640×512 is prep/leaf-bound (GEMMs ≈ 2 ms) — real headroom; (3) 1024-class tridiag (~84 ms) late-panel latency.
+The connected graph gate also passed on B200 at 2×35 ps=8/bt=16/leaf=32 for random-tail, zero, and divisible diagonal N=33 inputs (`graph=True`, inputs preserved, no leaf failures). Its full-stage trace is under `profiles/eigh_nsys/b2_n35_ps8_leaf32_cublas_full_20260714T120640Z/`.
+
+| ranked case | custom ms | torch ms | speedup |
+|---|---:|---:|---:|
+| 20×32 dense | 0.313 | 0.140 | 0.45× |
+| 40×176 dense | 2.787 | 5.688 | 2.04× |
+| 40×352 dense | 9.550 | 16.860 | 1.77× |
+| 640×512 dense | 73.748 | 171.054 | 2.32× |
+| 60×1024 dense | 103.927 | 104.947 | 1.01× |
+| 8×2048 dense | 453.815 | 157.586 | 0.35× |
+| 640×512 mixed/rankdef/clustered | 69.070–73.524 | 138.310–166.714 | 2.00–2.29× |
+| 60×1024 mixed/nearrank/geometric | 102.016–106.035 | 100.555–104.000 | 0.98–1.00× |
+| 640×512 LAPACK dense-even | 75.112 | 202.678 | 2.70× |
+
+The largest pure-custom losses remain 20×32 launch overhead and CTA-starved 8×2048 tridiagonalization. Shape fallback is deliberately not part of the current implementation.
 
 ## D&C tridiagonal eigensolver (`tridiag_eig_dc_` in `eigh.py`)
 
@@ -141,6 +147,17 @@ Verified (2026-07-14, local sm89): fp64+fp32 Python mirror (scratchpad `test_dc.
 MATHDX_ROOT=$PWD/nvidia-mathdx-26.06.0-cuda13/nvidia/mathdx/26.06 \
   .venv/bin/python eigh_bench_local_rtx4050.py --batch 4 --n 512 --panel-size 16 \
   --tri-solve --skip-expected --bench --bench-calls 4 --bench-sets 2
+
+# connected eigensolver correctness + graph replay
+MATHDX_ROOT=$PWD/nvidia-mathdx-26.06.0-cuda13/nvidia/mathdx/26.06 \
+  .venv/bin/python eigh_bench_local_rtx4050.py --full-eigh --batch 2 --n 35 \
+  --panel-size 8 --backtransform-block-size 16 --leaf-size 32 \
+  --update-backend cublas
+
+# exact 13-case Popcorn-style B200 comparison
+.venv/bin/modal run eigh_bench_b200_modal.py --official-eigh \
+  --panel-size 16 --backtransform-block-size 16 --leaf-size 32 \
+  --backends cublas --official-output profiles/eigh_official
 ```
 
 When verifying kernel changes, always cover: an odd N (predicates), a `warps_per_row=2` config (`block_sum` path + reduction barriers — use the `threads_per_row=64` override at N=512, since N=4096 no longer fits local smem with V/W panels), `panel_size > 1` (correction GEMVs + smem-reuse barriers across `i`), and a **tail-panel N** for the tridiag driver (`(N-1) % ps != 0`, e.g. N=67 ps=8). Compare against float64 torch references mirroring the kernel's exact recurrence — per-panel w (see the scratchpad `test_panel.py` mirror) and full-factorization D/E (`torch_tridiag_reference`, exercised by the scratchpad `test_tridiag.py`).
