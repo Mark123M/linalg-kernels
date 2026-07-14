@@ -29,6 +29,7 @@ from quack.bench.bench_utils import (  # noqa: E402
 # competition input is fp32, so the runner is fp32-only.
 DTYPE = torch.float32
 PANEL_SIZE = 1
+DC_LEAF_SIZE = 32
 
 
 def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -122,6 +123,69 @@ def check_tridiag_htev(data: torch.Tensor, backend: str) -> bool:
         flush=True,
     )
     return htev_ok and spectrum_ok
+
+
+def validate_dc_result(
+    D_input: torch.Tensor,
+    E_input: torch.Tensor,
+    L: torch.Tensor,
+    Z: torch.Tensor,
+    *,
+    label: str,
+) -> bool:
+    """Residual-gate the D&C output against the tridiagonal (D_input, E_input)."""
+    finite = bool(torch.isfinite(L).all().item() and torch.isfinite(Z).all().item())
+    sorted_values = bool((L[:, 1:] >= L[:, :-1]).all().item())
+
+    vd = Z.double()
+    tv = D_input.double().unsqueeze(2) * vd
+    ed = E_input.double().unsqueeze(2)
+    tv[:, 1:, :] += ed * vd[:, :-1, :]
+    tv[:, :-1, :] += ed * vd[:, 1:, :]
+    vl = vd * L.double().unsqueeze(1)
+    eig_scale = torch.maximum(tv.abs().amax(), vl.abs().amax()).clamp_min(1e-30)
+    eig_rel = ((tv - vl).abs().amax() / eig_scale).item()
+
+    gram = torch.bmm(vd.transpose(1, 2), vd)
+    identity = torch.eye(L.size(1), device=L.device, dtype=torch.float64).expand_as(gram)
+    orth_rel = (gram - identity).abs().amax().item()
+    ok = finite and sorted_values and eig_rel <= 2e-3 and orth_rel <= 2e-3
+    print(
+        f"{label}: ok={ok} leaf={DC_LEAF_SIZE} finite={finite} sorted={sorted_values} "
+        f"eig_rel={eig_rel:.3e} orth_max={orth_rel:.3e}",
+        flush=True,
+    )
+    return ok
+
+
+def check_tridiag_dc(data: torch.Tensor, backend: str) -> bool:
+    """Gate the full pipeline: tridiagonalize, then the batched D&C solve."""
+    work = data.clone()
+    D, E = make_de(data)
+    v_ws, w_ws = make_workspace(data)
+    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    D_tri, E_tri = D.clone(), E.clone()
+    ws = eigh.dc_workspace(data.size(0), data.size(1), data.device, leaf_size=DC_LEAF_SIZE)
+    Z = torch.zeros(data.size(0), data.size(1), data.size(1), device=data.device,
+                    dtype=torch.float32)
+    eigh.tridiag_eig_dc_(D, E, Z, ws, leaf_size=DC_LEAF_SIZE)
+    torch.cuda.synchronize()
+    dc_ok = validate_dc_result(D_tri, E_tri, D, Z, label="tridiag+dc")
+
+    spectrum_rel = 0.0
+    for row in range(min(3, data.size(0))):
+        expected = torch.linalg.eigvalsh(data[row].double())
+        spectrum_rel = max(
+            spectrum_rel,
+            ((D[row].double() - expected).abs().max() / expected.abs().max().clamp_min(1e-30)).item(),
+        )
+    spectrum_ok = spectrum_rel <= 1e-4
+    print(
+        f"tridiag+dc spectrum: ok={spectrum_ok} rel={spectrum_rel:.3e} "
+        f"(first {min(3, data.size(0))} matrices)",
+        flush=True,
+    )
+    return dc_ok and spectrum_ok
 
 
 def factor_panel(
@@ -676,20 +740,161 @@ def benchmark_tridiag_htev(
     return samples, n_sets
 
 
-def profile_tridiag_htev_once(data: torch.Tensor, backend: str) -> None:
-    """Warm, then expose exactly one full pipeline to an external profiler."""
+def benchmark_dc(
+    D_input: torch.Tensor,
+    E_input: torch.Tensor,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    """Graph-captured D&C tridiagonal eigensolve alone (inputs pre-factored)."""
+    batch, n = D_input.shape
+    eigh.warm_dc(n, DC_LEAF_SIZE)
+    # The workspace is scratch traffic (fully rewritten each call), so one
+    # instance is shared across the L2-rotated input sets.
+    ws = eigh.dc_workspace(batch, n, D_input.device, leaf_size=DC_LEAF_SIZE)
+    D = D_input.clone()
+    Z = torch.zeros(batch, n, n, device=D_input.device, dtype=torch.float32)
+    base_args = (D_input, E_input, D, Z)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(
+        source_d: torch.Tensor,
+        source_e: torch.Tensor,
+        work_d: torch.Tensor,
+        vectors: torch.Tensor,
+    ) -> None:
+        work_d.copy_(source_d)
+        eigh.tridiag_eig_dc_(
+            work_d,
+            source_e,
+            vectors,
+            ws,
+            leaf_size=DC_LEAF_SIZE,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def benchmark_tridiag_dc(
+    data: torch.Tensor,
+    backend: str,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    """Graph-captured full pipeline: tridiagonalization + D&C eigensolve."""
+    batch, n = data.size(0), data.size(1)
+    D, E = make_de(data)
+    Z = torch.zeros(batch, n, n, device=data.device, dtype=torch.float32)
+    v_ws, w_ws = make_workspace(data)
+    eigh.warm_rank2k_backend(PANEL_SIZE, backend)
+    tail = (n - 1) % PANEL_SIZE
+    if tail and backend == "cublasdx":
+        eigh.warm_rank2k_backend(tail, backend)
+    eigh.warm_dc(n, DC_LEAF_SIZE)
+    ws = eigh.dc_workspace(batch, n, data.device, leaf_size=DC_LEAF_SIZE)
+    base_args = (data, data.clone(), D, E, Z, v_ws, w_ws)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
+
+    def launch(
+        source: torch.Tensor,
+        work: torch.Tensor,
+        values: torch.Tensor,
+        offdiag: torch.Tensor,
+        vectors: torch.Tensor,
+        panel_v: torch.Tensor,
+        panel_w: torch.Tensor,
+    ) -> None:
+        queue_handle = torch.cuda.current_stream().cuda_stream
+        work.copy_(source)
+        eigh.tridiagonalize_(
+            work,
+            values,
+            offdiag,
+            panel_v,
+            panel_w,
+            panel_size=PANEL_SIZE,
+            backend=backend,
+            queue_handle=queue_handle,
+        )
+        eigh.tridiag_eig_dc_(
+            values,
+            offdiag,
+            vectors,
+            ws,
+            leaf_size=DC_LEAF_SIZE,
+            queue_handle=queue_handle,
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def profile_pipeline_once(data: torch.Tensor, backend: str, stage: str) -> None:
+    """Warm, then expose exactly one requested pipeline to an external profiler."""
     from contextlib import nullcontext
 
     D, E = make_de(data)
-    V, info = make_htev_outputs(D)
     v_ws, w_ws = make_workspace(data)
     work = data.clone()
+    Z = dc_ws = None
+    if stage == "full":
+        Z = torch.zeros(
+            data.size(0), data.size(1), data.size(1),
+            device=data.device, dtype=torch.float32,
+        )
 
     eigh.warm_rank2k_backend(PANEL_SIZE, backend)
     tail = (data.size(1) - 1) % PANEL_SIZE
     if tail and backend == "cublasdx":
         eigh.warm_rank2k_backend(tail, backend)
-    eigh.warm_htev(data.size(1))
+    if stage == "full":
+        eigh.warm_dc(data.size(1), DC_LEAF_SIZE)
+        dc_ws = eigh.dc_workspace(
+            data.size(0), data.size(1), data.device, leaf_size=DC_LEAF_SIZE
+        )
+
+    def check_dc_leaf_info(label: str) -> None:
+        if dc_ws is None:
+            return
+        failures = []
+        for group in dc_ws.leaf_groups:
+            bad = torch.nonzero(group.info, as_tuple=False).flatten().tolist()
+            if bad:
+                failures.append(f"size={group.size} flat_batch_leaf={bad}")
+        if failures:
+            raise RuntimeError(f"{label} D&C leaf HTEV failed: " + "; ".join(failures))
 
     def launch(*, annotate: bool) -> None:
         queue_handle = torch.cuda.current_stream().cuda_stream
@@ -709,33 +914,43 @@ def profile_tridiag_htev_once(data: torch.Tensor, backend: str) -> None:
                 queue_handle=queue_handle,
             )
 
-        with torch.cuda.nvtx.range("htev") if annotate else nullcontext():
-            eigh.htev_all_vectors_(D, E, V, info, queue_handle=queue_handle)
+        if stage == "full":
+            assert Z is not None and dc_ws is not None
+            # Fine-grained D&C ranges (leaves/prep/bmm) live inside eigh.py,
+            # gated off by default so eval calls never pay for them.
+            eigh.DC_NVTX = annotate
+            try:
+                with torch.cuda.nvtx.range("dc_solve") if annotate else nullcontext():
+                    eigh.tridiag_eig_dc_(
+                        D, E, Z, dc_ws, leaf_size=DC_LEAF_SIZE, queue_handle=queue_handle
+                    )
+            finally:
+                eigh.DC_NVTX = False
 
     # Compile every specialization and bring the GPU out of its idle state before
     # cudaProfilerStart. This execution is intentionally outside the captured range.
     launch(annotate=False)
     torch.cuda.synchronize()
-    warm_bad = torch.nonzero(info, as_tuple=False).flatten().tolist()
-    if warm_bad:
-        raise RuntimeError(f"HTEV warmup failed for batch entries {warm_bad}")
+    check_dc_leaf_info("warmup")
+    if Z is not None:
+        if not bool(torch.isfinite(Z).all().item()):
+            raise RuntimeError("D&C warmup produced non-finite eigenvectors")
 
     cudart = torch.cuda.cudart()
     cudart.cudaProfilerStart()
     try:
-        with torch.cuda.nvtx.range("full_pipeline"):
+        pipeline_range = "full_pipeline" if stage == "full" else "tridiag_pipeline"
+        with torch.cuda.nvtx.range(pipeline_range):
             launch(annotate=True)
             # Keep collection active until every GPU operation in the pipeline has
-            # completed; HTEV and all preceding launches are asynchronous.
+            # completed; the D&C solve and all preceding launches are asynchronous.
             torch.cuda.synchronize()
     finally:
         cudart.cudaProfilerStop()
 
-    bad = torch.nonzero(info, as_tuple=False).flatten().tolist()
-    if bad:
-        raise RuntimeError(f"profiled HTEV failed for batch entries {bad}")
+    check_dc_leaf_info("profiled")
     print(
-        f"profile workload: one full tridiagonalization+HTEV launch complete "
+        f"profile workload: one {stage} pipeline launch complete "
         f"(batch={data.size(0)} n={data.size(1)} ps={PANEL_SIZE} backend={backend})",
         flush=True,
     )
@@ -879,7 +1094,7 @@ def print_householder_reference(
 
 
 def main() -> None:
-    global PANEL_SIZE
+    global PANEL_SIZE, DC_LEAF_SIZE
     parser = argparse.ArgumentParser(description="Local runner for eigh.py CuTeDSL skeleton.")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--n", type=int, default=512)
@@ -913,7 +1128,16 @@ def main() -> None:
     parser.add_argument(
         "--tri-solve",
         action="store_true",
-        help="Run full tridiagonalization followed by cuSolverDx HTEV all-vectors.",
+        help="Run full tridiagonalization followed by the batched divide-and-"
+        "conquer tridiagonal eigensolver (block-mode HTEV leaves + GEMM merges).",
+    )
+    parser.add_argument(
+        "--leaf-size",
+        type=int,
+        default=DC_LEAF_SIZE,
+        help="D&C leaf size (subproblems this small are solved by block-mode "
+        "cuSolverDx HTEV; must stay under the arch's smem cap, ~157 on sm89, "
+        "~240 on B200).",
     )
     parser.add_argument(
         "--expected-preview",
@@ -952,10 +1176,16 @@ def main() -> None:
         help="Run only the panel correctness gate and exit.",
     )
     parser.add_argument(
-        "--profile-tri-solve-once",
+        "--profile-pipeline-once",
         action="store_true",
-        help="Warm, then launch exactly one full tridiagonalization+HTEV pipeline "
-        "between CUDA profiler start/stop calls.",
+        help="Warm, then launch exactly one selected pipeline between CUDA profiler "
+        "start/stop calls.",
+    )
+    parser.add_argument(
+        "--profile-stage",
+        choices=("full", "tridiag"),
+        default="full",
+        help="Pipeline exposed by --profile-pipeline-once.",
     )
     parser.add_argument(
         "--bench-sets",
@@ -997,13 +1227,18 @@ def main() -> None:
     args = parser.parse_args()
     if args.tri and args.tri_solve:
         parser.error("--tri and --tri-solve are mutually exclusive")
-    if sum((args.bench, args.trace_once, args.check_panel_only, args.profile_tri_solve_once)) > 1:
+    if sum((args.bench, args.trace_once, args.check_panel_only, args.profile_pipeline_once)) > 1:
         parser.error(
             "--bench, --trace-once, --check-panel-only, and "
-            "--profile-tri-solve-once are mutually exclusive"
+            "--profile-pipeline-once are mutually exclusive"
         )
-    if args.profile_tri_solve_once and not args.tri_solve:
-        parser.error("--profile-tri-solve-once requires --tri-solve")
+    if args.profile_pipeline_once:
+        required_mode = args.tri_solve if args.profile_stage == "full" else args.tri
+        if not required_mode:
+            parser.error(
+                f"--profile-pipeline-once --profile-stage={args.profile_stage} requires "
+                f"--{'tri-solve' if args.profile_stage == 'full' else 'tri'}"
+            )
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
     if args.bench_warmup_ms < 0:
@@ -1013,6 +1248,9 @@ def main() -> None:
     if not 1 <= args.panel_size <= eigh.MAX_PANEL_SIZE:
         parser.error(f"--panel-size must be in [1, {eigh.MAX_PANEL_SIZE}]")
     PANEL_SIZE = args.panel_size
+    if args.leaf_size < 3:
+        parser.error("--leaf-size must be at least 3")
+    DC_LEAF_SIZE = args.leaf_size
 
     panel_start = args.k * PANEL_SIZE
     if panel_start + PANEL_SIZE >= args.n:
@@ -1043,15 +1281,17 @@ def main() -> None:
         print("panel correctness gate passed", flush=True)
         return
 
+    if args.profile_pipeline_once:
+        backend = args.update_backend if args.update_backend != "none" else "cublas"
+        profile_pipeline_once(data, backend, args.profile_stage)
+        return
+
     if args.tri_solve:
         backend = args.update_backend if args.update_backend != "none" else "cublas"
-        if args.profile_tri_solve_once:
-            profile_tridiag_htev_once(data, backend)
-            return
         if not check_tridiag(data, backend):
             raise SystemExit(f"tridiag {backend} correctness check failed")
-        if not check_tridiag_htev(data, backend):
-            raise SystemExit(f"tridiag+HTEV {backend} correctness check failed")
+        if not check_tridiag_dc(data, backend):
+            raise SystemExit(f"tridiag+D&C {backend} correctness check failed")
         if args.bench:
             work = data.clone()
             D_input, E_input = make_de(data)
@@ -1065,7 +1305,7 @@ def main() -> None:
                 panel_size=PANEL_SIZE,
                 backend=backend,
             )
-            htev_samples, htev_sets = benchmark_htev(
+            dc_samples, dc_sets = benchmark_dc(
                 D_input.clone(),
                 E_input.clone(),
                 args.bench_sets,
@@ -1073,7 +1313,7 @@ def main() -> None:
                 args.bench_warmup_ms,
                 args.bench_repeats,
             )
-            combined_samples, combined_sets = benchmark_tridiag_htev(
+            combined_samples, combined_sets = benchmark_tridiag_dc(
                 data,
                 backend,
                 args.bench_sets,
@@ -1081,15 +1321,15 @@ def main() -> None:
                 args.bench_warmup_ms,
                 args.bench_repeats,
             )
-            htev_selected = select_sample(htev_samples, args.bench_stat)
+            dc_selected = select_sample(dc_samples, args.bench_stat)
             combined_selected = select_sample(combined_samples, args.bench_stat)
             print(
-                f"bench htev sets={htev_sets} samples_ms={htev_samples} "
-                f"{args.bench_stat}_ms={htev_selected:.6f}",
+                f"bench dc sets={dc_sets} samples_ms={dc_samples} "
+                f"{args.bench_stat}_ms={dc_selected:.6f}",
                 flush=True,
             )
             print(
-                f"bench tridiag_htev_{backend} sets={combined_sets} "
+                f"bench tridiag_dc_{backend} sets={combined_sets} "
                 f"samples_ms={combined_samples} {args.bench_stat}_ms={combined_selected:.6f}",
                 flush=True,
             )

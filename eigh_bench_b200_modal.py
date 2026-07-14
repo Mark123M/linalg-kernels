@@ -13,9 +13,11 @@ Usage:
     # so keep --calls small):
     modal run eigh_bench_b200_modal.py --cases 640x512 --panel-size 16 \
         --backends cublas --tri --calls 20 --repeats 3
-    # one warmed, uncaptured full tridiagonalization + HTEV Nsight Systems trace:
+    # one warmed, uncaptured full tridiagonalization + D&C-solve Nsight Systems trace:
     modal run eigh_bench_b200_modal.py --nsys --cases 640x512 \
         --panel-size 16 --nsys-backend cublas
+    # tridiagonalization only (no eigensolve): add --nsys-stage tridiag
+    # hardware SM/memory/tensor metrics at 10 kHz: add --nsys-gpu-metrics
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
 """
@@ -192,6 +194,7 @@ def _bench_torch_eigh(data, n_calls: int, repeats: int):
 def bench(
     cases: list[tuple[int, int]],
     panel_size: int,
+    leaf_size: int,
     k: int,
     backends: list[str],
     sets: int,
@@ -238,6 +241,7 @@ def bench(
         label = f"case {batch}x{n} ps={panel_size} k={k}"
         print(f"=== {label} ===", flush=True)
         runner.PANEL_SIZE = panel_size
+        runner.DC_LEAF_SIZE = leaf_size
         torch.manual_seed(seed)
         data = runner.make_input(batch, n, runner.DTYPE, device)
 
@@ -247,10 +251,10 @@ def bench(
 
         if tri_solve:
             tri_backends = backends or ["cublas"]
-            parts = [f"htev_mode={runner.eigh.htev_execution_mode(n)}"]
+            parts = [f"dc_leaf={runner.DC_LEAF_SIZE}"]
             case_ok = True
             for be in tri_backends:
-                if not runner.check_tridiag(data, be) or not runner.check_tridiag_htev(data, be):
+                if not runner.check_tridiag(data, be) or not runner.check_tridiag_dc(data, be):
                     case_ok = False
                     break
                 work = data.clone()
@@ -265,26 +269,35 @@ def bench(
                     panel_size=panel_size,
                     backend=be,
                 )
-                htev_samples, htev_sets = runner.benchmark_htev(
+                dc_samples, dc_sets = runner.benchmark_dc(
                     D_input.clone(), E_input.clone(), sets, calls, warmup_ms, repeats
                 )
-                combined_samples, combined_sets = runner.benchmark_tridiag_htev(
+                combined_samples, combined_sets = runner.benchmark_tridiag_dc(
                     data, be, sets, calls, warmup_ms, repeats
                 )
-                htev_ms = runner.select_sample(htev_samples, stat)
+                dc_ms = runner.select_sample(dc_samples, stat)
                 combined_ms = runner.select_sample(combined_samples, stat)
                 print(
-                    f"htev sets={htev_sets} samples_ms={[f'{s:.4f}' for s in htev_samples]}",
+                    f"dc sets={dc_sets} samples_ms={[f'{s:.4f}' for s in dc_samples]}",
                     flush=True,
                 )
                 print(
-                    f"tridiag_htev_{be} sets={combined_sets} "
+                    f"tridiag_dc_{be} sets={combined_sets} "
                     f"samples_ms={[f'{s:.4f}' for s in combined_samples]}",
                     flush=True,
                 )
-                parts.extend((f"htev={htev_ms:.4f}ms", f"tridiag_htev_{be}={combined_ms:.4f}ms"))
+                parts.extend((f"dc={dc_ms:.4f}ms", f"tridiag_dc_{be}={combined_ms:.4f}ms"))
+            if case_ok and bench_eigh:
+                eigh_samples, eigh_sets = _bench_torch_eigh(data, max(10, calls // 10), repeats)
+                eigh_ms = runner.select_sample(eigh_samples, stat)
+                print(
+                    f"torch_eigh sets={eigh_sets} "
+                    f"samples_ms={[f'{s:.4f}' for s in eigh_samples]}",
+                    flush=True,
+                )
+                parts.append(f"torch_eigh={eigh_ms:.4f}ms")
             if not case_ok:
-                summaries.append(f"{label}: TRIDIAG+HTEV GATE FAILED")
+                summaries.append(f"{label}: TRIDIAG+DC GATE FAILED")
                 failed = True
             else:
                 summaries.append(f"{label}: " + " ".join(parts))
@@ -498,14 +511,18 @@ def trace_panel(
 
 
 @app.function(image=nsys_image, gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
-def profile_full_pipeline(
+def profile_nsys_pipeline(
     batch: int,
     n: int,
     panel_size: int,
+    leaf_size: int,
     backend: str,
+    stage: str,
+    gpu_metrics: bool,
+    gpu_metrics_frequency: int,
     seed: int,
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Gate and profile one full tridiagonalization+HTEV pipeline."""
+    """Gate and profile one selected tridiagonalization pipeline."""
     from datetime import datetime, timezone
     import os
     from pathlib import Path
@@ -515,10 +532,13 @@ def profile_full_pipeline(
     os.makedirs("/cache/tmp", exist_ok=True)
     os.makedirs("/cache/cute", exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_name = f"b{batch}_n{n}_ps{panel_size}_{backend}_{stamp}"
+    metrics_tag = f"_gm{gpu_metrics_frequency}" if gpu_metrics else ""
+    run_name = f"b{batch}_n{n}_ps{panel_size}_leaf{leaf_size}_{backend}_{stage}{metrics_tag}_{stamp}"
     output_dir = Path("/cache/nsys") / run_name
     output_dir.mkdir(parents=True, exist_ok=False)
-    report_base = output_dir / "full_pipeline"
+    report_base = output_dir / (
+        "full_pipeline" if stage == "full" else "tridiagonalization"
+    )
     report_path = report_base.with_suffix(".nsys-rep")
     sqlite_path = report_base.with_suffix(".sqlite")
     summary_path = output_dir / "stats.txt"
@@ -534,20 +554,22 @@ def profile_full_pipeline(
         str(n),
         "--panel-size",
         str(panel_size),
+        "--leaf-size",
+        str(leaf_size),
         "--seed",
         str(seed),
         "--skip-expected",
-        "--tri-solve",
+        "--tri-solve" if stage == "full" else "--tri",
         "--update-backend",
         backend,
     ]
 
     _report_env("nsys")
-    print("=== full tridiagonalization+HTEV correctness preflight ===", flush=True)
+    print(f"=== {stage} pipeline correctness preflight ===", flush=True)
     preflight = subprocess.run(workload, env=env)
     if preflight.returncode != 0:
         raise RuntimeError(
-            f"tridiagonalization+HTEV correctness preflight failed: {preflight.returncode}"
+            f"{stage} pipeline correctness preflight failed: {preflight.returncode}"
         )
 
     command = [
@@ -565,9 +587,16 @@ def profile_full_pipeline(
         str(report_base),
         "--",
         *workload,
-        "--profile-tri-solve-once",
+        "--profile-pipeline-once",
+        "--profile-stage",
+        stage,
     ]
-    print("=== Nsight Systems full-pipeline profile ===", flush=True)
+    if gpu_metrics:
+        command[2:2] = [
+            "--gpu-metrics-devices=cuda-visible",
+            f"--gpu-metrics-frequency={gpu_metrics_frequency}",
+        ]
+    print(f"=== Nsight Systems {stage} pipeline profile ===", flush=True)
     print("command: " + " ".join(command), flush=True)
     profiled = subprocess.run(command, env=env)
     if profiled.returncode != 0:
@@ -596,7 +625,43 @@ def profile_full_pipeline(
         raise RuntimeError(f"nsys stats failed: {stats.returncode}")
     if not stats.stdout.strip():
         raise RuntimeError("nsys stats produced an empty summary")
-    summary_path.write_text(stats.stdout)
+
+    metrics_summary = ""
+    if gpu_metrics:
+        import sqlite3
+
+        with sqlite3.connect(sqlite_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            required_metric_tables = {"GPU_METRICS", "TARGET_INFO_GPU_METRICS"}
+            if not required_metric_tables.issubset(tables):
+                raise RuntimeError(
+                    "Nsight Systems completed without GPU metric tables; hardware "
+                    "counter access may not be permitted on this Modal worker"
+                )
+            sample_count = connection.execute("SELECT COUNT(*) FROM GPU_METRICS").fetchone()[0]
+            if sample_count <= 0:
+                raise RuntimeError("Nsight Systems GPU_METRICS table contains no samples")
+            metric_names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT metricName FROM TARGET_INFO_GPU_METRICS ORDER BY metricId"
+                )
+            ]
+        metrics_summary = (
+            f"\nGPU hardware metrics: {sample_count} samples at "
+            f"{gpu_metrics_frequency} Hz\n"
+            + "Metrics: "
+            + ", ".join(metric_names)
+            + "\n"
+        )
+        print(metrics_summary, end="", flush=True)
+
+    summary_path.write_text(stats.stdout + metrics_summary)
 
     required = (report_path, sqlite_path, summary_path)
     missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
@@ -616,6 +681,7 @@ def profile_full_pipeline(
 def main(
     cases: str = "640x512",
     panel_size: int = 8,
+    leaf_size: int = 128,
     k: int = 0,
     backends: str = "cublas,cublasdx",
     sets: int = 0,
@@ -633,6 +699,9 @@ def main(
     trace_output: str = "profiles/eigh_iket",
     nsys: bool = False,
     nsys_backend: str = "cublas",
+    nsys_stage: str = "full",
+    nsys_gpu_metrics: bool = False,
+    nsys_gpu_metrics_frequency: int = 10000,
     nsys_output: str = "profiles/eigh_nsys",
 ) -> None:
     if tri and tri_solve:
@@ -649,6 +718,10 @@ def main(
             raise SystemExit(f"unknown backend: {backend}")
     if nsys_backend not in ("cublas", "cublasdx"):
         raise SystemExit(f"unknown Nsight Systems backend: {nsys_backend}")
+    if nsys_stage not in ("full", "tridiag"):
+        raise SystemExit(f"unknown Nsight Systems stage: {nsys_stage}")
+    if not 10 <= nsys_gpu_metrics_frequency <= 200000:
+        raise SystemExit("--nsys-gpu-metrics-frequency must be in [10, 200000] Hz")
     if stat not in ("min", "mean", "median"):
         raise SystemExit(f"unknown stat: {stat}")
     if nsys:
@@ -657,8 +730,16 @@ def main(
         batch, n = parsed_cases[0]
         if batch <= 0:
             raise SystemExit("the --cases batch must be positive in --nsys mode")
-        run_name, artifacts = profile_full_pipeline.remote(
-            batch, n, panel_size, nsys_backend, seed
+        run_name, artifacts = profile_nsys_pipeline.remote(
+            batch,
+            n,
+            panel_size,
+            leaf_size,
+            nsys_backend,
+            nsys_stage,
+            nsys_gpu_metrics,
+            nsys_gpu_metrics_frequency,
+            seed,
         )
 
         from pathlib import Path
@@ -705,6 +786,7 @@ def main(
     bench.remote(
         parsed_cases,
         panel_size,
+        leaf_size,
         k,
         backend_list,
         sets,

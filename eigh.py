@@ -8,7 +8,7 @@ import pickle
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
@@ -77,6 +77,16 @@ def _iket_pop() -> None:
     """Close the most recent IKET range; a compile-time no-op on CuTe 4.5."""
     if _iket is not None:
         _iket.range_pop()
+
+
+# Fine-grained NVTX ranges inside tridiag_eig_dc_ (leaves vs prep vs bmm).
+# Off by default so eval calls pay zero Python overhead; the local runner's
+# profile path flips it on for the one annotated launch.
+DC_NVTX = False
+
+
+def _dc_range(name: str):
+    return torch.cuda.nvtx.range(name) if DC_NVTX else nullcontext()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -639,13 +649,22 @@ using QueueT = typename FifthArg<decltype(&cudaMemcpyAsync)>::type;
 
 constexpr int kN = EIGH_HTEV_N;
 constexpr int kArch = EIGH_HTEV_ARCH;
-constexpr int kThreads = 32;
+constexpr int kThreads = EIGH_HTEV_NT;
 
 using namespace cusolverdx;
 #if EIGH_HTEV_BLOCK
+// BlockDim is plumbed for sweeps (EIGH_HTEV_NT), but 32 = cuSolverDx's
+// suggestion is the measured optimum: with batches-per-block 1 the htev
+// warp_driver works one matrix per warp and extra warps idle (NT 32..256
+// bit-identical results, no speedup). The leaf-cost lever is leaf size
+// (work ~ n*leaf^2 per matrix), not CTA width.
 using HTEVSolver = decltype(Size<kN>() + Precision<float>() + Type<type::real>() +
                             Function<htev>() + SM<kArch>() + Block() +
+                            BlockDim<kThreads>() +
                             Job<job::all_vectors>() + Arrangement<row_major>());
+static_assert(HTEVSolver::block_dim.x == kThreads && HTEVSolver::block_dim.y == 1 &&
+                  HTEVSolver::block_dim.z == 1,
+              "HTEV block_dim must match EIGH_HTEV_NT");
 #else
 using HTEVSolver = decltype(Size<kN>() + Precision<float>() + Type<type::real>() +
                             Function<htev>() + SM<kArch>() + Thread() +
@@ -937,12 +956,31 @@ def _load_extension_file(name: str, path: Path):
     return module
 
 
+def _htev_block_threads(n: int) -> int:
+    """CTA width for the block-mode HTEV kernel.
+
+    cuSolverDx's suggested width (32) is the measured optimum: with
+    batches-per-block 1 the htev warp_driver keeps one matrix per warp, so
+    wider CTAs only add idle warps (NT 32..256 timed bit-identical at
+    B=2560/N=128 on sm89). The ``EIGH_HTEV_NT`` env var overrides for sweeps.
+    """
+    del n
+    env = os.environ.get("EIGH_HTEV_NT")
+    if env:
+        nt = int(env)
+        if nt % 32 != 0 or not 32 <= nt <= 1024:
+            raise ValueError(f"EIGH_HTEV_NT must be a multiple of 32 in [32, 1024], got {nt}")
+        return nt
+    return 32
+
+
 def _build_htev_extension(
     name: str,
     n: int,
     arch_name: str,
     arch: int,
     mode: str,
+    nt: int,
 ):
     from setuptools import Distribution
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -965,6 +1003,7 @@ def _build_htev_extension(
         f"-DEIGH_HTEV_N={n}",
         f"-DEIGH_HTEV_ARCH={arch}",
         f"-DEIGH_HTEV_BLOCK={int(mode == 'block')}",
+        f"-DEIGH_HTEV_NT={nt}",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -1012,6 +1051,13 @@ def _htev_shared_memory_size(n: int) -> int:
 def _htev_execution_mode(n: int, arch_name: str) -> str:
     shared_limit = {"sm89": 101376, "sm100a": 232448}[arch_name]
     return "block" if _htev_shared_memory_size(n) <= shared_limit else "thread"
+
+
+def _htev_max_block_n(arch_name: str) -> int:
+    n = 2
+    while _htev_execution_mode(n + 1, arch_name) == "block":
+        n += 1
+    return n
 
 
 def htev_execution_mode(n: int) -> str:
@@ -1069,10 +1115,18 @@ def _load_cublasdx_module(panel_size: int, arch_name: str, arch: int):
 @lru_cache(maxsize=None)
 def _load_htev_module(n: int, arch_name: str, arch: int):
     mode = _htev_execution_mode(n, arch_name)
+    if mode != "block":
+        raise RuntimeError(
+            f"HTEV at N={n} exceeds the {arch_name} shared-memory cap for the "
+            f"Block() execution policy (max N={_htev_max_block_n(arch_name)}); "
+            "the Thread() fallback is ~1000x too slow at these sizes and is "
+            "disabled. Use the divide-and-conquer solver for larger N."
+        )
+    nt = _htev_block_threads(n) if mode == "block" else 32
     source_tag = hashlib.sha256(
         (_HTEV_CPP_SOURCE + _HTEV_CUDA_SOURCE).encode()
     ).hexdigest()[:10]
-    name = f"eigh_htev_n{n}_{arch_name}_{mode}_v3_{source_tag}"
+    name = f"eigh_htev_n{n}_{arch_name}_{mode}_nt{nt}_v4_{source_tag}"
     build_root = _HTEV_BUILD_ROOT / name
     build_root.mkdir(parents=True, exist_ok=True)
     lock_path = build_root / "build.lock"
@@ -1084,7 +1138,7 @@ def _load_htev_module(n: int, arch_name: str, arch: int):
             if matches:
                 module = _load_extension_file(name, matches[-1])
             else:
-                module = _build_htev_extension(name, n, arch_name, arch, mode)
+                module = _build_htev_extension(name, n, arch_name, arch, mode, nt)
     module.prepare_htev()
     return module
 
@@ -1182,6 +1236,669 @@ def htev_all_vectors_(
     arch_name, arch = _current_arch()
     module = _load_htev_module(n, arch_name, arch)
     module.htev_all_vectors_(D, E, V, info, queue_handle)
+
+
+# --------------------------------------------------------------------------
+# Divide & conquer tridiagonal eigensolver (dstedc/dlaed0-4 chain, batched).
+#
+# htev solves the leaves (block-mode smem cap ~N<=240 on B200); each merge is
+# a rank-1 update T = Q (D + rho z z^T) Q^T handled by one prep kernel CTA per
+# (matrix, merge) that folds deflation Givens rotations, the secular
+# eigenvectors, deflated pass-through columns, and the ascending sort into one
+# m x m matrix S_eff, followed by two batched GEMMs Q1 @ S_top / Q2 @ S_bot.
+# The deflation count K never reaches the host: uniform launches, CUDA-graph
+# capturable.
+# --------------------------------------------------------------------------
+
+_DC_MAX_MERGE = 4096
+
+_DC_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+void dc_prep_native_(torch::Tensor e,
+                     torch::Tensor lam,
+                     torch::Tensor z_cur,
+                     torch::Tensor s_out,
+                     torch::Tensor fbuf,
+                     torch::Tensor ibuf,
+                     torch::Tensor merges,
+                     int64_t m_max,
+                     int64_t queue_handle);
+void prepare_dc_native();
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("dc_prep_", &dc_prep_native_, "D&C merge S_eff preparation kernel");
+  m.def("prepare_dc", &prepare_dc_native, "Set D&C kernel attributes");
+}
+"""
+
+_DC_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+namespace {
+
+template <class F>
+struct FifthArg;
+template <class R, class A, class B, class C, class D, class E>
+struct FifthArg<R (*)(A, B, C, D, E)> {
+  using type = E;
+};
+using QueueT = typename FifthArg<decltype(&cudaMemcpyAsync)>::type;
+
+constexpr int kDcThreads = 256;
+constexpr int kDcMaxMerge = 4096;
+constexpr int kDcSecularIters = 40;
+constexpr float kDcEps = 1.1920929e-07f;
+
+// One CTA per (merge g, matrix b). Implements dlaed1/dlaed2/dlaed3/dlaed4 for
+// the rank-1 merge T = Q (diag(d) + rho z z^T) Q^T entirely on device,
+// emitting the merged ascending eigenvalues into lam (in place, own slice
+// only) and the m x m S_eff block into s_out at (off, off).
+__global__ void dc_prep_kernel(const float* __restrict__ e,
+                               float* __restrict__ lam,
+                               const float* __restrict__ z_cur,
+                               float* __restrict__ s_out,
+                               float* __restrict__ fbuf,
+                               int* __restrict__ ibuf,
+                               const int* __restrict__ merges,
+                               int n_full) {
+  const int g = blockIdx.x;
+  const int b = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int nthr = blockDim.x;
+  const int off = merges[3 * g];
+  const int n1 = merges[3 * g + 1];
+  const int m = merges[3 * g + 2];
+
+  // Dynamic smem: survivor poles, weights (later Loewner z-hat), secular
+  // roots, and origin indices.
+  extern __shared__ unsigned char dc_smem[];
+  float* sdl = reinterpret_cast<float*>(dc_smem);
+  float* sw = sdl + m;
+  float* smu = sw + m;
+  int* sorig = reinterpret_cast<int*>(smu + m);
+
+  __shared__ float red[kDcThreads];
+  __shared__ float sh_tol, sh_rho, sh_rhoinv;
+  __shared__ int sh_k, sh_r;
+
+  // Per-merge slices of the gmem scratch (merges at a level are disjoint in
+  // [off, off + m)).
+  float* zv = fbuf + ((long long)b * 4 + 0) * n_full + off;   // z, mutated
+  float* dw = fbuf + ((long long)b * 4 + 1) * n_full + off;   // working d
+  float* rotc = fbuf + ((long long)b * 4 + 2) * n_full + off; // Givens cos
+  float* rots = fbuf + ((long long)b * 4 + 3) * n_full + off; // Givens sin
+  int* perm = ibuf + ((long long)b * 6 + 0) * n_full + off;
+  int* surv = ibuf + ((long long)b * 6 + 1) * n_full + off;
+  int* defl = ibuf + ((long long)b * 6 + 2) * n_full + off;
+  int* roti = ibuf + ((long long)b * 6 + 3) * n_full + off;
+  int* rotj = ibuf + ((long long)b * 6 + 4) * n_full + off;
+  int* order = ibuf + ((long long)b * 6 + 5) * n_full + off;
+  float* lam_g = lam + (long long)b * n_full + off;
+  float* s_g = s_out + ((long long)b * n_full + off) * n_full + off;
+
+  // Phase A: gather z = (last row of Q1, sign(e) * first row of Q2)/sqrt(2)
+  // and the two halves' eigenvalues. dlaed1.f:231-234 + dlaed2.f:281-293.
+  const float ecut = e[(long long)b * (n_full - 1) + off + n1 - 1];
+  const float inv_sqrt2 = 0.70710678118654752f;
+  const float scale2 = ecut < 0.0f ? -inv_sqrt2 : inv_sqrt2;
+  const long long zrow1 = ((long long)b * n_full + off + n1 - 1) * n_full + off;
+  const long long zrow2 = ((long long)b * n_full + off + n1) * n_full + off;
+  for (int i = tid; i < m; i += nthr) {
+    zv[i] = i < n1 ? z_cur[zrow1 + i] * inv_sqrt2 : z_cur[zrow2 + i] * scale2;
+    dw[i] = lam_g[i];
+  }
+  __syncthreads();
+
+  // Phase B: deflation tolerance = 8 eps max(|d|max, |z|max) (dlaed2.f:313).
+  float local_max = 0.0f;
+  for (int i = tid; i < m; i += nthr) {
+    local_max = fmaxf(local_max, fabsf(dw[i]));
+    local_max = fmaxf(local_max, fabsf(zv[i]));
+  }
+  red[tid] = local_max;
+  __syncthreads();
+  for (int s = kDcThreads / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+  float zmax = 0.0f;
+  for (int i = tid; i < m; i += nthr) zmax = fmaxf(zmax, fabsf(zv[i]));
+  if (tid == 0) {
+    sh_tol = 8.0f * kDcEps * red[0];
+    sh_rho = fabsf(2.0f * ecut);
+    sh_rhoinv = sh_rho > 0.0f ? 1.0f / sh_rho : 0.0f;
+  }
+  red[tid] = zmax;
+  __syncthreads();
+  for (int s = kDcThreads / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+
+  // Phase C (single thread): merge-sort the two ascending halves, then the
+  // dlaed2 deflation scan (rule A: negligible z; rule B: close eigenvalues
+  // -> Givens rotation recorded for later folding into S_eff).
+  if (tid == 0) {
+    const float tol = sh_tol;
+    const float rho = sh_rho;
+    const float zmax_all = red[0];
+    int a = 0, c = n1, p = 0;
+    while (a < n1 && c < m)
+      perm[p++] = dw[a] <= dw[c] ? a++ : c++;
+    while (a < n1) perm[p++] = a++;
+    while (c < m) perm[p++] = c++;
+
+    int k = 0, r = 0, nd = 0;
+    int pj = -1;
+    const bool all_deflate = rho * zmax_all <= tol;
+    for (int t = 0; t < m; ++t) {
+      const int nj = perm[t];
+      if (all_deflate || rho * fabsf(zv[nj]) <= tol) {
+        // rule A; insertion keeps the deflated list ascending by value.
+        int q = nd++;
+        while (q > 0 && dw[defl[q - 1]] > dw[nj]) {
+          defl[q] = defl[q - 1];
+          --q;
+        }
+        defl[q] = nj;
+        continue;
+      }
+      if (pj < 0) {
+        pj = nj;
+        continue;
+      }
+      const float zs = zv[pj];
+      const float zc = zv[nj];
+      const float tau = hypotf(zc, zs);
+      const float tdiff = dw[nj] - dw[pj];
+      const float cn = zc / tau;
+      const float sn = -zs / tau;
+      if (fabsf(tdiff * cn * sn) <= tol) {
+        // rule B (dlaed2.f:384-422)
+        zv[nj] = tau;
+        zv[pj] = 0.0f;
+        roti[r] = pj;
+        rotj[r] = nj;
+        rotc[r] = cn;
+        rots[r] = sn;
+        ++r;
+        const float t2 = dw[pj] * cn * cn + dw[nj] * sn * sn;
+        dw[nj] = dw[pj] * sn * sn + dw[nj] * cn * cn;
+        dw[pj] = t2;
+        int q = nd++;
+        while (q > 0 && dw[defl[q - 1]] > dw[pj]) {
+          defl[q] = defl[q - 1];
+          --q;
+        }
+        defl[q] = pj;
+        pj = nj;
+      } else {
+        surv[k++] = pj;
+        pj = nj;
+      }
+    }
+    if (pj >= 0) surv[k++] = pj;
+    // Defensive near-sorted fix-up: rule-B updates keep survivors ascending
+    // in exact arithmetic; enforce it so dlaed4's precondition holds.
+    for (int i = 1; i < k; ++i) {
+      const int key = surv[i];
+      const float dv = dw[key];
+      int q = i - 1;
+      while (q >= 0 && dw[surv[q]] > dv) {
+        surv[q + 1] = surv[q];
+        --q;
+      }
+      surv[q + 1] = key;
+    }
+    sh_k = k;
+    sh_r = r;
+  }
+  __syncthreads();
+
+  const int k = sh_k;
+  const int r = sh_r;
+  const float rho = sh_rho;
+  const float rhoinv = sh_rhoinv;
+  for (int i = tid; i < k; i += nthr) {
+    sdl[i] = dw[surv[i]];
+    sw[i] = zv[surv[i]];
+  }
+  __syncthreads();
+
+  // Phase D: secular equation, one lane per root (dlaed4 fixed-weight
+  // iteration; interior formulas dlaed4.f:633-658, last root :324-340).
+  if (k == 1 && tid == 0) {
+    smu[0] = rho * sw[0] * sw[0];
+    sorig[0] = 0;
+  }
+  if (k > 1) {
+    for (int j = tid; j < k; j += nthr) {
+      const bool lastr = j == k - 1;
+      const int il = lastr ? k - 2 : j;
+      const int ir = il + 1;
+      int org;
+      float lo, hi;
+      if (!lastr) {
+        const float half = 0.5f * (sdl[j + 1] - sdl[j]);
+        float fmid = rhoinv;
+        for (int i = 0; i < k; ++i)
+          fmid += sw[i] * sw[i] / ((sdl[i] - sdl[j]) - half);
+        if (fmid > 0.0f) {
+          org = j;
+          lo = 0.0f;
+          hi = half;
+        } else {
+          org = j + 1;
+          lo = -half;
+          hi = 0.0f;
+        }
+      } else {
+        org = k - 1;
+        lo = 0.0f;
+        float sum2 = 0.0f;
+        for (int i = 0; i < k; ++i) sum2 += sw[i] * sw[i];
+        hi = rho * sum2;
+      }
+      const float dorg = sdl[org];
+      const float pl = sdl[il] - dorg;
+      const float pr = sdl[ir] - dorg;
+      const float w2l = sw[il] * sw[il];
+      const float w2r = sw[ir] * sw[ir];
+      const bool orgati = org == il;
+      float tau = 0.5f * (lo + hi);
+      for (int it = 0; it < kDcSecularIters; ++it) {
+        float wv = rhoinv, dwv = 0.0f, dphi = 0.0f;
+        for (int i = 0; i < k; ++i) {
+          const float dif = (sdl[i] - dorg) - tau;
+          const float t1 = sw[i] / dif;
+          wv += sw[i] * t1;
+          const float t2 = t1 * t1;
+          dwv += t2;
+          if (i == k - 1) dphi = t2;
+        }
+        const bool wneg = wv <= 0.0f;
+        if (wneg)
+          lo = fmaxf(lo, tau);
+        else
+          hi = fminf(hi, tau);
+        const float s1 = pl - tau;
+        const float s2 = pr - tau;
+        float cq, aq, bq;
+        if (!lastr) {
+          cq = orgati ? wv - s2 * dwv - (pl - pr) * w2l / (s1 * s1)
+                      : wv - s1 * dwv - (pr - pl) * w2r / (s2 * s2);
+          aq = (s1 + s2) * wv - s1 * s2 * dwv;
+          bq = s1 * s2 * wv;
+        } else {
+          const float dpsi = dwv - dphi;
+          cq = wv - s1 * dpsi - s2 * dphi;
+          aq = (s1 + s2) * wv - s1 * s2 * dwv;
+          bq = s1 * s2 * wv;
+        }
+        const float disc = sqrtf(fabsf(aq * aq - 4.0f * bq * cq));
+        float eta;
+        if (!lastr)
+          eta = aq <= 0.0f ? (aq - disc) / (2.0f * cq)
+                           : 2.0f * bq / (aq + disc);
+        else
+          eta = aq >= 0.0f ? (aq + disc) / (2.0f * cq)
+                           : 2.0f * bq / (aq - disc);
+        const float newton = -wv / dwv;
+        if (cq == 0.0f || !isfinite(eta)) eta = newton;
+        if (wv * eta >= 0.0f) eta = newton;
+        const float cand = tau + eta;
+        if (cand > hi || cand < lo)
+          eta = wneg ? 0.5f * (hi - tau) : 0.5f * (lo - tau);
+        tau += eta;
+        if (tau == 0.0f) tau = 0.5f * (lo + hi);
+      }
+      smu[j] = tau;
+      sorig[j] = org;
+    }
+  }
+  __syncthreads();
+
+  // Phase E: Loewner z-hat recompute (dlaed3.f:260-290); overwrites sw with
+  // z-hat (each lane touches only its own indices).
+  for (int i = tid; i < k; i += nthr) {
+    float prod = 1.0f;
+    const float di = sdl[i];
+    for (int j = 0; j < k; ++j) {
+      const float del = (di - sdl[sorig[j]]) - smu[j];
+      prod *= j == i ? del : del / (di - sdl[j]);
+    }
+    sw[i] = copysignf(sqrtf(fmaxf(-prod, 0.0f)), sw[i]);
+  }
+
+  // Phase F1: zero the S block.
+  for (long long idx = tid; idx < (long long)m * m; idx += nthr)
+    s_g[(idx / m) * n_full + idx % m] = 0.0f;
+  __syncthreads();
+
+  // Phase F2 (single thread): merge secular roots (ascending by interlacing)
+  // with the ascending deflated values into the output order + eigenvalues.
+  if (tid == 0) {
+    int a = 0, t = 0;
+    const int nd = m - k;
+    for (int c = 0; c < m; ++c) {
+      const float va = a < k ? sdl[sorig[a]] + smu[a] : 0.0f;
+      const float vb = t < nd ? dw[defl[t]] : 0.0f;
+      const bool pick_a = t >= nd || (a < k && va <= vb);
+      if (pick_a) {
+        order[c] = a;
+        lam_g[c] = va;
+        ++a;
+      } else {
+        order[c] = k + t;
+        lam_g[c] = vb;
+        ++t;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase F3: write S_eff columns — normalized secular eigenvectors scattered
+  // through the survivor map (dlaed3.f:281-290), unit columns for deflated.
+  for (int c = tid; c < m; c += nthr) {
+    const int src = order[c];
+    if (src >= k) {
+      s_g[(long long)defl[src - k] * n_full + c] = 1.0f;
+    } else {
+      float nrm = 0.0f;
+      for (int i = 0; i < k; ++i) {
+        const float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        const float v = sw[i] / del;
+        nrm += v * v;
+      }
+      const float inv = rsqrtf(nrm);
+      for (int i = 0; i < k; ++i) {
+        const float del = (sdl[i] - sdl[sorig[src]]) - smu[src];
+        s_g[(long long)surv[i] * n_full + c] = (sw[i] / del) * inv;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase F4: fold the Givens rotations, S_eff = G1 ... Gr S0, applied in
+  // reverse record order. Each thread owns a fixed column set for every
+  // rotation, so no synchronization is needed between rotations.
+  for (int t = r - 1; t >= 0; --t) {
+    const long long rp = (long long)roti[t] * n_full;
+    const long long rn = (long long)rotj[t] * n_full;
+    const float cn = rotc[t];
+    const float sn = rots[t];
+    for (int c = tid; c < m; c += nthr) {
+      const float xp = s_g[rp + c];
+      const float xn = s_g[rn + c];
+      s_g[rp + c] = cn * xp - sn * xn;
+      s_g[rn + c] = sn * xp + cn * xn;
+    }
+  }
+}
+
+void validate_dc_inputs(const torch::Tensor& e,
+                        const torch::Tensor& lam,
+                        const torch::Tensor& z_cur,
+                        const torch::Tensor& s_out,
+                        const torch::Tensor& fbuf,
+                        const torch::Tensor& ibuf,
+                        const torch::Tensor& merges) {
+  TORCH_CHECK(lam.is_cuda() && lam.dim() == 2, "lam must be a CUDA (batch, n) tensor");
+  const auto batch = lam.size(0);
+  const auto n = lam.size(1);
+  TORCH_CHECK(e.dim() == 2 && e.size(0) == batch && e.size(1) == n - 1,
+              "e must have shape (batch, n-1)");
+  TORCH_CHECK(z_cur.dim() == 3 && z_cur.size(0) == batch && z_cur.size(1) == n &&
+                  z_cur.size(2) == n,
+              "z_cur must have shape (batch, n, n)");
+  TORCH_CHECK(s_out.sizes() == z_cur.sizes(), "s_out must match z_cur's shape");
+  TORCH_CHECK(fbuf.dim() == 3 && fbuf.size(0) == batch && fbuf.size(1) == 4 &&
+                  fbuf.size(2) == n,
+              "fbuf must have shape (batch, 4, n)");
+  TORCH_CHECK(ibuf.dim() == 3 && ibuf.size(0) == batch && ibuf.size(1) == 6 &&
+                  ibuf.size(2) == n,
+              "ibuf must have shape (batch, 6, n)");
+  TORCH_CHECK(merges.is_cuda() && merges.dim() == 2 && merges.size(1) == 3 &&
+                  merges.scalar_type() == at::kInt,
+              "merges must be a CUDA (G, 3) int32 tensor");
+  TORCH_CHECK(ibuf.scalar_type() == at::kInt, "ibuf must be int32");
+  for (const auto* t : {&e, &lam, &z_cur, &s_out, &fbuf}) {
+    TORCH_CHECK(t->scalar_type() == at::kFloat, "float32 tensors required");
+    TORCH_CHECK(t->is_contiguous(), "contiguous tensors required");
+  }
+  TORCH_CHECK(ibuf.is_contiguous() && merges.is_contiguous(),
+              "contiguous tensors required");
+}
+
+}  // namespace
+
+void prepare_dc_native() {
+  auto status = cudaFuncSetAttribute(dc_prep_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     16 * kDcMaxMerge);
+  TORCH_CHECK(status == cudaSuccess,
+              "D&C shared-memory setup failed: ", cudaGetErrorString(status));
+}
+
+void dc_prep_native_(torch::Tensor e,
+                     torch::Tensor lam,
+                     torch::Tensor z_cur,
+                     torch::Tensor s_out,
+                     torch::Tensor fbuf,
+                     torch::Tensor ibuf,
+                     torch::Tensor merges,
+                     int64_t m_max,
+                     int64_t queue_handle) {
+  validate_dc_inputs(e, lam, z_cur, s_out, fbuf, ibuf, merges);
+  TORCH_CHECK(m_max >= 2 && m_max <= kDcMaxMerge, "m_max must be in [2, ",
+              kDcMaxMerge, "]");
+  const int batch = static_cast<int>(lam.size(0));
+  const int n = static_cast<int>(lam.size(1));
+  const int g = static_cast<int>(merges.size(0));
+  const QueueT queue = reinterpret_cast<QueueT>(queue_handle);
+  const dim3 grid(g, batch);
+  const size_t shmem = 16 * static_cast<size_t>(m_max);
+  dc_prep_kernel<<<grid, kDcThreads, shmem, queue>>>(
+      e.data_ptr<float>(), lam.data_ptr<float>(), z_cur.data_ptr<float>(),
+      s_out.data_ptr<float>(), fbuf.data_ptr<float>(), ibuf.data_ptr<int>(),
+      merges.data_ptr<int>(), n);
+  auto status = cudaPeekAtLastError();
+  TORCH_CHECK(status == cudaSuccess,
+              "D&C prep launch failed: ", cudaGetErrorString(status));
+}
+"""
+
+
+@lru_cache(maxsize=1)
+def _load_dc_module():
+    module = load_inline(
+        "eigh_dc_prep_v1",
+        cpp_sources=_DC_CPP_SOURCE,
+        cuda_sources=_DC_CUDA_SOURCE,
+        functions=None,
+        extra_cflags=_NATIVE_CFLAGS,
+        # No fast math: the secular iteration needs exact FP32 division.
+        extra_cuda_cflags=[f for f in _NATIVE_CUDA_CFLAGS if f != "--use_fast_math"],
+        build_directory=_build_directory("eigh_dc_prep_v1"),
+        verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
+    )
+    module.prepare_dc()
+    return module
+
+
+@lru_cache(maxsize=None)
+def _dc_tree(n: int, leaf: int):
+    """Split [0, n) by repeated halving until every segment is <= leaf.
+
+    Returns (leaves, levels): leaves as ((off, size), ...) and levels as a
+    bottom-up tuple of (merges, passthrough) pairs — merges as (off, n1, m),
+    passthrough as the (off, size) segments alive but not merged at that
+    level (unbalanced trees only), whose Z blocks must be copied across the
+    ping-pong buffers.
+    """
+    if leaf < 3:
+        raise ValueError(f"leaf size must be >= 3, got {leaf}")
+    segs = [(0, n)]
+    merges_top_down = []
+    while any(size > leaf for _, size in segs):
+        merges = []
+        nxt = []
+        for off, size in segs:
+            if size > leaf:
+                n1 = size // 2
+                merges.append((off, n1, size))
+                nxt.append((off, n1))
+                nxt.append((off + n1, size - n1))
+            else:
+                nxt.append((off, size))
+        merges_top_down.append(tuple(merges))
+        segs = nxt
+    leaves = tuple(segs)
+    # Bottom-up replay to find each level's pass-through segments.
+    state = set(leaves)
+    levels = []
+    for merges in reversed(merges_top_down):
+        children = set()
+        for off, n1, m in merges:
+            children.add((off, n1))
+            children.add((off + n1, m - n1))
+        passthrough = tuple(sorted(state - children))
+        state = (state - children) | {(off, m) for off, _, m in merges}
+        levels.append((merges, passthrough))
+    return leaves, tuple(levels)
+
+
+DCWorkspace = namedtuple(
+    "DCWorkspace",
+    ["z_alt", "s", "fbuf", "ibuf", "cuts", "level_desc", "leaf_groups"],
+)
+DCLeafGroup = namedtuple("DCLeafGroup", ["size", "offs", "d", "e", "v", "info"])
+
+
+def dc_workspace(
+    batch: int, n: int, device: torch.device, leaf_size: int = 32
+) -> DCWorkspace:
+    """Allocate every buffer ``tridiag_eig_dc_`` needs (graph-friendly)."""
+    leaves, levels = _dc_tree(n, min(leaf_size, n))
+    f32 = dict(device=device, dtype=torch.float32)
+    z_alt = torch.zeros(batch, n, n, **f32)
+    s = torch.zeros(batch, n, n, **f32)
+    fbuf = torch.zeros(batch, 4, n, **f32)
+    ibuf = torch.zeros(batch, 6, n, device=device, dtype=torch.int32)
+    cut_list = [off + n1 - 1 for merges, _ in levels for off, n1, _ in merges]
+    cuts = torch.tensor(sorted(cut_list), device=device, dtype=torch.long)
+    level_desc = tuple(
+        torch.tensor(merges, device=device, dtype=torch.int32) for merges, _ in levels
+    )
+    by_size: dict[int, list[int]] = {}
+    for off, size in leaves:
+        by_size.setdefault(size, []).append(off)
+    leaf_groups = []
+    for size, offs in sorted(by_size.items()):
+        count = len(offs)
+        leaf_groups.append(
+            DCLeafGroup(
+                size,
+                tuple(offs),
+                torch.zeros(batch, count, size, **f32),
+                torch.zeros(batch, count, max(size - 1, 1), **f32),
+                torch.zeros(batch * count, size, size, **f32),
+                torch.zeros(batch * count, device=device, dtype=torch.int32),
+            )
+        )
+    return DCWorkspace(z_alt, s, fbuf, ibuf, cuts, level_desc, tuple(leaf_groups))
+
+
+def warm_dc(n: int, leaf_size: int = 32) -> None:
+    """Compile the D&C prep module and the leaf HTEV specializations."""
+    leaves, _ = _dc_tree(n, min(leaf_size, n))
+    _load_dc_module()
+    for size in sorted({size for _, size in leaves}):
+        warm_htev(size)
+
+
+def tridiag_eig_dc_(
+    D: torch.Tensor,
+    E: torch.Tensor,
+    Z: torch.Tensor,
+    ws: DCWorkspace,
+    *,
+    leaf_size: int = 32,
+    queue_handle: int = 0,
+) -> None:
+    """Batched D&C eigendecomposition of the tridiagonal (D, E).
+
+    ``D`` (batch, n) is overwritten with ascending eigenvalues; ``E`` is read
+    only; ``Z`` (batch, n, n) receives the eigenvectors as columns. ``ws``
+    comes from :func:`dc_workspace` with matching (batch, n, leaf_size). All
+    work runs on the ambient torch queue except the native launches, which
+    take ``queue_handle`` (0 = legacy default queue, correct in eval).
+    """
+    batch, n = D.shape
+    leaves, levels = _dc_tree(n, min(leaf_size, n))
+    n_levels = len(levels)
+    module = _load_dc_module()
+
+    # Tears: subtract |E[cut]| from both straddling diagonals for every merge
+    # in the tree, once up front (dlaed0.f:263-268).
+    if ws.cuts.numel() > 0:
+        with _dc_range("dc_tears"):
+            eabs = E[:, ws.cuts].abs()
+            D[:, ws.cuts] -= eabs
+            D[:, ws.cuts + 1] -= eabs
+
+    # Leaves: batched block-mode HTEV per distinct leaf size.
+    z_cur = Z if n_levels % 2 == 0 else ws.z_alt
+    z_nxt = ws.z_alt if n_levels % 2 == 0 else Z
+    for group in ws.leaf_groups:
+        size = group.size
+        with _dc_range(f"dc_leaf_gather_{size}x{len(group.offs)}"):
+            for gi, off in enumerate(group.offs):
+                group.d[:, gi].copy_(D[:, off : off + size])
+                group.e[:, gi].copy_(E[:, off : off + size - 1])
+        with _dc_range(f"dc_htev_{size}x{len(group.offs)}"):
+            htev_all_vectors_(
+                group.d.view(batch * len(group.offs), size),
+                group.e.view(batch * len(group.offs), max(size - 1, 1))[:, : size - 1],
+                group.v,
+                group.info,
+                queue_handle=queue_handle,
+            )
+        v_view = group.v.view(batch, len(group.offs), size, size)
+        with _dc_range(f"dc_leaf_scatter_{size}x{len(group.offs)}"):
+            for gi, off in enumerate(group.offs):
+                D[:, off : off + size].copy_(group.d[:, gi])
+                z_cur[:, off : off + size, off : off + size].copy_(v_view[:, gi])
+
+    # Merge levels, bottom-up: prep (S_eff + merged eigenvalues), then the two
+    # block GEMMs per merge into the ping buffer. Pass-through segments (alive
+    # but not merged at this level — unbalanced trees only) are copied across
+    # so the destination buffer holds every live block.
+    for li, ((merges, passthrough), desc) in enumerate(zip(levels, ws.level_desc)):
+        m_max = max(m for _, _, m in merges)
+        with _dc_range(f"dc_prep_L{li}_m{m_max}x{len(merges)}"):
+            module.dc_prep_(E, D, z_cur, ws.s, ws.fbuf, ws.ibuf, desc, m_max, queue_handle)
+        if passthrough:
+            with _dc_range(f"dc_pass_L{li}"):
+                for off, size in passthrough:
+                    z_nxt[:, off : off + size, off : off + size].copy_(
+                        z_cur[:, off : off + size, off : off + size]
+                    )
+        with _dc_range(f"dc_bmm_L{li}_m{m_max}x{len(merges)}"):
+            for off, n1, m in merges:
+                torch.bmm(
+                    z_cur[:, off : off + n1, off : off + n1],
+                    ws.s[:, off : off + n1, off : off + m],
+                    out=z_nxt[:, off : off + n1, off : off + m],
+                )
+                torch.bmm(
+                    z_cur[:, off + n1 : off + m, off + n1 : off + m],
+                    ws.s[:, off + n1 : off + m, off : off + m],
+                    out=z_nxt[:, off + n1 : off + m, off : off + m],
+                )
+        z_cur, z_nxt = z_nxt, z_cur
 
 
 def rank2k_update_(
@@ -1657,6 +2374,7 @@ class Eigh:
 
             _iket_push("matvec")
             for t in cutlass.range(num_tiles):
+                #_iket_push("matvec_async_load")
                 if t + 1 < num_tiles:
                     gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (t + 1, 0))
                     tAgA_next = thr_matvec.partition_S(gA_next)
@@ -1668,13 +2386,19 @@ class Eigh:
                             pred=tApA,
                         )
                 cute.arch.cp_async_commit_group()
+                #_iket_pop()
+                
                 cute.arch.cp_async_wait_group(1)
-
+                
+                #_iket_push("matvec_reg_load")
                 if const_expr(warps_per_row > 1):
                     # Keep a fast row group from overwriting reduction_buffer before slow
                     # warps have read the previous reduction.
                     cute.arch.barrier()
                 cute.autovec_copy(tAsA[None, None, None, t % 2], tArA)
+                #_iket_pop()
+                
+                #_iket_push("matvec_reduce")
                 a = tArA.load().to(Float32)
                 b = row_sum(
                     a * tVrV.load(),
@@ -1685,6 +2409,7 @@ class Eigh:
                 if reduction_tidx == 0:
                     if row_global < panel_n:
                         sB[row_global] = b
+                #_iket_pop()
             _iket_pop()
 
             # All threads read sCol/reduction_buffer during the matvec; sync so the
