@@ -91,6 +91,13 @@ _NATIVE_CUDA_CFLAGS = [
     "-Xptxas=--allow-expensive-optimizations=true",
     "-lineinfo",
 ]
+# cuSolverDx's packaged fatbin is built with FTZ disabled and precise division.
+# RDC device linking requires every input to agree on those cicc options, so
+# its HEEV/HTEV translation units cannot use --use_fast_math.  They retain the
+# remaining release flags, including O3, vectorization, restrict, and device LTO.
+_MATHDX_CUDA_CFLAGS = [
+    flag for flag in _NATIVE_CUDA_CFLAGS if flag != "--use_fast_math"
+]
 
 
 def _iket_push(name: str, payload=None) -> None:
@@ -1230,7 +1237,7 @@ def _build_htev_extension(
     cpp_path.write_text(_HTEV_CPP_SOURCE)
     cuda_path.write_text(_HTEV_CUDA_SOURCE)
 
-    nvcc_flags = [flag for flag in _NATIVE_CUDA_CFLAGS if flag != "--use_fast_math"] + [
+    nvcc_flags = _MATHDX_CUDA_CFLAGS + [
         "-rdc=true",
         (
             "-gencode=arch=compute_100a,code=lto_100a"
@@ -1313,7 +1320,7 @@ def _build_small_heev_extension(
     cpp_path.write_text(_SMALL_HEEV_CPP_SOURCE)
     cuda_path.write_text(_SMALL_HEEV_CUDA_SOURCE)
 
-    nvcc_flags = [flag for flag in _NATIVE_CUDA_CFLAGS if flag != "--use_fast_math"] + [
+    nvcc_flags = _MATHDX_CUDA_CFLAGS + [
         "-rdc=true",
         (
             "-gencode=arch=compute_100a,code=lto_100a"
@@ -1369,7 +1376,12 @@ def _load_small_heev_module(
     lower: bool,
 ):
     source_tag = hashlib.sha256(
-        (_SMALL_HEEV_CPP_SOURCE + _SMALL_HEEV_CUDA_SOURCE).encode()
+        (
+            _SMALL_HEEV_CPP_SOURCE
+            + _SMALL_HEEV_CUDA_SOURCE
+            + "\0"
+            + "\0".join(_MATHDX_CUDA_CFLAGS)
+        ).encode()
     ).hexdigest()[:10]
     fill_tag = "lo" if lower else "up"
     name = f"eigh_small_heev_20x32_{arch_name}_nt{nt}_{fill_tag}_{source_tag}"
@@ -1472,9 +1484,14 @@ def _load_htev_module(n: int, arch_name: str, arch: int):
         )
     nt = _htev_block_threads(n) if mode == "block" else 32
     source_tag = hashlib.sha256(
-        (_HTEV_CPP_SOURCE + _HTEV_CUDA_SOURCE).encode()
+        (
+            _HTEV_CPP_SOURCE
+            + _HTEV_CUDA_SOURCE
+            + "\0"
+            + "\0".join(_MATHDX_CUDA_CFLAGS)
+        ).encode()
     ).hexdigest()[:10]
-    name = f"eigh_htev_n{n}_{arch_name}_{mode}_nt{nt}_v4_{source_tag}"
+    name = f"eigh_htev_n{n}_{arch_name}_{mode}_nt{nt}_v5_{source_tag}"
     build_root = _HTEV_BUILD_ROOT / name
     build_root.mkdir(parents=True, exist_ok=True)
     lock_path = build_root / "build.lock"
@@ -2173,8 +2190,8 @@ def _load_dc_module():
     # per-phase cycle counts (see DC_PHASE_MARK); separate module name so the
     # release build is never polluted.
     timers = _env_flag("EIGH_DC_TIMERS")
-    name = "eigh_dc_prep_v3_timers" if timers else "eigh_dc_prep_v3"
-    cuda_flags = [f for f in _NATIVE_CUDA_CFLAGS if f != "--use_fast_math"]
+    name = "eigh_dc_prep_v4_fast_timers" if timers else "eigh_dc_prep_v4_fast"
+    cuda_flags = _NATIVE_CUDA_CFLAGS.copy()
     if timers:
         cuda_flags.append("-DEIGH_DC_PHASE_TIMERS=1")
     module = load_inline(
@@ -2183,7 +2200,7 @@ def _load_dc_module():
         cuda_sources=_DC_CUDA_SOURCE,
         functions=None,
         extra_cflags=_NATIVE_CFLAGS,
-        # No fast math: the secular iteration needs exact FP32 division.
+        # Keep this path aligned with the common release optimization policy.
         extra_cuda_cflags=cuda_flags,
         build_directory=_build_directory(name),
         verbose=_env_flag("EIGH_NATIVE_VERBOSE"),
