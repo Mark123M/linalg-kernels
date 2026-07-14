@@ -208,6 +208,7 @@ def bench(
     tri: bool,
     tri_solve: bool,
     stages: str = "",
+    min_ctas: str = "",
 ) -> None:
     import os
     import sys
@@ -320,27 +321,38 @@ def bench(
             torch.set_float32_matmul_precision(matmul_precision)
             parts = []
             first_ms = None
-            # Empty -> single run at the kernel default; a list sweeps the matvec
-            # cp.async prefetch depth K (correctness is K-invariant).
+            # Empty -> single run at the kernel default; lists sweep the matvec
+            # cp.async prefetch depth K and/or the __launch_bounds__ min-CTAs-per-SM
+            # register cap (both occupancy-only; correctness is invariant).
             stage_list = [int(x) for x in stages.split(",") if x.strip()] or [None]
+            min_ctas_list = [int(x) for x in min_ctas.split(",") if x.strip()] or [None]
             for be in tri_backends:
                 for st in stage_list:
-                    runner.STAGE = st
-                    samples, n_sets = runner.benchmark_tridiag(
-                        data, be, sets, calls, warmup_ms, repeats
-                    )
-                    tri_ms = runner.select_sample(samples, stat)
-                    if first_ms is None:
-                        first_ms = tri_ms
-                    tag = "" if st is None else f" stage={st}"
-                    print(
-                        f"tridiag_{be}{tag} sets={n_sets} "
-                        f"samples_ms={[f'{s:.4f}' for s in samples]}",
-                        flush=True,
-                    )
-                    key = be if st is None else f"{be}@k{st}"
-                    parts.append(f"tridiag_{key}={tri_ms:.4f}ms")
+                    for mc in min_ctas_list:
+                        runner.STAGE = st
+                        runner.MIN_CTAS = mc
+                        samples, n_sets = runner.benchmark_tridiag(
+                            data, be, sets, calls, warmup_ms, repeats
+                        )
+                        tri_ms = runner.select_sample(samples, stat)
+                        if first_ms is None:
+                            first_ms = tri_ms
+                        tag = ("" if st is None else f" stage={st}") + (
+                            "" if mc is None else f" min_ctas={mc}"
+                        )
+                        print(
+                            f"tridiag_{be}{tag} sets={n_sets} "
+                            f"samples_ms={[f'{s:.4f}' for s in samples]}",
+                            flush=True,
+                        )
+                        key = be
+                        if st is not None:
+                            key = f"{key}@k{st}"
+                        if mc is not None:
+                            key = f"{key}@mc{mc}"
+                        parts.append(f"tridiag_{key}={tri_ms:.4f}ms")
             runner.STAGE = None
+            runner.MIN_CTAS = None
             samples, n_sets = runner.benchmark_torch_tridiag(
                 data, sets, calls, warmup_ms, repeats
             )
@@ -705,6 +717,7 @@ def main(
     tri: bool = False,
     tri_solve: bool = False,
     stages: str = "",
+    min_ctas: str = "",
     trace: bool = False,
     trace_batch: int = 1,
     trace_output: str = "profiles/eigh_iket",
@@ -811,4 +824,5 @@ def main(
         tri,
         tri_solve,
         stages,
+        min_ctas,
     )

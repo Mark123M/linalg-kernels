@@ -2005,6 +2005,15 @@ class Eigh:
         reduction_dtype=Float32,
         debug_printf: bool = True,
         threads_per_row: Optional[int] = None,
+        # __launch_bounds__ min-blocks-per-SM. 0 = leave register allocation to
+        # ptxas (current behavior: 80 regs/thread -> 6 CTAs/SM on B200, the
+        # register-limited occupancy). A positive value emits nvvm.minctasm=N,
+        # forcing ptxas to cap registers so N CTAs fit (B200: 65536 regs/SM /
+        # (N*128 threads) -> N=7 caps ~73 regs, N=8 caps 64), trading spills for
+        # occupancy. When set we also pass the exact dynamic smem so the DSL's
+        # carveout requests a partition big enough for N CTAs (else it would
+        # default to a 0% carveout and could cap CTAs by smem instead).
+        min_blocks_per_mp: int = 0,
     ):
         assert 1 <= panel_size <= MAX_PANEL_SIZE
         assert panel_size < N
@@ -2015,6 +2024,7 @@ class Eigh:
         self.debug_printf = debug_printf
         self.threads_per_row_override = threads_per_row
         self.stage = stage
+        self.min_blocks_per_mp = min_blocks_per_mp
 
     def _threads_per_row(self):
         if self.threads_per_row_override is not None:
@@ -2027,6 +2037,36 @@ class Eigh:
 
     def _num_threads(self):
         return 128 if self.N <= 16384 else 256
+
+    def _smem_bytes(self, num_stages: int) -> int:
+        """Exact dynamic smem the kernel allocates, mirroring the SmemAllocator's
+        sequential aligned placement (sCol, sB, sA, reduction_buffer, sSw, sSv).
+        Only used to size the launch carveout when min_blocks_per_mp is set;
+        auto-smem covers the default path. Validated against the launch-time
+        "Allocated: 102480 bytes" report (N=512, ps=8, K=12, tpr=32)."""
+        num_threads = self._num_threads()
+        threads_per_row = self._threads_per_row()
+        rows_per_tile = num_threads // threads_per_row
+        max_panel_n = self.N - 1
+        tiler_n = -(-max_panel_n // num_threads) * num_threads
+        warps_per_row = max(threads_per_row // 32, 1)
+        num_warps = num_threads // 32
+        redbuf_elems = (num_warps // warps_per_row) * warps_per_row
+
+        col_w = self.dtype.width // 8
+        red_w = self.reduction_dtype.width // 8
+
+        def align(x, a):
+            return -(-x // a) * a
+
+        off = 0
+        off = align(off, 16) + tiler_n * col_w  # sCol
+        off = align(off, 16) + tiler_n * red_w  # sB
+        off = align(off, 16) + rows_per_tile * tiler_n * num_stages * col_w  # sA
+        off = align(off, 8) + redbuf_elems * red_w  # reduction_buffer
+        off = align(off, 8) + self.panel_size * red_w  # sSw
+        off = align(off, 8) + self.panel_size * red_w  # sSv
+        return off
 
     def tiled_copy_2d(
         self,
@@ -2135,6 +2175,7 @@ class Eigh:
         mData: cute.Tensor,
         mD: cute.Tensor,
         mE: cute.Tensor,
+        mTau: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
         panel_start: Int32,
@@ -2359,8 +2400,12 @@ class Eigh:
             # E[col] = beta (dsytrd convention: the final subdiagonal element).
             # One scalar store, hidden under the tile-0 prefetch + inner GEMVs
             # that follow. col <= N-2 by construction, so it always fits E.
+            # tau is persisted alongside for the eigenvector backtransform
+            # (dormtr-style blocked larfb needs V and tau; beta==0 stores
+            # tau=0, i.e. H=I, which the backtransform honors as-is).
             if tidx == 0:
                 mE[bidx, col] = beta
+                mTau[bidx, col] = tau
 
             # LAPACK dlarfg convention: v[i] = 1 (col_values gives alpha/denom there).
             # Dynamic condition => `if` statement; a ternary would bake a branch at trace time.
@@ -2547,6 +2592,15 @@ class Eigh:
                     wp = tau * Float32(sB[p]) + alpha_w * vp
                     mVb[i, p] = vp
                     mWb[i, p] = wp
+                    # Persist the reflector in data's lower triangle (LAPACK
+                    # dsytrd layout, with the explicit unit at the subdiagonal
+                    # and explicit zeros above it — vp already carries sCol's
+                    # zero prefix for p < i, including the diagonal at p=i-1,
+                    # whose D value was extracted during the refresh). Column
+                    # col is dead for the rest of the factorization: every
+                    # later matvec read of it lands on a zero v coefficient,
+                    # and all later panels/rank-2k touch only trailing blocks.
+                    mCol[p] = self.dtype(vp)
             _iket_pop()
             # The w store reads sCol/sB and appends the V/W rows consumed by the next
             # column's inner GEMVs (CTA barrier orders the gmem writes for this CTA —
@@ -2563,6 +2617,7 @@ class Eigh:
         mData: cute.Tensor,
         mD: cute.Tensor,
         mE: cute.Tensor,
+        mTau: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
         panel_start: Int32,
@@ -2571,24 +2626,14 @@ class Eigh:
         assert mData.element_type == self.dtype
         assert mD.element_type == self.reduction_dtype
         assert mE.element_type == self.reduction_dtype
+        assert mTau.element_type == self.reduction_dtype
         assert mV.element_type == self.reduction_dtype
         assert mW.element_type == self.reduction_dtype
         tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row = (
             self._get_column_tiled_copy()
         )
         num_threads = tiled_copy.size
-        self.kernel(
-            mData,
-            mD,
-            mE,
-            mV,
-            mW,
-            panel_start,
-            tiler_n,
-            tiled_copy,
-            matvec_tiled_copy,
-            threads_per_row,
-        ).launch(
+        launch_kwargs = dict(
             grid=[mData.shape[0], 1, 1],
             block=[num_threads, 1, 1],
             # Public spelling of the launch-queue kwarg without the substring the
@@ -2596,6 +2641,26 @@ class Eigh:
             # before LaunchConfig in the DSL anyway).
             async_deps=q,
         )
+        if const_expr(self.min_blocks_per_mp > 0):
+            # nvvm.minctasm caps registers for occupancy; pass the exact smem so
+            # the DSL's carveout requests a partition sized for that many CTAs
+            # (the default 0-smem carveout would under-provision and cap CTAs by
+            # smem instead). auto-smem stays in charge on the default path.
+            launch_kwargs["min_blocks_per_mp"] = self.min_blocks_per_mp
+            launch_kwargs["smem"] = self._smem_bytes(self.stage)
+        self.kernel(
+            mData,
+            mD,
+            mE,
+            mTau,
+            mV,
+            mW,
+            panel_start,
+            tiler_n,
+            tiled_copy,
+            matvec_tiled_copy,
+            threads_per_row,
+        ).launch(**launch_kwargs)
         
     @staticmethod
     @jit_cache
@@ -2606,6 +2671,7 @@ class Eigh:
         panel_size: int = 1,
         threads_per_row: Optional[int] = None,
         stage: int = 2,
+        min_blocks_per_mp: int = 0,
     ):
         obj = Eigh(
             data_dtype,
@@ -2614,12 +2680,14 @@ class Eigh:
             debug_printf=debug_printf,
             threads_per_row=threads_per_row,
             stage=stage,
+            min_blocks_per_mp=min_blocks_per_mp,
         )
         batch_sym = cute.sym_int()
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
         d_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N), 1)
         e_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N - 1), 1)
+        tau_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N - 1), 1)
         ws_rows, ws_cols = obj.workspace_shape()
         v_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
         w_cute = Eigh.make_fake_tensor(Float32, (batch_sym, ws_rows, ws_cols), 4)
@@ -2629,6 +2697,7 @@ class Eigh:
             data_cute,
             d_cute,
             e_cute,
+            tau_cute,
             v_cute,
             w_cute,
             Int32(0),  # panel_start: dynamic per-launch argument
@@ -2656,19 +2725,27 @@ def run_panel_with_update(
     debug_printf: bool = False,
     threads_per_row: Optional[int] = None,
     stage: int = 2,
+    min_blocks_per_mp: int = 0,
     queue_handle: int = 0,
+    tau: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Factor one DLATRD panel, then update its unreduced trailing block.
 
-    ``data`` is deliberately mutated by the rank-2k update.  The panel kernel and
-    native backend both use PyTorch's ambient CUDA queue, so their launch order is
-    sufficient and no host synchronization is required.
+    ``data`` is deliberately mutated: the panel kernel persists each reflector
+    into the factored column's lower triangle (LAPACK dsytrd layout: explicit
+    unit at the subdiagonal, zeros above) and the rank-2k update rewrites the
+    trailing block.  ``tau`` is a (batch, N-1) FP32 buffer for the reflector
+    scalars (allocated here when omitted).  The panel kernel and native backend
+    both use PyTorch's ambient CUDA queue, so their launch order is sufficient
+    and no host synchronization is required.
     """
     if data.dtype not in torch2cute_dtype_map:
         raise TypeError(f"unsupported data dtype: {data.dtype}")
     if not 1 <= panel_size <= MAX_PANEL_SIZE:
         raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
     data_dtype = torch2cute_dtype_map[data.dtype]
+    if tau is None:
+        tau = torch.empty_like(E)
     compiled = Eigh.compile(
         data_dtype,
         data.size(1),
@@ -2676,8 +2753,9 @@ def run_panel_with_update(
         panel_size=panel_size,
         threads_per_row=threads_per_row,
         stage=stage,
+        min_blocks_per_mp=min_blocks_per_mp,
     )
-    compiled(data, D, E, v_ws, w_ws, panel_start)
+    compiled(data, D, E, tau, v_ws, w_ws, panel_start)
     return rank2k_update_(
         data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
     )
@@ -2696,12 +2774,20 @@ def tridiagonalize_(
     debug_printf: bool = False,
     threads_per_row: Optional[int] = None,
     stage: int = 2,
+    min_blocks_per_mp: int = 0,
+    tau: Optional[torch.Tensor] = None,
 ) -> None:
     """Full blocked Householder tridiagonalization (lower DSYTRD flow).
 
     Outputs follow the LAPACK/cuSOLVER convention: ``D`` (batch, N) diagonal,
-    ``E`` (batch, N-1) subdiagonal, both FP32. ``data`` is mutated (the trailing
-    rank-2k updates land in it); pass a working copy if the input must survive.
+    ``E`` (batch, N-1) subdiagonal, both FP32. ``data`` is mutated: the strictly
+    lower triangle receives the Householder vectors (dsytrd layout — column
+    ``col`` holds v in rows ``col+1..N-1`` with an explicit unit at the
+    subdiagonal and explicit zeros filling the gap above it), the trailing
+    rank-2k updates land in the not-yet-reduced block. Pass a working copy if
+    the input must survive. ``tau`` (batch, N-1) FP32 receives the reflector
+    scalars (allocated internally when omitted); together with the lower
+    triangle it is exactly what the eigenvector backtransform needs.
     ``v_ws``/``w_ws`` come zero-allocated from :meth:`Eigh.workspace_shape` at
     this ``panel_size``. All work is issued on the ambient queue, so the whole
     factorization is CUDA-graph capturable (the Python loop unrolls into the
@@ -2718,6 +2804,8 @@ def tridiagonalize_(
     if not 1 <= panel_size <= MAX_PANEL_SIZE or panel_size >= N:
         raise ValueError(f"panel_size must be in [1, min({MAX_PANEL_SIZE}, N-1)]")
     data_dtype = torch2cute_dtype_map[data.dtype]
+    if tau is None:
+        tau = torch.empty_like(E)
     n_cols = N - 1
     full, tail = divmod(n_cols, panel_size)
     if full:
@@ -2728,10 +2816,11 @@ def tridiagonalize_(
             panel_size=panel_size,
             threads_per_row=threads_per_row,
             stage=stage,
+            min_blocks_per_mp=min_blocks_per_mp,
         )
         for j in range(full):
             panel_start = j * panel_size
-            compiled(data, D, E, v_ws, w_ws, panel_start)
+            compiled(data, D, E, tau, v_ws, w_ws, panel_start)
             rank2k_update_(
                 data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
             )
@@ -2743,6 +2832,7 @@ def tridiagonalize_(
             panel_size=tail,
             threads_per_row=threads_per_row,
             stage=stage,
+            min_blocks_per_mp=min_blocks_per_mp,
         )
         # The tail kernel was compiled against a workspace with fewer padded
         # rows; a leading-rows slice keeps the strides it expects.
@@ -2752,7 +2842,7 @@ def tridiagonalize_(
         tv_ws = v_ws[:, :tail_rows]
         tw_ws = w_ws[:, :tail_rows]
         panel_start = full * panel_size
-        tail_compiled(data, D, E, tv_ws, tw_ws, panel_start)
+        tail_compiled(data, D, E, tau, tv_ws, tw_ws, panel_start)
         rank2k_update_(data, tv_ws, tw_ws, panel_start, tail, backend, queue_handle)
     # A[N-1, N-1] was finalized by the last (1x1) trailing update.
     D[:, -1].copy_(data[:, -1, -1])
@@ -2774,6 +2864,9 @@ def custom_kernel(data: input_t) -> output_t:
     w_ws = torch.zeros_like(v_ws)
     D = torch.empty(data.size(0), N, device=data.device, dtype=torch.float32)
     E = torch.empty(data.size(0), N - 1, device=data.device, dtype=torch.float32)
-    Eigh.compile(data_dtype, N)(data, D, E, v_ws, w_ws, 0)
+    tau = torch.empty_like(E)
+    # The panel kernel now persists reflectors into its input's lower
+    # triangle, so it must run on a work copy — `data` feeds eigh below.
+    Eigh.compile(data_dtype, N)(data.clone(), D, E, tau, v_ws, w_ws, 0)
 
     return torch.linalg.eigh(data)

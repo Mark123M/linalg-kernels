@@ -33,6 +33,10 @@ DC_LEAF_SIZE = 32
 # Matvec cp.async prefetch depth K forwarded to tridiagonalize_; None -> eigh's
 # own default. Set by the --stages sweep (and the modal runner) per run.
 STAGE = None
+# __launch_bounds__ min-CTAs-per-SM (nvvm.minctasm) forwarded to tridiagonalize_;
+# None -> eigh's default (0, ptxas-chosen registers). Set by the --min-ctas sweep
+# (and the modal runner) to force a register cap for higher occupancy.
+MIN_CTAS = None
 
 
 def make_input(batch: int, n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -199,6 +203,7 @@ def factor_panel(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     data_dtype = eigh.torch2cute_dtype_map[data.dtype]
     D, E = make_de(data)
+    tau = torch.empty_like(E)
     v_ws, w_ws = make_workspace(data)
     compiled = eigh.Eigh.compile(
         data_dtype,
@@ -206,7 +211,9 @@ def factor_panel(
         debug_printf=debug_printf,
         panel_size=PANEL_SIZE,
     )
-    compiled(data, D, E, v_ws, w_ws, k * PANEL_SIZE)
+    # Work copy: the panel kernel persists reflectors into its input's lower
+    # triangle, and callers (w-check mirror, rank2k gate) reread `data` after.
+    compiled(data.clone(), D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
     return D, E, v_ws, w_ws
 
 
@@ -306,6 +313,7 @@ def benchmark_panel_with_update(
     )
     eigh.warm_rank2k_backend(PANEL_SIZE, backend)
     D, E = make_de(data)
+    tau = torch.empty_like(E)
     v_ws, w_ws = make_workspace(data)
     # The public input must remain available to the eventual residual checker, so
     # combined timing includes the explicit source -> working-matrix copy.
@@ -317,7 +325,7 @@ def benchmark_panel_with_update(
 
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
-        compiled(work, D, E, v_ws, w_ws, k * PANEL_SIZE)
+        compiled(work, D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
         # Capture-time current stream: see benchmark_rank2k.
         eigh.rank2k_update_(
             work,
@@ -363,6 +371,7 @@ def benchmark_direct(
     # outputs are tiny — so sharing them keeps the auto-picked set counts and
     # per-set memory traffic identical between the kernel and torch benches.
     D, E = make_de(data)
+    tau = torch.empty_like(E)
     v_ws, w_ws = make_workspace(data)
     base_args = (data,)
     base_kwargs = {}
@@ -371,7 +380,7 @@ def benchmark_direct(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(bench_data: torch.Tensor) -> None:
-        compiled(bench_data, D, E, v_ws, w_ws, k * PANEL_SIZE)
+        compiled(bench_data, D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -611,6 +620,38 @@ def sweep_tridiag_stages(data, backend, stage_list, args) -> None:
     )
 
 
+def sweep_tridiag_min_ctas(data, backend, min_ctas_list, args) -> None:
+    """Time the full tridiagonalization at each __launch_bounds__ min-CTAs-per-SM
+    in ``min_ctas_list`` (0 = ptxas-default registers) and print one line each
+    plus the best. Occupancy only affects timing, not correctness."""
+    global MIN_CTAS
+    print(f"bench tridiag min-ctas sweep {min_ctas_list} (backend={backend})", flush=True)
+    results = []
+    try:
+        for mc in min_ctas_list:
+            MIN_CTAS = mc
+            samples, n_sets = benchmark_tridiag(
+                data, backend, args.bench_sets, args.bench_calls,
+                args.bench_warmup_ms, args.bench_repeats,
+            )
+            selected = select_sample(samples, args.bench_stat)
+            results.append((mc, selected))
+            sample_text = ", ".join(f"{s:.4f}" for s in samples)
+            print(
+                f"bench tridiag_{backend} min_ctas={mc} sets={n_sets} "
+                f"samples_ms=[{sample_text}] {args.bench_stat}_ms={selected:.6f}",
+                flush=True,
+            )
+    finally:
+        MIN_CTAS = None
+    best = min(results, key=lambda r: r[1])
+    print(
+        f"bench tridiag min-ctas sweep best: min_ctas={best[0]} "
+        f"{args.bench_stat}_ms={best[1]:.4f}",
+        flush=True,
+    )
+
+
 def benchmark_tridiag(
     data: torch.Tensor,
     backend: str,
@@ -633,6 +674,9 @@ def benchmark_tridiag(
 
     # STAGE=None defers to tridiagonalize_'s own default; a set value sweeps K.
     stage_kwargs = {} if STAGE is None else {"stage": STAGE}
+    # MIN_CTAS=None -> default (ptxas-chosen regs); a set value forces the cap.
+    if MIN_CTAS is not None:
+        stage_kwargs["min_blocks_per_mp"] = MIN_CTAS
 
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
@@ -1270,6 +1314,13 @@ def main() -> None:
         "--tri --bench mode (e.g. '2,3,4'). Empty -> single run at the kernel "
         "default. Each K reports its own tridiag time; correctness is K-invariant.",
     )
+    parser.add_argument(
+        "--min-ctas",
+        default="",
+        help="Comma-separated __launch_bounds__ min-CTAs-per-SM to sweep in "
+        "--tri --bench mode (e.g. '0,7,8'; 0 = ptxas-default registers). Empty -> "
+        "single run at the kernel default. Forces a register cap for occupancy.",
+    )
     args = parser.parse_args()
     if args.tri and args.tri_solve:
         parser.error("--tri and --tri-solve are mutually exclusive")
@@ -1394,6 +1445,11 @@ def main() -> None:
             stage_list = [int(x) for x in args.stages.split(",") if x.strip()]
             if stage_list:
                 sweep_tridiag_stages(data, backend, stage_list, args)
+                print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
+                return
+            min_ctas_list = [int(x) for x in args.min_ctas.split(",") if x.strip()]
+            if min_ctas_list:
+                sweep_tridiag_min_ctas(data, backend, min_ctas_list, args)
                 print(f"compile cache: {eigh.Eigh.compile.cache_info()}")
                 return
             samples, bench_sets = benchmark_tridiag(
