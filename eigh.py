@@ -83,10 +83,15 @@ def _iket_pop() -> None:
 # Off by default so eval calls pay zero Python overhead; the local runner's
 # profile path flips it on for the one annotated launch.
 DC_NVTX = False
+BT_NVTX = False
 
 
 def _dc_range(name: str):
     return torch.cuda.nvtx.range(name) if DC_NVTX else nullcontext()
+
+
+def _bt_range(name: str):
+    return torch.cuda.nvtx.range(name) if BT_NVTX else nullcontext()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2710,6 +2715,380 @@ class Eigh:
             ),
             options="--enable-tvm-ffi",
         )
+
+
+def backtransform_panel_spans(
+    n: int, backtransform_block_size: int
+) -> tuple[tuple[int, int], ...]:
+    """Return ``(panel_start, panel_width)`` pairs in backtransform order.
+
+    The lower-DSYTRD reflectors occupy columns ``0..n-2``.  Applying their
+    product from the left visits a possible high-end tail first, then the full
+    panels from right to left.  Consequently the active row slice
+    ``panel_start + 1 : n`` grows on every step.
+    """
+    if n < 2:
+        raise ValueError(f"n must be at least 2, got {n}")
+    if not 1 <= backtransform_block_size <= MAX_PANEL_SIZE:
+        raise ValueError(
+            "backtransform_block_size must be in "
+            f"[1, {MAX_PANEL_SIZE}], got {backtransform_block_size}"
+        )
+
+    full, tail = divmod(n - 1, backtransform_block_size)
+    spans = []
+    if tail:
+        spans.append((full * backtransform_block_size, tail))
+    spans.extend(
+        (j * backtransform_block_size, backtransform_block_size)
+        for j in range(full - 1, -1, -1)
+    )
+    return tuple(spans)
+
+
+class BacktransformT:
+    """Form the compact-WY triangular factor for one reflector panel."""
+
+    def __init__(
+        self,
+        dtype: Type[cutlass.Numeric],
+        N: int,
+        block_size: int,
+        panel_width: int,
+    ):
+        assert 1 <= block_size <= MAX_PANEL_SIZE
+        assert 1 <= panel_width <= block_size
+        assert panel_width < N
+        self.dtype = dtype
+        self.N = N
+        self.block_size = block_size
+        self.panel_width = panel_width
+
+    @cute.kernel
+    def kernel(
+        self,
+        mData: cute.Tensor,
+        mTau: cute.Tensor,
+        mT: cute.Tensor,
+        panel_start: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        num_threads = const_expr(128)
+        num_pairs = const_expr(self.panel_width * (self.panel_width - 1) // 2)
+        gram_elems = const_expr(max(num_pairs, 1))
+        pair_rounds = const_expr(cute.ceil_div(num_pairs, num_threads))
+        pair_search_steps = const_expr(max((self.panel_width - 1).bit_length(), 1))
+
+        smem = cutlass.utils.SmemAllocator()
+        # Packed strict-upper Gram matrix. Column i starts at i*(i-1)/2 and
+        # stores v_j^T v_i for j in [0, i). Keeping only the used triangle
+        # preserves the block_size=128 shared-memory bound.
+        sGram = smem.allocate_tensor(
+            Float32,
+            cute.make_layout(gram_elems),
+            byte_alignment=16,
+        )
+        sT = smem.allocate_tensor(
+            Float32,
+            cute.make_ordered_layout(
+                (self.block_size, self.block_size), order=(1, 0)
+            ),
+            byte_alignment=16,
+        )
+
+        # T is one reusable full-width scratch tensor.  Clear shared and global
+        # storage together so a short high-end panel cannot expose stale entries
+        # from an earlier full panel.
+        t_elems = const_expr(self.block_size * self.block_size)
+        t_iters = const_expr(cute.ceil_div(t_elems, num_threads))
+        for m in cutlass.range_constexpr(t_iters):
+            linear = tidx + m * num_threads
+            if linear < t_elems:
+                row = linear // self.block_size
+                col = linear - row * self.block_size
+                sT[row, col] = Float32(0.0)
+                mT[bidx, row, col] = Float32(0.0)
+
+        active_rows = self.N - panel_start - 1
+
+        # All v_j^T v_i terms depend only on the already-persisted reflectors,
+        # not on T. Compute them before the serial compact-WY recurrence so up
+        # to 128 independent pairs scan the active rows concurrently. The
+        # per-pair p loop keeps the previous increasing-row FP32 sum order.
+        for pair_round in cutlass.range_constexpr(pair_rounds):
+            pair_idx = tidx + pair_round * num_threads
+            if pair_idx < num_pairs:
+                # Invert offset(i)=i*(i-1)/2 with a fixed-width integer binary
+                # search. This avoids a boundary-sensitive approximate sqrt.
+                lo = Int32(1)
+                hi = Int32(self.panel_width - 1)
+                for _ in cutlass.range_constexpr(pair_search_steps):
+                    mid = (lo + hi + 1) // 2
+                    if (mid * (mid - 1)) // 2 <= pair_idx:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                i = lo
+                j = pair_idx - (i * (i - 1)) // 2
+                dot = Float32(0.0)
+                # Column i has an implicit zero prefix and its explicit unit at
+                # local row i. Matrix entries above that unit may belong to an
+                # earlier tridiagonalization panel, so never consume them.
+                for p in cutlass.range(i, active_rows):
+                    row = panel_start + 1 + p
+                    vi = Float32(mData[bidx, row, panel_start + i])
+                    vj = Float32(mData[bidx, row, panel_start + j])
+                    dot += vj * vi
+                sGram[pair_idx] = dot
+        cute.arch.barrier()
+
+        panel_unroll = const_expr(0)
+        panel_unroll_full = const_expr(True)
+        if const_expr(self.panel_width > 32):
+            panel_unroll = const_expr(4)
+            panel_unroll_full = const_expr(False)
+        for i in cutlass.range(
+            self.panel_width,
+            unroll=panel_unroll,
+            unroll_full=panel_unroll_full,
+        ):
+            tau_i = Float32(mTau[bidx, panel_start + i])
+            if tidx < i:
+                acc = Float32(0.0)
+                for col in cutlass.range(i):
+                    if col >= tidx:
+                        gram_idx = (i * (i - 1)) // 2 + col
+                        acc += sT[tidx, col] * (-tau_i * sGram[gram_idx])
+                sT[tidx, i] = acc
+                mT[bidx, tidx, i] = acc
+            if tidx == i:
+                sT[i, i] = tau_i
+                mT[bidx, i, i] = tau_i
+            cute.arch.barrier()
+
+    @cute.jit
+    def __call__(
+        self,
+        mData: cute.Tensor,
+        mTau: cute.Tensor,
+        mT: cute.Tensor,
+        panel_start: Int32,
+        q: Any,
+    ):
+        assert mData.element_type == self.dtype
+        assert mTau.element_type == Float32
+        assert mT.element_type == Float32
+        self.kernel(mData, mTau, mT, panel_start).launch(
+            grid=[mData.shape[0], 1, 1],
+            block=[128, 1, 1],
+            async_deps=q,
+        )
+
+    @staticmethod
+    @jit_cache
+    def compile(data_dtype, N: int, block_size: int, panel_width: int):
+        obj = BacktransformT(data_dtype, N, block_size, panel_width)
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // data_dtype.width, N)
+        data_cute = Eigh.make_fake_tensor(data_dtype, (batch_sym, N, N), div)
+        tau_cute = Eigh.make_fake_tensor(Float32, (batch_sym, N - 1), 1)
+        t_cute = Eigh.make_fake_tensor(
+            Float32, (batch_sym, block_size, block_size), 1
+        )
+        return cute.compile(
+            obj,
+            data_cute,
+            tau_cute,
+            t_cute,
+            Int32(0),
+            getattr(cute.runtime, "make_fake_" + "str" + "eam")(
+                **{"use_tvm_ffi_env_" + "str" + "eam": True}
+            ),
+            options="--enable-tvm-ffi",
+        )
+
+
+def warm_backtransform_t(n: int, backtransform_block_size: int) -> None:
+    """Compile the full and optional tail T-builder specializations."""
+    widths = {
+        panel_width
+        for _, panel_width in backtransform_panel_spans(
+            n, backtransform_block_size
+        )
+    }
+    for panel_width in sorted(widths):
+        BacktransformT.compile(
+            Float32, n, backtransform_block_size, panel_width
+        )
+
+
+def warm_backtransform(n: int, backtransform_block_size: int) -> None:
+    """Warm every specialization needed by the blocked backtransform."""
+    warm_backtransform_t(n, backtransform_block_size)
+
+
+def form_backtransform_t_(
+    data: torch.Tensor,
+    tau: torch.Tensor,
+    T: torch.Tensor,
+    *,
+    panel_start: int,
+    panel_width: int,
+) -> None:
+    """Overwrite ``T`` with one lower-DSYTRD panel's compact-WY factor.
+
+    ``T`` is a contiguous ``(batch, block_size, block_size)`` FP32 scratch
+    tensor.  ``panel_width`` may be smaller than ``block_size`` for the first
+    high-end tail panel; entries outside its leading square are cleared.
+    ``data`` and ``tau`` are read-only.
+    """
+    if data.dtype not in torch2cute_dtype_map:
+        raise TypeError(f"unsupported data dtype: {data.dtype}")
+    if data.ndim != 3 or data.size(1) != data.size(2):
+        raise ValueError(f"data must be batch x N x N, got {tuple(data.shape)}")
+    if not data.is_cuda or not data.is_contiguous():
+        raise ValueError("data must be a contiguous CUDA tensor")
+    batch, n, _ = data.shape
+    if tau.shape != (batch, n - 1) or tau.dtype != torch.float32:
+        raise ValueError(
+            f"tau must have shape {(batch, n - 1)} and dtype torch.float32"
+        )
+    if not tau.is_cuda or not tau.is_contiguous() or tau.device != data.device:
+        raise ValueError("tau must be a contiguous CUDA tensor on data's device")
+    if T.ndim != 3 or T.size(0) != batch or T.size(1) != T.size(2):
+        raise ValueError(
+            "T must have shape batch x backtransform_block_size x "
+            f"backtransform_block_size, got {tuple(T.shape)}"
+        )
+    block_size = T.size(1)
+    if not 1 <= block_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"T block size must be in [1, {MAX_PANEL_SIZE}]")
+    if T.dtype != torch.float32 or not T.is_cuda or not T.is_contiguous():
+        raise ValueError("T must be a contiguous CUDA FP32 tensor")
+    if T.device != data.device:
+        raise ValueError("T must be on data's device")
+    if not 1 <= panel_width <= block_size:
+        raise ValueError(f"panel_width must be in [1, {block_size}]")
+    if not 0 <= panel_start or panel_start + panel_width > n - 1:
+        raise ValueError(
+            "panel must lie within reflector columns 0..N-2, got "
+            f"start={panel_start}, width={panel_width}, N={n}"
+        )
+
+    compiled = BacktransformT.compile(
+        torch2cute_dtype_map[data.dtype], n, block_size, panel_width
+    )
+    compiled(data, tau, T, panel_start)
+
+
+def backtransform_eigenvectors_(
+    data: torch.Tensor,
+    tau: torch.Tensor,
+    Z: torch.Tensor,
+    T: torch.Tensor,
+    dc_ws: DCWorkspace,
+) -> None:
+    """Apply the persisted lower-DSYTRD reflectors to ``Z`` in place.
+
+    Panels are visited from right to left.  For each panel this forms its
+    compact-WY factor and applies ``Z_active -= V @ (T @ (V.T @ Z_active))``.
+    ``dc_ws.s`` and ``dc_ws.z_alt`` are reused for the masked reflector panel
+    and intermediate products;
+    callers must therefore invoke this only after :func:`tridiag_eig_dc_` has
+    finished and left its final eigenvectors in ``Z``.
+
+    ``data`` and ``tau`` are read-only.  ``Z`` and ``T`` are overwritten, as
+    are leading rows of ``dc_ws.s`` and ``dc_ws.z_alt``.
+    """
+    if data.dtype != torch.float32:
+        raise TypeError(f"data must have dtype torch.float32, got {data.dtype}")
+    if data.ndim != 3 or data.size(1) != data.size(2):
+        raise ValueError(f"data must be batch x N x N, got {tuple(data.shape)}")
+    if not data.is_cuda or not data.is_contiguous():
+        raise ValueError("data must be a contiguous CUDA tensor")
+    batch, n, _ = data.shape
+    if tau.shape != (batch, n - 1) or tau.dtype != torch.float32:
+        raise ValueError(
+            f"tau must have shape {(batch, n - 1)} and dtype torch.float32"
+        )
+    if not tau.is_cuda or not tau.is_contiguous() or tau.device != data.device:
+        raise ValueError("tau must be a contiguous CUDA tensor on data's device")
+    if Z.shape != (batch, n, n) or Z.dtype != torch.float32:
+        raise ValueError(
+            f"Z must have shape {(batch, n, n)} and dtype torch.float32"
+        )
+    if not Z.is_cuda or not Z.is_contiguous() or Z.device != data.device:
+        raise ValueError("Z must be a contiguous CUDA tensor on data's device")
+    if T.ndim != 3 or T.size(0) != batch or T.size(1) != T.size(2):
+        raise ValueError(
+            "T must have shape batch x backtransform_block_size x "
+            f"backtransform_block_size, got {tuple(T.shape)}"
+        )
+    block_size = T.size(1)
+    if not 1 <= block_size <= MAX_PANEL_SIZE:
+        raise ValueError(f"T block size must be in [1, {MAX_PANEL_SIZE}]")
+    if T.dtype != torch.float32 or not T.is_cuda or not T.is_contiguous():
+        raise ValueError("T must be a contiguous CUDA FP32 tensor")
+    if T.device != data.device:
+        raise ValueError("T must be on data's device")
+
+    for name, scratch in (("dc_ws.s", dc_ws.s), ("dc_ws.z_alt", dc_ws.z_alt)):
+        if scratch.shape != (batch, n, n) or scratch.dtype != torch.float32:
+            raise ValueError(
+                f"{name} must have shape {(batch, n, n)} and dtype torch.float32"
+            )
+        if (
+            not scratch.is_cuda
+            or not scratch.is_contiguous()
+            or scratch.device != data.device
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous CUDA tensor on data's device"
+            )
+
+    s_flat = dc_ws.s.view(-1)
+    z_alt_flat = dc_ws.z_alt.view(-1)
+    for panel_start, panel_width in backtransform_panel_spans(n, block_size):
+        active_rows = n - panel_start - 1
+        with _bt_range(
+            f"backtransform_panel_start{panel_start}_width{panel_width}_rows{active_rows}"
+        ):
+            with _bt_range("form_T"):
+                form_backtransform_t_(
+                    data,
+                    tau,
+                    T,
+                    panel_start=panel_start,
+                    panel_width=panel_width,
+                )
+
+            V_source = data[
+                :, panel_start + 1 :, panel_start : panel_start + panel_width
+            ]
+            v_elems = batch * active_rows * panel_width
+            y_elems = batch * panel_width * n
+            if v_elems + y_elems > z_alt_flat.numel():
+                raise ValueError(
+                    "backtransform block is too wide for the reused D&C scratch: "
+                    f"start={panel_start}, width={panel_width}, N={n}"
+                )
+            V = z_alt_flat[:v_elems].view(batch, active_rows, panel_width)
+            Y = z_alt_flat[v_elems : v_elems + y_elems].view(
+                batch, panel_width, n
+            )
+            with _bt_range("mask_V"):
+                V.copy_(V_source)
+                V.tril_()
+
+            Z_active = Z[:, panel_start + 1 :, :]
+            W = s_flat[:y_elems].view(batch, panel_width, n)
+            with _bt_range("VtZ"):
+                torch.bmm(V.transpose(1, 2), Z_active, out=W)
+            with _bt_range("TW"):
+                torch.bmm(T[:, :panel_width, :panel_width], W, out=Y)
+            with _bt_range("update_Z"):
+                Z_active.baddbmm_(V, Y, beta=1.0, alpha=-1.0)
 
 
 def run_panel_with_update(

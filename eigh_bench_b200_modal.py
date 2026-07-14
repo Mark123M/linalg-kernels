@@ -17,6 +17,9 @@ Usage:
     modal run eigh_bench_b200_modal.py --nsys --cases 640x512 \
         --panel-size 16 --nsys-backend cublas
     # tridiagonalization only (no eigensolve): add --nsys-stage tridiag
+    # T formation only (factorization is outside capture): add
+    #   --nsys-stage backtransform-t --backtransform-block-size 16
+    # complete eigenvector backtransform only: use --nsys-stage backtransform
     # hardware SM/memory/tensor metrics at 10 kHz: add --nsys-gpu-metrics
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
@@ -537,6 +540,7 @@ def profile_nsys_pipeline(
     batch: int,
     n: int,
     panel_size: int,
+    backtransform_block_size: int,
     leaf_size: int,
     backend: str,
     stage: str,
@@ -544,7 +548,7 @@ def profile_nsys_pipeline(
     gpu_metrics_frequency: int,
     seed: int,
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Gate and profile one selected tridiagonalization pipeline."""
+    """Gate and profile one selected eigensolver stage."""
     from datetime import datetime, timezone
     import os
     from pathlib import Path
@@ -555,12 +559,24 @@ def profile_nsys_pipeline(
     os.makedirs("/cache/cute", exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     metrics_tag = f"_gm{gpu_metrics_frequency}" if gpu_metrics else ""
-    run_name = f"b{batch}_n{n}_ps{panel_size}_leaf{leaf_size}_{backend}_{stage}{metrics_tag}_{stamp}"
+    bt_tag = (
+        f"_bt{backtransform_block_size}"
+        if stage in ("backtransform-t", "backtransform")
+        else ""
+    )
+    run_name = (
+        f"b{batch}_n{n}_ps{panel_size}{bt_tag}_leaf{leaf_size}_"
+        f"{backend}_{stage}{metrics_tag}_{stamp}"
+    )
     output_dir = Path("/cache/nsys") / run_name
     output_dir.mkdir(parents=True, exist_ok=False)
-    report_base = output_dir / (
-        "full_pipeline" if stage == "full" else "tridiagonalization"
-    )
+    report_name = {
+        "full": "full_pipeline",
+        "tridiag": "tridiagonalization",
+        "backtransform-t": "backtransform_t_formation",
+        "backtransform": "eigenvector_backtransform",
+    }[stage]
+    report_base = output_dir / report_name
     report_path = report_base.with_suffix(".nsys-rep")
     sqlite_path = report_base.with_suffix(".sqlite")
     summary_path = output_dir / "stats.txt"
@@ -576,15 +592,21 @@ def profile_nsys_pipeline(
         str(n),
         "--panel-size",
         str(panel_size),
+        "--backtransform-block-size",
+        str(backtransform_block_size),
         "--leaf-size",
         str(leaf_size),
         "--seed",
         str(seed),
         "--skip-expected",
-        "--tri-solve" if stage == "full" else "--tri",
-        "--update-backend",
-        backend,
     ]
+    if stage == "backtransform-t":
+        workload.append("--backtransform-t")
+    elif stage == "backtransform":
+        workload.append("--backtransform")
+    else:
+        workload.append("--tri-solve" if stage == "full" else "--tri")
+    workload.extend(("--update-backend", backend))
 
     _report_env("nsys")
     print(f"=== {stage} pipeline correctness preflight ===", flush=True)
@@ -703,6 +725,7 @@ def profile_nsys_pipeline(
 def main(
     cases: str = "640x512",
     panel_size: int = 8,
+    backtransform_block_size: int = 16,
     leaf_size: int = 32,
     k: int = 0,
     backends: str = "cublas,cublasdx",
@@ -742,8 +765,10 @@ def main(
             raise SystemExit(f"unknown backend: {backend}")
     if nsys_backend not in ("cublas", "cublasdx"):
         raise SystemExit(f"unknown Nsight Systems backend: {nsys_backend}")
-    if nsys_stage not in ("full", "tridiag"):
+    if nsys_stage not in ("full", "tridiag", "backtransform-t", "backtransform"):
         raise SystemExit(f"unknown Nsight Systems stage: {nsys_stage}")
+    if not 1 <= backtransform_block_size <= 128:
+        raise SystemExit("--backtransform-block-size must be in [1, 128]")
     if not 10 <= nsys_gpu_metrics_frequency <= 200000:
         raise SystemExit("--nsys-gpu-metrics-frequency must be in [10, 200000] Hz")
     if stat not in ("min", "mean", "median"):
@@ -758,6 +783,7 @@ def main(
             batch,
             n,
             panel_size,
+            backtransform_block_size,
             leaf_size,
             nsys_backend,
             nsys_stage,

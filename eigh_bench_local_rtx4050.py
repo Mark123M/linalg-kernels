@@ -29,6 +29,7 @@ from quack.bench.bench_utils import (  # noqa: E402
 # competition input is fp32, so the runner is fp32-only.
 DTYPE = torch.float32
 PANEL_SIZE = 1
+BACKTRANSFORM_BLOCK_SIZE = 16
 DC_LEAF_SIZE = 32
 # Matvec cp.async prefetch depth K forwarded to tridiagonalize_; None -> eigh's
 # own default. Set by the --stages sweep (and the modal runner) per run.
@@ -472,6 +473,390 @@ def _panel_spans(n: int, panel_size: int) -> list[tuple[int, int]]:
     if tail:
         spans.append((full * panel_size, tail))
     return spans
+
+
+def torch_backtransform_t_reference(
+    data: torch.Tensor,
+    tau: torch.Tensor,
+    panel_start: int,
+    panel_width: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Independent FP32 LARFT recurrence for one lower-reflector panel."""
+    batch = data.size(0)
+    V = torch.tril(
+        data[:, panel_start + 1 :, panel_start : panel_start + panel_width]
+    )
+    T = torch.zeros(
+        batch, block_size, block_size, device=data.device, dtype=torch.float32
+    )
+    for i in range(panel_width):
+        tau_i = tau[:, panel_start + i]
+        if i:
+            dots = (V[:, :, :i] * V[:, :, i : i + 1]).sum(dim=1)
+            x = -tau_i.unsqueeze(1) * dots
+            for row in range(i):
+                T[:, row, i] = (T[:, row, row:i] * x[:, row:i]).sum(dim=1)
+        T[:, i, i] = tau_i
+    return T
+
+
+def validate_backtransform_t_factorization(
+    data: torch.Tensor,
+    backend: str,
+    backtransform_block_size: int,
+    *,
+    label: str,
+) -> bool:
+    """Factor ``data`` and validate every reverse-panel compact-WY T."""
+    work = data.clone()
+    D, E = make_de(data)
+    tau = torch.empty_like(E)
+    v_ws, w_ws = make_workspace(data)
+    eigh.tridiagonalize_(
+        work,
+        D,
+        E,
+        v_ws,
+        w_ws,
+        panel_size=PANEL_SIZE,
+        backend=backend,
+        tau=tau,
+    )
+    torch.cuda.synchronize()
+    zero_tau_ok = label != "zero" or bool((tau == 0).all().item())
+
+    expected_spans = tuple(
+        reversed(_panel_spans(data.size(1), backtransform_block_size))
+    )
+    spans = eigh.backtransform_panel_spans(data.size(1), backtransform_block_size)
+    spans_ok = spans == expected_spans
+    active_rows = tuple(data.size(1) - start - 1 for start, _ in spans)
+    growth_ok = all(a < b for a, b in zip(active_rows, active_rows[1:]))
+
+    T = torch.empty(
+        data.size(0),
+        backtransform_block_size,
+        backtransform_block_size,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    work_before = work.clone()
+    tau_before = tau.clone()
+    finite = True
+    triangular = True
+    diagonal = True
+    close = True
+    max_abs = 0.0
+    max_rel = 0.0
+    max_action = 0.0
+    for panel_start, panel_width in spans:
+        eigh.form_backtransform_t_(
+            work,
+            tau,
+            T,
+            panel_start=panel_start,
+            panel_width=panel_width,
+        )
+        torch.cuda.synchronize()
+        expected = torch_backtransform_t_reference(
+            work,
+            tau,
+            panel_start,
+            panel_width,
+            backtransform_block_size,
+        )
+        diff = (T - expected).abs()
+        scale = expected.abs().max().clamp_min(1e-30)
+        panel_abs = diff.max().item()
+        panel_rel = (diff.max() / scale).item()
+        max_abs = max(max_abs, panel_abs)
+        max_rel = max(max_rel, panel_rel)
+        close &= torch.allclose(T, expected, rtol=3e-4, atol=3e-5)
+        finite &= bool(torch.isfinite(T).all().item())
+        triangular &= bool((T == torch.triu(T)).all().item())
+        diagonal &= torch.allclose(
+            T[:, :panel_width, :panel_width].diagonal(dim1=1, dim2=2),
+            tau[:, panel_start : panel_start + panel_width],
+            rtol=0.0,
+            atol=0.0,
+        )
+        if panel_width < backtransform_block_size:
+            triangular &= bool(
+                (T[:, panel_width:, :] == 0).all().item()
+                and (T[:, :, panel_width:] == 0).all().item()
+            )
+
+        # Compare the compact-WY action with the elementary reflectors in FP64.
+        V = torch.tril(
+            work[:, panel_start + 1 :, panel_start : panel_start + panel_width]
+        ).double()
+        probe_cols = min(5, data.size(1))
+        probe = torch.arange(
+            1,
+            V.size(1) * probe_cols + 1,
+            device=data.device,
+            dtype=torch.float64,
+        ).reshape(1, V.size(1), probe_cols)
+        probe = probe.expand(data.size(0), -1, -1) / max(V.size(1), 1)
+        leading = T[:, :panel_width, :panel_width].double()
+        block_action = probe - torch.bmm(
+            V, torch.bmm(leading, torch.bmm(V.transpose(1, 2), probe))
+        )
+        elementary_action = probe.clone()
+        for i in range(panel_width - 1, -1, -1):
+            vi = V[:, :, i : i + 1]
+            elementary_action -= (
+                tau[:, panel_start + i].double().view(-1, 1, 1)
+                * torch.bmm(
+                    vi, torch.bmm(vi.transpose(1, 2), elementary_action)
+                )
+            )
+        action_scale = elementary_action.abs().max().clamp_min(1e-30)
+        action_rel = ((block_action - elementary_action).abs().max() / action_scale).item()
+        max_action = max(max_action, action_rel)
+
+    preserved = bool(torch.equal(work, work_before) and torch.equal(tau, tau_before))
+
+    # Warm first, then verify that replay clears and rebuilds T deterministically.
+    graph_ok = True
+    if spans:
+        panel_start, panel_width = spans[0]
+        eigh.warm_backtransform_t(data.size(1), backtransform_block_size)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            eigh.form_backtransform_t_(
+                work,
+                tau,
+                T,
+                panel_start=panel_start,
+                panel_width=panel_width,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        first = T.clone()
+        T.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_ok = bool(torch.equal(T, first))
+
+    ok = (
+        spans_ok
+        and growth_ok
+        and zero_tau_ok
+        and finite
+        and triangular
+        and diagonal
+        and close
+        and max_action <= 3e-5
+        and preserved
+        and graph_ok
+    )
+    print(
+        f"backtransform T {label}: ok={ok} spans={spans_ok} growth={growth_ok} "
+        f"zero_tau={zero_tau_ok} "
+        f"finite={finite} triangular={triangular} diagonal={diagonal} "
+        f"allclose={close} preserved={preserved} graph={graph_ok} "
+        f"max_abs={max_abs:.3e} max_rel={max_rel:.3e} "
+        f"action_rel={max_action:.3e} spans_list={spans}",
+        flush=True,
+    )
+    return ok
+
+
+def check_backtransform_t_builder(
+    data: torch.Tensor, backend: str, backtransform_block_size: int
+) -> bool:
+    random_ok = validate_backtransform_t_factorization(
+        data,
+        backend,
+        backtransform_block_size,
+        label="random",
+    )
+    zero_ok = validate_backtransform_t_factorization(
+        torch.zeros_like(data),
+        backend,
+        backtransform_block_size,
+        label="zero",
+    )
+    return random_ok and zero_ok
+
+
+def torch_backtransform_reference(
+    data: torch.Tensor, tau: torch.Tensor, Z: torch.Tensor
+) -> torch.Tensor:
+    """Independent FP64 application of every elementary reflector."""
+    result = Z.double().clone()
+    reflectors = data.double()
+    tau64 = tau.double()
+    for i in range(data.size(1) - 2, -1, -1):
+        v = reflectors[:, i + 1 :, i : i + 1]
+        active = result[:, i + 1 :, :]
+        active -= tau64[:, i].view(-1, 1, 1) * torch.bmm(
+            v, torch.bmm(v.transpose(1, 2), active)
+        )
+    return result
+
+
+def prepare_backtransform_inputs(
+    data: torch.Tensor, backend: str
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    eigh.DCWorkspace,
+]:
+    """Factor ``data`` and solve its tridiagonal eigensystem."""
+    work = data.clone()
+    D, E = make_de(data)
+    tau = torch.empty_like(E)
+    v_ws, w_ws = make_workspace(data)
+    queue_handle = torch.cuda.current_stream().cuda_stream
+    eigh.tridiagonalize_(
+        work,
+        D,
+        E,
+        v_ws,
+        w_ws,
+        panel_size=PANEL_SIZE,
+        backend=backend,
+        queue_handle=queue_handle,
+        tau=tau,
+    )
+    dc_ws = eigh.dc_workspace(
+        data.size(0), data.size(1), data.device, leaf_size=DC_LEAF_SIZE
+    )
+    Z = torch.zeros(
+        data.size(0),
+        data.size(1),
+        data.size(1),
+        device=data.device,
+        dtype=torch.float32,
+    )
+    eigh.tridiag_eig_dc_(
+        D,
+        E,
+        Z,
+        dc_ws,
+        leaf_size=DC_LEAF_SIZE,
+        queue_handle=queue_handle,
+    )
+    return work, tau, D, Z, dc_ws
+
+
+def validate_backtransform(
+    data: torch.Tensor,
+    backend: str,
+    backtransform_block_size: int,
+    *,
+    label: str,
+    check_graph: bool,
+) -> bool:
+    """Validate blocked reflector application and the final eigensystem."""
+    work, tau, values, Z, dc_ws = prepare_backtransform_inputs(data, backend)
+    torch.cuda.synchronize()
+    Z_tri = Z.clone()
+    row_zero = Z_tri[:, 0, :].clone()
+    expected = torch_backtransform_reference(work, tau, Z_tri)
+    work_before = work.clone()
+    tau_before = tau.clone()
+    T = torch.empty(
+        data.size(0),
+        backtransform_block_size,
+        backtransform_block_size,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+    eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+    torch.cuda.synchronize()
+
+    q64 = Z.double()
+    action_scale = expected.abs().amax().clamp_min(1e-30)
+    action_rel = ((q64 - expected).abs().amax() / action_scale).item()
+    finite = bool(torch.isfinite(values).all().item() and torch.isfinite(Z).all().item())
+    sorted_values = bool((values[:, 1:] >= values[:, :-1]).all().item())
+    row_zero_ok = bool(torch.equal(Z[:, 0, :], row_zero))
+    preserved = bool(torch.equal(work, work_before) and torch.equal(tau, tau_before))
+    zero_tau_ok = label != "zero" or bool((tau == 0).all().item())
+
+    a64 = data.double()
+    l64 = values.double()
+    aq = torch.bmm(a64, q64)
+    ql = q64 * l64.unsqueeze(1)
+    eig_scale = torch.maximum(aq.abs().amax(), ql.abs().amax()).clamp_min(1e-30)
+    eig_rel = ((aq - ql).abs().amax() / eig_scale).item()
+    recon = torch.bmm(q64 * l64.unsqueeze(1), q64.transpose(1, 2))
+    recon_scale = a64.abs().amax().clamp_min(1e-30)
+    recon_rel = ((recon - a64).abs().amax() / recon_scale).item()
+    gram = torch.bmm(q64.transpose(1, 2), q64)
+    identity = torch.eye(
+        data.size(1), device=data.device, dtype=torch.float64
+    ).expand_as(gram)
+    orth_rel = (gram - identity).abs().amax().item()
+
+    graph_ok = True
+    if check_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            Z.copy_(Z_tri)
+            eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_result = Z.clone()
+        Z.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_ok = bool(torch.equal(Z, graph_result))
+
+    spans = eigh.backtransform_panel_spans(data.size(1), backtransform_block_size)
+    expected_spans = tuple(
+        reversed(_panel_spans(data.size(1), backtransform_block_size))
+    )
+    spans_ok = spans == expected_spans
+    ok = (
+        spans_ok
+        and finite
+        and sorted_values
+        and row_zero_ok
+        and preserved
+        and zero_tau_ok
+        and graph_ok
+        and action_rel <= 5e-4
+        and eig_rel <= 2e-3
+        and recon_rel <= 2e-3
+        and orth_rel <= 2e-3
+    )
+    print(
+        f"backtransform {label}: ok={ok} spans={spans_ok} finite={finite} "
+        f"sorted={sorted_values} row0={row_zero_ok} preserved={preserved} "
+        f"zero_tau={zero_tau_ok} graph={graph_ok} action_rel={action_rel:.3e} "
+        f"eig_rel={eig_rel:.3e} recon_rel={recon_rel:.3e} "
+        f"orth_max={orth_rel:.3e} spans_list={spans}",
+        flush=True,
+    )
+    return ok
+
+
+def check_backtransform(
+    data: torch.Tensor, backend: str, backtransform_block_size: int
+) -> bool:
+    random_ok = validate_backtransform(
+        data,
+        backend,
+        backtransform_block_size,
+        label="random",
+        check_graph=True,
+    )
+    zero_ok = validate_backtransform(
+        torch.zeros_like(data),
+        backend,
+        backtransform_block_size,
+        label="zero",
+        check_graph=False,
+    )
+    return random_ok and zero_ok
 
 
 def torch_tridiag_reference(data: torch.Tensor, panel_size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -944,6 +1329,177 @@ def benchmark_tridiag_dc(
     return samples, n_sets
 
 
+def benchmark_backtransform(
+    data: torch.Tensor,
+    backend: str,
+    backtransform_block_size: int,
+    n_sets: int,
+    n_timed_calls: int,
+    warmup_target_ms: float,
+    repeats: int,
+) -> tuple[list[float], int]:
+    """Graph-captured blocked backtransform on precomputed tridiagonal vectors."""
+    work, tau, _, Z, dc_ws = prepare_backtransform_inputs(data, backend)
+    T = torch.empty(
+        data.size(0),
+        backtransform_block_size,
+        backtransform_block_size,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+    base_args = (work, tau, Z)
+    base_kwargs = {}
+    if n_sets == 0:
+        n_sets = _pick_l2_rotate_count(base_args, base_kwargs)
+    arg_sets, kwarg_sets = _clone_l2_rotate_inputs(
+        base_args, base_kwargs, n_sets
+    )
+
+    def launch(
+        reflectors: torch.Tensor,
+        reflector_tau: torch.Tensor,
+        vectors: torch.Tensor,
+    ) -> None:
+        eigh.backtransform_eigenvectors_(
+            reflectors, reflector_tau, vectors, T, dc_ws
+        )
+
+    samples = [
+        _bench_cuda_graph_l2_rotate(
+            launch,
+            arg_sets,
+            kwarg_sets,
+            extra_kwargs={},
+            warmup_target_ms=warmup_target_ms,
+            n_timed_calls=n_timed_calls,
+        )
+        for _ in range(repeats)
+    ]
+    return samples, n_sets
+
+
+def profile_backtransform_t_once(
+    data: torch.Tensor, backend: str, backtransform_block_size: int
+) -> None:
+    """Expose one warmed reverse T-formation sweep to an external profiler."""
+    D, E = make_de(data)
+    tau = torch.empty_like(E)
+    v_ws, w_ws = make_workspace(data)
+    work = data.clone()
+    T = torch.empty(
+        data.size(0),
+        backtransform_block_size,
+        backtransform_block_size,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    spans = eigh.backtransform_panel_spans(
+        data.size(1), backtransform_block_size
+    )
+
+    eigh.warm_rank2k_backend(PANEL_SIZE, backend)
+    tri_tail = (data.size(1) - 1) % PANEL_SIZE
+    if tri_tail and backend == "cublasdx":
+        eigh.warm_rank2k_backend(tri_tail, backend)
+    queue_handle = torch.cuda.current_stream().cuda_stream
+    eigh.tridiagonalize_(
+        work,
+        D,
+        E,
+        v_ws,
+        w_ws,
+        panel_size=PANEL_SIZE,
+        backend=backend,
+        queue_handle=queue_handle,
+        tau=tau,
+    )
+    eigh.warm_backtransform_t(data.size(1), backtransform_block_size)
+
+    def launch(*, annotate: bool) -> None:
+        from contextlib import nullcontext
+
+        for panel_start, panel_width in spans:
+            active_rows = data.size(1) - panel_start - 1
+            label = (
+                f"form_T_start{panel_start}_width{panel_width}_rows{active_rows}"
+            )
+            with torch.cuda.nvtx.range(label) if annotate else nullcontext():
+                eigh.form_backtransform_t_(
+                    work,
+                    tau,
+                    T,
+                    panel_start=panel_start,
+                    panel_width=panel_width,
+                )
+
+    # Compile, execute, and validate outside the profiler range.
+    launch(annotate=False)
+    torch.cuda.synchronize()
+    if not bool(torch.isfinite(T).all().item()):
+        raise RuntimeError("T-formation warmup produced non-finite output")
+
+    cudart = torch.cuda.cudart()
+    cudart.cudaProfilerStart()
+    try:
+        with torch.cuda.nvtx.range("backtransform_T_sweep"):
+            launch(annotate=True)
+            torch.cuda.synchronize()
+    finally:
+        cudart.cudaProfilerStop()
+
+    print(
+        "profile workload: one backtransform T sweep complete "
+        f"(batch={data.size(0)} n={data.size(1)} tri_ps={PANEL_SIZE} "
+        f"bt_bs={backtransform_block_size} backend={backend} panels={len(spans)})",
+        flush=True,
+    )
+
+
+def profile_backtransform_once(
+    data: torch.Tensor, backend: str, backtransform_block_size: int
+) -> None:
+    """Expose one warmed blocked eigenvector backtransform to a profiler."""
+    work, tau, _, Z, dc_ws = prepare_backtransform_inputs(data, backend)
+    Z_seed = Z.clone()
+    T = torch.empty(
+        data.size(0),
+        backtransform_block_size,
+        backtransform_block_size,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+
+    eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+    torch.cuda.synchronize()
+    if not bool(torch.isfinite(Z).all().item()):
+        raise RuntimeError("backtransform warmup produced non-finite eigenvectors")
+
+    Z.copy_(Z_seed)
+    torch.cuda.synchronize()
+    cudart = torch.cuda.cudart()
+    cudart.cudaProfilerStart()
+    try:
+        eigh.BT_NVTX = True
+        with torch.cuda.nvtx.range("backtransform_sweep"):
+            eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+            torch.cuda.synchronize()
+    finally:
+        eigh.BT_NVTX = False
+        cudart.cudaProfilerStop()
+
+    if not bool(torch.isfinite(Z).all().item()):
+        raise RuntimeError("profiled backtransform produced non-finite eigenvectors")
+    print(
+        "profile workload: one eigenvector backtransform complete "
+        f"(batch={data.size(0)} n={data.size(1)} tri_ps={PANEL_SIZE} "
+        f"bt_bs={backtransform_block_size} leaf={DC_LEAF_SIZE} "
+        f"backend={backend})",
+        flush=True,
+    )
+
+
 def profile_pipeline_once(data: torch.Tensor, backend: str, stage: str) -> None:
     """Warm, then expose exactly one requested pipeline to an external profiler."""
     from contextlib import nullcontext
@@ -1215,6 +1771,25 @@ def main() -> None:
         "conquer tridiagonal eigensolver (block-mode HTEV leaves + GEMM merges).",
     )
     parser.add_argument(
+        "--backtransform-t",
+        action="store_true",
+        help="Factor the input and validate the reverse-blocked compact-WY "
+        "T builder for every reflector panel, including graph replay.",
+    )
+    parser.add_argument(
+        "--backtransform",
+        action="store_true",
+        help="Factor and solve the input, then validate the complete blocked "
+        "eigenvector backtransform; combine with --bench to time it alone.",
+    )
+    parser.add_argument(
+        "--backtransform-block-size",
+        type=int,
+        default=BACKTRANSFORM_BLOCK_SIZE,
+        help="Independent reflector block size for --backtransform-t and "
+        "--backtransform.",
+    )
+    parser.add_argument(
         "--leaf-size",
         type=int,
         default=DC_LEAF_SIZE,
@@ -1266,7 +1841,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--profile-stage",
-        choices=("full", "tridiag"),
+        choices=("full", "tridiag", "backtransform-t", "backtransform"),
         default="full",
         help="Pipeline exposed by --profile-pipeline-once.",
     )
@@ -1322,19 +1897,52 @@ def main() -> None:
         "single run at the kernel default. Forces a register cap for occupancy.",
     )
     args = parser.parse_args()
-    if args.tri and args.tri_solve:
-        parser.error("--tri and --tri-solve are mutually exclusive")
+    if sum((args.tri, args.tri_solve, args.backtransform_t, args.backtransform)) > 1:
+        parser.error(
+            "--tri, --tri-solve, --backtransform-t, and --backtransform are "
+            "mutually exclusive"
+        )
+    if args.backtransform_t and any(
+        (args.bench, args.trace_once, args.check_panel_only)
+    ):
+        parser.error(
+            "--backtransform-t cannot be combined with benchmark, trace, panel-only, "
+            "or profile modes other than --profile-stage=backtransform-t"
+        )
+    if args.backtransform_t and args.profile_pipeline_once:
+        if args.profile_stage != "backtransform-t":
+            parser.error(
+                "--backtransform-t with --profile-pipeline-once requires "
+                "--profile-stage=backtransform-t"
+            )
+    if args.backtransform and args.profile_pipeline_once:
+        if args.profile_stage != "backtransform":
+            parser.error(
+                "--backtransform with --profile-pipeline-once requires "
+                "--profile-stage=backtransform"
+            )
     if sum((args.bench, args.trace_once, args.check_panel_only, args.profile_pipeline_once)) > 1:
         parser.error(
             "--bench, --trace-once, --check-panel-only, and "
             "--profile-pipeline-once are mutually exclusive"
         )
     if args.profile_pipeline_once:
-        required_mode = args.tri_solve if args.profile_stage == "full" else args.tri
+        required_mode = {
+            "full": args.tri_solve,
+            "tridiag": args.tri,
+            "backtransform-t": args.backtransform_t,
+            "backtransform": args.backtransform,
+        }[args.profile_stage]
         if not required_mode:
+            required_flag = {
+                "full": "tri-solve",
+                "tridiag": "tri",
+                "backtransform-t": "backtransform-t",
+                "backtransform": "backtransform",
+            }[args.profile_stage]
             parser.error(
                 f"--profile-pipeline-once --profile-stage={args.profile_stage} requires "
-                f"--{'tri-solve' if args.profile_stage == 'full' else 'tri'}"
+                f"--{required_flag}"
             )
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
@@ -1345,6 +1953,10 @@ def main() -> None:
     if not 1 <= args.panel_size <= eigh.MAX_PANEL_SIZE:
         parser.error(f"--panel-size must be in [1, {eigh.MAX_PANEL_SIZE}]")
     PANEL_SIZE = args.panel_size
+    if not 1 <= args.backtransform_block_size <= eigh.MAX_PANEL_SIZE:
+        parser.error(
+            f"--backtransform-block-size must be in [1, {eigh.MAX_PANEL_SIZE}]"
+        )
     if args.leaf_size < 3:
         parser.error("--leaf-size must be at least 3")
     DC_LEAF_SIZE = args.leaf_size
@@ -1366,6 +1978,40 @@ def main() -> None:
     if args.batch != 1:
         print("note: current debug kernel prints only the reflector for mData[0]", flush=True)
 
+    if args.backtransform_t and not args.profile_pipeline_once:
+        backend = args.update_backend if args.update_backend != "none" else "cublas"
+        if not check_backtransform_t_builder(
+            data, backend, args.backtransform_block_size
+        ):
+            raise SystemExit("backtransform T correctness gate failed")
+        print("backtransform T correctness gate passed", flush=True)
+        return
+
+    if args.backtransform and not args.profile_pipeline_once:
+        backend = args.update_backend if args.update_backend != "none" else "cublas"
+        if not check_backtransform(
+            data, backend, args.backtransform_block_size
+        ):
+            raise SystemExit("backtransform correctness gate failed")
+        print("backtransform correctness gate passed", flush=True)
+        if args.bench:
+            samples, n_sets = benchmark_backtransform(
+                data,
+                backend,
+                args.backtransform_block_size,
+                args.bench_sets,
+                args.bench_calls,
+                args.bench_warmup_ms,
+                args.bench_repeats,
+            )
+            selected = select_sample(samples, args.bench_stat)
+            print(
+                f"bench backtransform sets={n_sets} samples_ms={samples} "
+                f"{args.bench_stat}_ms={selected:.6f}",
+                flush=True,
+            )
+        return
+
     if args.trace_once:
         factor_panel(data, args.k, debug_printf=False)
         torch.cuda.synchronize()
@@ -1380,7 +2026,16 @@ def main() -> None:
 
     if args.profile_pipeline_once:
         backend = args.update_backend if args.update_backend != "none" else "cublas"
-        profile_pipeline_once(data, backend, args.profile_stage)
+        if args.profile_stage == "backtransform-t":
+            profile_backtransform_t_once(
+                data, backend, args.backtransform_block_size
+            )
+        elif args.profile_stage == "backtransform":
+            profile_backtransform_once(
+                data, backend, args.backtransform_block_size
+            )
+        else:
+            profile_pipeline_once(data, backend, args.profile_stage)
         return
 
     if args.tri_solve:
