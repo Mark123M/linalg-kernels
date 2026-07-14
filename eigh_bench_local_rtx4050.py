@@ -676,6 +676,71 @@ def benchmark_tridiag_htev(
     return samples, n_sets
 
 
+def profile_tridiag_htev_once(data: torch.Tensor, backend: str) -> None:
+    """Warm, then expose exactly one full pipeline to an external profiler."""
+    from contextlib import nullcontext
+
+    D, E = make_de(data)
+    V, info = make_htev_outputs(D)
+    v_ws, w_ws = make_workspace(data)
+    work = data.clone()
+
+    eigh.warm_rank2k_backend(PANEL_SIZE, backend)
+    tail = (data.size(1) - 1) % PANEL_SIZE
+    if tail and backend == "cublasdx":
+        eigh.warm_rank2k_backend(tail, backend)
+    eigh.warm_htev(data.size(1))
+
+    def launch(*, annotate: bool) -> None:
+        queue_handle = torch.cuda.current_stream().cuda_stream
+
+        with torch.cuda.nvtx.range("input_copy") if annotate else nullcontext():
+            work.copy_(data)
+
+        with torch.cuda.nvtx.range("tridiagonalization") if annotate else nullcontext():
+            eigh.tridiagonalize_(
+                work,
+                D,
+                E,
+                v_ws,
+                w_ws,
+                panel_size=PANEL_SIZE,
+                backend=backend,
+                queue_handle=queue_handle,
+            )
+
+        with torch.cuda.nvtx.range("htev") if annotate else nullcontext():
+            eigh.htev_all_vectors_(D, E, V, info, queue_handle=queue_handle)
+
+    # Compile every specialization and bring the GPU out of its idle state before
+    # cudaProfilerStart. This execution is intentionally outside the captured range.
+    launch(annotate=False)
+    torch.cuda.synchronize()
+    warm_bad = torch.nonzero(info, as_tuple=False).flatten().tolist()
+    if warm_bad:
+        raise RuntimeError(f"HTEV warmup failed for batch entries {warm_bad}")
+
+    cudart = torch.cuda.cudart()
+    cudart.cudaProfilerStart()
+    try:
+        with torch.cuda.nvtx.range("full_pipeline"):
+            launch(annotate=True)
+            # Keep collection active until every GPU operation in the pipeline has
+            # completed; HTEV and all preceding launches are asynchronous.
+            torch.cuda.synchronize()
+    finally:
+        cudart.cudaProfilerStop()
+
+    bad = torch.nonzero(info, as_tuple=False).flatten().tolist()
+    if bad:
+        raise RuntimeError(f"profiled HTEV failed for batch entries {bad}")
+    print(
+        f"profile workload: one full tridiagonalization+HTEV launch complete "
+        f"(batch={data.size(0)} n={data.size(1)} ps={PANEL_SIZE} backend={backend})",
+        flush=True,
+    )
+
+
 def benchmark_torch_tridiag(
     data: torch.Tensor,
     n_sets: int,
@@ -887,6 +952,12 @@ def main() -> None:
         help="Run only the panel correctness gate and exit.",
     )
     parser.add_argument(
+        "--profile-tri-solve-once",
+        action="store_true",
+        help="Warm, then launch exactly one full tridiagonalization+HTEV pipeline "
+        "between CUDA profiler start/stop calls.",
+    )
+    parser.add_argument(
         "--bench-sets",
         type=int,
         default=0,
@@ -926,8 +997,13 @@ def main() -> None:
     args = parser.parse_args()
     if args.tri and args.tri_solve:
         parser.error("--tri and --tri-solve are mutually exclusive")
-    if sum((args.bench, args.trace_once, args.check_panel_only)) > 1:
-        parser.error("--bench, --trace-once, and --check-panel-only are mutually exclusive")
+    if sum((args.bench, args.trace_once, args.check_panel_only, args.profile_tri_solve_once)) > 1:
+        parser.error(
+            "--bench, --trace-once, --check-panel-only, and "
+            "--profile-tri-solve-once are mutually exclusive"
+        )
+    if args.profile_tri_solve_once and not args.tri_solve:
+        parser.error("--profile-tri-solve-once requires --tri-solve")
     if args.bench_sets < 0 or args.bench_calls <= 0 or args.bench_repeats <= 0:
         parser.error("--bench-sets must be non-negative; --bench-calls and --bench-repeats must be positive")
     if args.bench_warmup_ms < 0:
@@ -969,6 +1045,9 @@ def main() -> None:
 
     if args.tri_solve:
         backend = args.update_backend if args.update_backend != "none" else "cublas"
+        if args.profile_tri_solve_once:
+            profile_tridiag_htev_once(data, backend)
+            return
         if not check_tridiag(data, backend):
             raise SystemExit(f"tridiag {backend} correctness check failed")
         if not check_tridiag_htev(data, backend):

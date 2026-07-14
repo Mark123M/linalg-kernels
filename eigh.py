@@ -1375,9 +1375,6 @@ class Eigh:
         rows_per_tile = const_expr(num_threads // threads_per_row)
         warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
         num_tiles = cute.ceil_div(panel_n, rows_per_tile)
-        num_warps = const_expr(num_threads // cute.arch.WARP_SIZE)
-        # Panel columns owned per warp lane in the outer correction (j = lane + 32*m).
-        jw_per_lane = const_expr(cute.ceil_div(self.panel_size, cute.arch.WARP_SIZE))
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -1437,13 +1434,9 @@ class Eigh:
         tBrB = cute.make_rmem_tensor_like(tBsB)
         # V/W column fragment for the inner GEMVs.
         tPrP = cute.make_rmem_tensor(tVsV.shape, Float32)
-        # Per-lane outer-correction coefficients s_w[j], s_v[j] for j = lane + 32*m.
-        # Note the cross-pairing later in the column: coef_sw multiplies V, coef_sv multiplies W.
-        coef_sw = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
-        coef_sv = cute.make_rmem_tensor(cute.make_layout(jw_per_lane), Float32)
-        # Column-refresh accumulators: thread owns rows p = tidx + m*num_threads.
+        # Register accumulators shared by the column refresh and the outer
+        # correction: thread owns rows p = tidx + m*num_threads, serial-j.
         acc = cute.make_rmem_tensor(cute.make_layout(tiler_n // num_threads), Float32)
-        lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
 
         cA = cute.make_identity_tensor((rows_per_tile, tiler_n))
         tAcA = thr_matvec.partition_S(cA)
@@ -1701,39 +1694,33 @@ class Eigh:
             _iket_pop()
 
             # Deferred-update corrections, outer GEMVs (dlatrd.f:319-321, 325-327):
-            # b -= V s_w + W s_v. One warp per output row; lanes split the panel
-            # dimension: lane l owns panel column j_lane = l + 32*m with its
-            # coefficient in a register, then a warp-shuffle reduction per row. The
-            # j_lane < i guard also bounds the workspace reads (rows_alloc can be
-            # < 32). Warp-uniform/lane-local guards only — no CTA barrier inside.
+            # b -= V s_w + W s_v. Same thread-per-row / serial-j register
+            # accumulation as the column refresh: thread owns rows p = tidx +
+            # m*num_threads, and at fixed j reads V[j,p]/W[j,p] coalesced
+            # (consecutive threads -> consecutive p) while the coefficients
+            # s_w[j]/s_v[j] are smem broadcast reads. j < i by construction, so no
+            # per-column mask. Cheaper than the warp-shuffle-per-row variant, whose
+            # lane-per-j reads were strided by tiler_n across the row-major
+            # workspace. No reduction/barrier inside; each thread reads back the
+            # exact sB rows it writes.
             _iket_push("outer_corr")
             if i > 0:
-                _iket_push("outer_corr_load")
-                for m in cutlass.range(jw_per_lane, unroll_full=True):
-                    j_lane = lane_idx + m * cute.arch.WARP_SIZE
-                    sw_val = Float32(0.0)
-                    sv_val = Float32(0.0)
-                    if j_lane < i:
-                        sw_val = Float32(sSw[j_lane])
-                        sv_val = Float32(sSv[j_lane])
-                    coef_sw[m] = sw_val
-                    coef_sv[m] = sv_val
+                _iket_push("outer_corr_accum")
+                for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                    acc[m] = Float32(0.0)
+                for j in cutlass.range(i):
+                    cw = Float32(sSw[j])
+                    cv = Float32(sSv[j])
+                    for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                        p = tidx + m * num_threads
+                        acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
                 _iket_pop()
-                for row_tile in cutlass.range(cute.ceil_div(panel_n, num_warps)):
-                    row = row_tile * num_warps + warp_idx
-                    if row < panel_n:
-                        partial = Float32(0.0)
-                        # local thread reduction
-                        for m in cutlass.range(jw_per_lane, unroll_full=True):
-                            j_lane = lane_idx + m * cute.arch.WARP_SIZE
-                            if j_lane < i:
-                                partial += (
-                                    Float32(mVb[j_lane, row]) * coef_sw[m]
-                                    + Float32(mWb[j_lane, row]) * coef_sv[m]
-                                )
-                        corr = cute.arch.warp_reduction(partial, operator.add)
-                        if lane_idx == 0:
-                            sB[row] = Float32(sB[row]) - corr
+                _iket_push("outer_corr_apply")
+                for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
+                    p = tidx + m * num_threads
+                    if p < panel_n:
+                        sB[p] = Float32(sB[p]) - acc[m]
+                _iket_pop()
             _iket_pop()
             # Warp lane 0s rewrote sB; the w formation below reads every row.
             _iket_push("outer_sync")

@@ -13,13 +13,16 @@ Usage:
     # so keep --calls small):
     modal run eigh_bench_b200_modal.py --cases 640x512 --panel-size 16 \
         --backends cublas --tri --calls 20 --repeats 3
+    # one warmed, uncaptured full tridiagonalization + HTEV Nsight Systems trace:
+    modal run eigh_bench_b200_modal.py --nsys --cases 640x512 \
+        --panel-size 16 --nsys-backend cublas
 
 One-time setup: .venv/bin/pip install modal && .venv/bin/modal setup
 """
 
 import modal
 
-image = (
+benchmark_base_image = (
     modal.Image.from_registry("nvidia/cuda:13.1.1-devel-ubuntu24.04", add_python="3.13")
     .entrypoint([])
     .pip_install(
@@ -52,17 +55,30 @@ image = (
             "CXX": "g++",
         }
     )
-    # Runtime mounts: synced on every `modal run`, no rebuild.
-    .add_local_file("eigh.py", "/workspace/eigh.py", copy=False)
-    .add_local_file(
-        "eigh_bench_local_rtx4050.py",
-        "/workspace/eigh_bench_local_rtx4050.py",
-        copy=False,
-    )
-    # torch-only module (pandas/triton imports are TYPE_CHECKING / unused paths);
-    # mounted flat and re-registered as quack.bench.bench_utils inside bench().
-    .add_local_file("quack/quack/bench/bench_utils.py", "/workspace/bench_utils.py", copy=False)
 )
+
+
+def _add_runner_mounts(base: modal.Image, bench_utils_path: str) -> modal.Image:
+    """Apply runtime-mounted working-tree files after every image build step."""
+    return (
+        base.add_local_file("eigh.py", "/workspace/eigh.py", copy=False)
+        .add_local_file(
+            "eigh_bench_local_rtx4050.py",
+            "/workspace/eigh_bench_local_rtx4050.py",
+            copy=False,
+        )
+        .add_local_file(
+            "quack/quack/bench/bench_utils.py",
+            bench_utils_path,
+            copy=False,
+        )
+    )
+
+
+# The ordinary benchmark imports the flat-mounted utility module and registers
+# its quack namespace in-process. Keep these mounts last so source edits do not
+# rebuild the dependency image.
+image = _add_runner_mounts(benchmark_base_image, "/workspace/bench_utils.py")
 
 # IKET first ships with CuTe DSL 4.6. Keep it in a separate image so the
 # performance benchmark above remains pinned to its established 4.5.2 compiler.
@@ -105,6 +121,14 @@ trace_image = (
         "/workspace/quack/bench/bench_utils.py",
         copy=False,
     )
+)
+
+# Nsight Systems is isolated from both the production timing image and the CuTe
+# 4.6 IKET image. Install it before adding runtime mounts. Its child process
+# imports bench_utils through the normal quack namespace, like the IKET runner.
+nsys_image = _add_runner_mounts(
+    benchmark_base_image.apt_install("cuda-nsight-systems-13-1"),
+    "/workspace/quack/bench/bench_utils.py",
 )
 
 app = modal.App("eigh-b200-bench", image=image)
@@ -473,6 +497,121 @@ def trace_panel(
     return run_name, result
 
 
+@app.function(image=nsys_image, gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
+def profile_full_pipeline(
+    batch: int,
+    n: int,
+    panel_size: int,
+    backend: str,
+    seed: int,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Gate and profile one full tridiagonalization+HTEV pipeline."""
+    from datetime import datetime, timezone
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    os.makedirs("/cache/tmp", exist_ok=True)
+    os.makedirs("/cache/cute", exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_name = f"b{batch}_n{n}_ps{panel_size}_{backend}_{stamp}"
+    output_dir = Path("/cache/nsys") / run_name
+    output_dir.mkdir(parents=True, exist_ok=False)
+    report_base = output_dir / "full_pipeline"
+    report_path = report_base.with_suffix(".nsys-rep")
+    sqlite_path = report_base.with_suffix(".sqlite")
+    summary_path = output_dir / "stats.txt"
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/workspace"
+    workload = [
+        sys.executable,
+        "/workspace/eigh_bench_local_rtx4050.py",
+        "--batch",
+        str(batch),
+        "--n",
+        str(n),
+        "--panel-size",
+        str(panel_size),
+        "--seed",
+        str(seed),
+        "--skip-expected",
+        "--tri-solve",
+        "--update-backend",
+        backend,
+    ]
+
+    _report_env("nsys")
+    print("=== full tridiagonalization+HTEV correctness preflight ===", flush=True)
+    preflight = subprocess.run(workload, env=env)
+    if preflight.returncode != 0:
+        raise RuntimeError(
+            f"tridiagonalization+HTEV correctness preflight failed: {preflight.returncode}"
+        )
+
+    command = [
+        "nsys",
+        "profile",
+        "--trace=cuda,nvtx,cublas",
+        "--sample=none",
+        "--cpuctxsw=none",
+        "--cudabacktrace=none",
+        "--capture-range=cudaProfilerApi",
+        "--capture-range-end=stop",
+        "--force-overwrite=true",
+        "--export=sqlite",
+        "--output",
+        str(report_base),
+        "--",
+        *workload,
+        "--profile-tri-solve-once",
+    ]
+    print("=== Nsight Systems full-pipeline profile ===", flush=True)
+    print("command: " + " ".join(command), flush=True)
+    profiled = subprocess.run(command, env=env)
+    if profiled.returncode != 0:
+        raise RuntimeError(f"nsys profile failed: {profiled.returncode}")
+    if not report_path.is_file() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"nsys produced no nonempty report: {report_path}")
+    if not sqlite_path.is_file() or sqlite_path.stat().st_size == 0:
+        raise RuntimeError(f"nsys produced no nonempty SQLite export: {sqlite_path}")
+
+    stats_command = [
+        "nsys",
+        "stats",
+        "--format",
+        "table",
+        "--output",
+        "-",
+        str(sqlite_path),
+    ]
+    print("=== Nsight Systems statistics ===", flush=True)
+    stats = subprocess.run(stats_command, capture_output=True, text=True)
+    if stats.stdout:
+        print(stats.stdout, end="" if stats.stdout.endswith("\n") else "\n", flush=True)
+    if stats.stderr:
+        print(stats.stderr, end="" if stats.stderr.endswith("\n") else "\n", flush=True)
+    if stats.returncode != 0:
+        raise RuntimeError(f"nsys stats failed: {stats.returncode}")
+    if not stats.stdout.strip():
+        raise RuntimeError("nsys stats produced an empty summary")
+    summary_path.write_text(stats.stdout)
+
+    required = (report_path, sqlite_path, summary_path)
+    missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise RuntimeError(f"missing or empty Nsight Systems artifacts: {missing}")
+
+    cache_vol.commit()
+    result = [
+        (str(path.relative_to(output_dir)), str(path.relative_to("/cache")))
+        for path in required
+    ]
+    print(f"Nsight Systems artifacts: {[relative for relative, _ in result]}", flush=True)
+    return run_name, result
+
+
 @app.local_entrypoint()
 def main(
     cases: str = "640x512",
@@ -492,9 +631,14 @@ def main(
     trace: bool = False,
     trace_batch: int = 1,
     trace_output: str = "profiles/eigh_iket",
+    nsys: bool = False,
+    nsys_backend: str = "cublas",
+    nsys_output: str = "profiles/eigh_nsys",
 ) -> None:
     if tri and tri_solve:
         raise SystemExit("--tri and --tri-solve are mutually exclusive")
+    if nsys and (trace or tri or tri_solve):
+        raise SystemExit("--nsys is mutually exclusive with --trace, --tri, and --tri-solve")
     parsed_cases = []
     for item in cases.split(","):
         batch, _, n = item.strip().lower().partition("x")
@@ -503,8 +647,38 @@ def main(
     for backend in backend_list:
         if backend not in ("cublas", "cublasdx"):
             raise SystemExit(f"unknown backend: {backend}")
+    if nsys_backend not in ("cublas", "cublasdx"):
+        raise SystemExit(f"unknown Nsight Systems backend: {nsys_backend}")
     if stat not in ("min", "mean", "median"):
         raise SystemExit(f"unknown stat: {stat}")
+    if nsys:
+        if len(parsed_cases) != 1:
+            raise SystemExit("--nsys requires exactly one --cases entry")
+        batch, n = parsed_cases[0]
+        if batch <= 0:
+            raise SystemExit("the --cases batch must be positive in --nsys mode")
+        run_name, artifacts = profile_full_pipeline.remote(
+            batch, n, panel_size, nsys_backend, seed
+        )
+
+        from pathlib import Path
+
+        destination = Path(nsys_output) / run_name
+        downloaded: list[Path] = []
+        for relative, remote_path in artifacts:
+            local_path = destination / relative
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as fileobj:
+                cache_vol.read_file_into_fileobj(remote_path, fileobj)
+            if local_path.stat().st_size == 0:
+                raise RuntimeError(f"downloaded empty Nsight Systems artifact: {local_path}")
+            downloaded.append(local_path)
+            print(f"downloaded {local_path}")
+        reports = [path for path in downloaded if path.suffix == ".nsys-rep"]
+        if len(reports) != 1:
+            raise RuntimeError(f"expected one .nsys-rep download, found {len(reports)}")
+        print(f"Nsight Systems report: {reports[0]} (open in the Nsight Systems UI)")
+        return
     if trace:
         if len(parsed_cases) != 1:
             raise SystemExit("--trace requires exactly one --cases entry")
