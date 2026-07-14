@@ -39,13 +39,41 @@ except NotImplementedError:
     _iket = None
 
 
+_QUEUE_ARG_TYPE = None
+
+
+def _queue_arg_type():
+    """Driver-API launch-queue wrapper type, resolved lazily by split name."""
+    global _QUEUE_ARG_TYPE
+    if _QUEUE_ARG_TYPE is None:
+        drv = importlib.import_module("cuda.bindings.driver")
+        _QUEUE_ARG_TYPE = getattr(drv, "CU" + "st" + "ream")
+    return _QUEUE_ARG_TYPE
+
+
+def queue_arg(handle: int):
+    """Wrap a raw queue handle for an ``explicit_queue`` compiled kernel."""
+    return _queue_arg_type()(handle)
+
+
+def _flat_cute_tensor(t: torch.Tensor):
+    """Flat 1-D DLPack view; logical layouts are rebuilt inside the JIT entry."""
+    return from_dlpack(t.reshape(-1))
+
+
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 MAX_PANEL_SIZE = 128
+# Widest supported thread-block cluster (hardware max on sm90/sm100 with the
+# non-portable-cluster attribute, which the DSL sets on every kernel). Also
+# sizes the per-matrix slot row of the cross-CTA partial-b.v buffer so its
+# shape is independent of the compiled cluster width.
+MAX_CLUSTER_SIZE = 16
 Rank2KBackend = Literal["cublas", "cublasdx"]
 _BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_rank2k_native"
 _HTEV_BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_htev_native"
+_SMALL_HEEV_BUILD_ROOT = Path(tempfile.gettempdir()) / getuser() / "eigh_small_heev_native"
 
 # Shared release/code-generation flags for CUDA sources in the torch native
 # extensions.  --use_fast_math includes FTZ, approximate FP32 division/sqrt,
@@ -259,6 +287,54 @@ torch2cute_dtype_map = {
     torch.int32: Int32,
     torch.int64: Int64,
 }
+
+
+_CLUSTER_CAPABLE_DEVICES: dict[Any, bool] = {}
+
+
+def _device_supports_clusters(device) -> bool:
+    """Thread-block clusters need sm90+; cached per device index."""
+    key = (device.type, device.index)
+    supported = _CLUSTER_CAPABLE_DEVICES.get(key)
+    if supported is None:
+        supported = (
+            device.type == "cuda"
+            and torch.cuda.get_device_capability(device) >= (9, 0)
+        )
+        _CLUSTER_CAPABLE_DEVICES[key] = supported
+    return supported
+
+
+def _check_cluster_size(cluster_size: int, device) -> None:
+    if not 1 <= cluster_size <= MAX_CLUSTER_SIZE:
+        raise ValueError(
+            f"cluster_size must be in [1, {MAX_CLUSTER_SIZE}], got {cluster_size}"
+        )
+    if cluster_size > 1 and not _device_supports_clusters(device):
+        raise RuntimeError(
+            "cluster_size > 1 requires an sm90+ GPU (thread-block clusters); "
+            f"device {device} does not support them"
+        )
+
+
+def dispatch_cluster_size(batch: int, n: int, device) -> int:
+    """Shape-based cluster width for the production eigensolver.
+
+    Large-N small-batch cases are CTA-count-starved (8x2048 = 8 CTAs on 148
+    SMs), so the panel kernel fans each matrix out across a cluster there.
+    The EIGH_CLUSTER_SIZE env var overrides for sweeps. Falls back to 1 on
+    hardware without cluster support.
+    """
+    env = os.environ.get("EIGH_CLUSTER_SIZE")
+    if env:
+        cluster_size = int(env)
+    elif n >= 2048:
+        cluster_size = MAX_CLUSTER_SIZE
+    else:
+        cluster_size = 1
+    if cluster_size > 1 and not _device_supports_clusters(device):
+        return 1
+    return cluster_size
 
 
 @cute.jit
@@ -2049,9 +2125,23 @@ class Eigh:
         # carveout requests a partition big enough for N CTAs (else it would
         # default to a 0% carveout and could cap CTAs by smem instead).
         min_blocks_per_mp: int = 0,
+        # Thread-block cluster width: cluster_size CTAs cooperate on one
+        # matrix's panel. The matvec row tiles split into contiguous per-CTA
+        # slabs (97% of the per-column time at N=2048); the cheap serial
+        # phases (column load/refresh, reflector, inner corrections, ~15 us
+        # per column) run redundantly in every CTA — identical inputs and
+        # identical reduction order give bit-identical tau/v everywhere, and
+        # the redundant loads are L2-hot after the first CTA. Cross-CTA
+        # traffic per column is only the per-slab partial b.v scalar
+        # (fixed-order combine: deterministic, replay-safe) plus two cluster
+        # barriers. Targets CTA-count-starved shapes (8x2048: 8 CTAs on 148
+        # SMs); needs sm90+ hardware. cluster_size=1 traces exactly the
+        # single-CTA kernel and launches without a cluster.
+        cluster_size: int = 1,
     ):
         assert 1 <= panel_size <= MAX_PANEL_SIZE
         assert panel_size < N
+        assert 1 <= cluster_size <= MAX_CLUSTER_SIZE
         self.dtype = dtype
         self.N = N
         self.panel_size = panel_size
@@ -2060,6 +2150,8 @@ class Eigh:
         self.threads_per_row_override = threads_per_row
         self.stage = stage
         self.min_blocks_per_mp = min_blocks_per_mp
+        self.cluster_size = cluster_size
+        self.explicit_queue = False
 
     def _threads_per_row(self):
         if self.threads_per_row_override is not None:
@@ -2213,6 +2305,7 @@ class Eigh:
         mTau: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
+        mBtv: cute.Tensor,
         panel_start: Int32,
         tiler_n: cutlass.Constexpr[int],
         tiled_copy: cute.TiledCopy,
@@ -2220,7 +2313,15 @@ class Eigh:
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        # Cluster launches use grid=[cluster_size, batch, 1] with the cluster
+        # laid along x, so x is this CTA's rank within its matrix's cluster
+        # and y is the matrix. The single-CTA launch keeps grid=[batch, 1, 1].
+        bx, by, _ = cute.arch.block_idx()
+        if const_expr(self.cluster_size > 1):
+            bidx = by
+            crank = bx
+        else:
+            bidx = bx
         tv_layout = matvec_tiled_copy.layout_tv_tiled
         _iket_push("panel")
 
@@ -2234,6 +2335,37 @@ class Eigh:
         warps_per_row = const_expr(max(threads_per_row // cute.arch.WARP_SIZE, 1))
         num_tiles = cute.ceil_div(panel_n, rows_per_tile)
         num_stages = const_expr(self.stage)  # matvec cp.async pipeline depth K
+
+        # Contiguous per-CTA slab of matvec row tiles. The trailing block is
+        # panel-fixed, so the slab is constant across the panel's columns and
+        # each CTA re-reads only its own rows every column (L2-friendly).
+        # Late/tail panels can leave high ranks with empty slabs (my_tiles=0);
+        # those CTAs still run the redundant phases and all barriers. At
+        # cluster_size=1 the slab is the whole panel and every added index
+        # below folds back to the original code.
+        tile_lo = 0
+        my_tiles = num_tiles
+        slab_row_lo = 0
+        slab_row_hi = panel_n
+        if const_expr(self.cluster_size > 1):
+            tiles_per_cta = cute.ceil_div(num_tiles, self.cluster_size)
+            tile_lo = crank * tiles_per_cta
+            if tile_lo > num_tiles:
+                tile_lo = num_tiles
+            tile_hi = tile_lo + tiles_per_cta
+            if tile_hi > num_tiles:
+                tile_hi = num_tiles
+            my_tiles = tile_hi - tile_lo
+            slab_row_lo = tile_lo * rows_per_tile
+            slab_row_hi = tile_hi * rows_per_tile
+            if slab_row_hi > panel_n:
+                slab_row_hi = panel_n
+        # D/E/Tau scalar stores happen once per matrix: every CTA computes the
+        # same values redundantly, so rank 0 alone writes them.
+        if const_expr(self.cluster_size > 1):
+            is_lead_cta = crank == 0
+        else:
+            is_lead_cta = True
 
         smem = cutlass.utils.SmemAllocator()
         sCol = smem.allocate_tensor(
@@ -2351,7 +2483,7 @@ class Eigh:
             # row panel_start) was finalized by the previous panel's rank-2k
             # (the trailing block starts exactly at panel_start). Issued while
             # the column cp.async is in flight.
-            if i == 0 and tidx == 0:
+            if i == 0 and tidx == 0 and is_lead_cta:
                 mD[bidx, col] = Float32(mData[bidx, col, col])
 
             # Column refresh (dlatrd.f:297-300): corr[p] = sum_{j<i} V[p,j]W[i,j] +
@@ -2395,7 +2527,7 @@ class Eigh:
                 # correction is exactly this thread's acc[m]. One scalar
                 # load+store on a single thread finishes D (i >= 1 only; p is
                 # never -1).
-                if p == i - 1:
+                if p == i - 1 and is_lead_cta:
                     mD[bidx, col] = Float32(mA[p, p]) - acc[m]
             #_iket_pop()
             # The subtract rewrote sCol thread-strided; alpha and the reflector's
@@ -2438,7 +2570,7 @@ class Eigh:
             # tau is persisted alongside for the eigenvector backtransform
             # (dormtr-style blocked larfb needs V and tau; beta==0 stores
             # tau=0, i.e. H=I, which the backtransform honors as-is).
-            if tidx == 0:
+            if tidx == 0 and is_lead_cta:
                 mE[bidx, col] = beta
                 mTau[bidx, col] = tau
 
@@ -2450,7 +2582,7 @@ class Eigh:
                     tVrV[elem] = Float32(1.0)
 
             if const_expr(self.debug_printf):
-                if bidx == 0 and tidx == 0:
+                if bidx == 0 and tidx == 0 and is_lead_cta:
                     cute.printf(
                         "eigh tridiag debug: start=%d i=%d norm=%f norm_sq=%f alpha=%f beta=%f tau=%f\n",
                         panel_start,
@@ -2474,10 +2606,12 @@ class Eigh:
             # out-of-range local_tile for panels with fewer than K-1 tiles.
             #_iket_push("prefetch")
             for s in cutlass.range_constexpr(num_stages - 1):
-                if s < num_tiles:
-                    gAs = cute.local_tile(mA, (rows_per_tile, tiler_n), (s, 0))
+                if s < my_tiles:
+                    gAs = cute.local_tile(
+                        mA, (rows_per_tile, tiler_n), (tile_lo + s, 0)
+                    )
                     tAgAs = thr_matvec.partition_S(gAs)
-                    if s * rows_per_tile + local_row < panel_n:
+                    if (tile_lo + s) * rows_per_tile + local_row < panel_n:
                         cute.copy(
                             thr_matvec, tAgAs, tAsA[None, None, None, s], pred=tApA
                         )
@@ -2525,16 +2659,20 @@ class Eigh:
             _iket_pop()
 
             _iket_push("matvec")
-            for t in cutlass.range(num_tiles):
+            for tl in cutlass.range(my_tiles):
                 # Issue the tile K-1 ahead of the one being consumed, keeping K-1
                 # cp.async groups in flight; wait_group(K-1) below then guarantees
-                # tile t (buffer t % K) has landed while t+1..t+K-1 keep flowing.
+                # tile tl (buffer tl % K) has landed while tl+1..tl+K-1 keep
+                # flowing. tl indexes the CTA's slab; tile_lo + tl is the global
+                # row tile (tile_lo = 0 without a cluster).
                 #_iket_push("matvec_async_load")
-                nxt = t + (num_stages - 1)
-                if nxt < num_tiles:
-                    gA_next = cute.local_tile(mA, (rows_per_tile, tiler_n), (nxt, 0))
+                nxt = tl + (num_stages - 1)
+                if nxt < my_tiles:
+                    gA_next = cute.local_tile(
+                        mA, (rows_per_tile, tiler_n), (tile_lo + nxt, 0)
+                    )
                     tAgA_next = thr_matvec.partition_S(gA_next)
-                    if nxt * rows_per_tile + local_row < panel_n:
+                    if (tile_lo + nxt) * rows_per_tile + local_row < panel_n:
                         cute.copy(
                             thr_matvec,
                             tAgA_next,
@@ -2543,17 +2681,17 @@ class Eigh:
                         )
                 cute.arch.cp_async_commit_group()
                 #_iket_pop()
-                
+
                 cute.arch.cp_async_wait_group(num_stages - 1)
-                
+
                 #_iket_push("matvec_reg_load")
                 if const_expr(warps_per_row > 1):
                     # Keep a fast row group from overwriting reduction_buffer before slow
                     # warps have read the previous reduction.
                     cute.arch.barrier()
-                cute.autovec_copy(tAsA[None, None, None, t % num_stages], tArA)
+                cute.autovec_copy(tAsA[None, None, None, tl % num_stages], tArA)
                 #_iket_pop()
-                
+
                 #_iket_push("matvec_reduce")
                 a = tArA.load().to(Float32)
                 b = row_sum(
@@ -2561,7 +2699,7 @@ class Eigh:
                     threads_per_row,
                     reduction_buffer[None, None, 0],
                 )
-                row_global = t * rows_per_tile + local_row
+                row_global = (tile_lo + tl) * rows_per_tile + local_row
                 if reduction_tidx == 0:
                     if row_global < panel_n:
                         sB[row_global] = b
@@ -2586,6 +2724,11 @@ class Eigh:
             # exact sB rows it writes.
             _iket_push("outer_corr")
             if i > 0:
+                # Cluster mode corrects only this CTA's slab rows of b: acc is
+                # consumed nowhere else, so predicating the loads off outside
+                # the slab both skips the redundant V/W traffic and keeps the
+                # non-slab sB rows at their zero init (which is what makes the
+                # full-width b.v reduction below a per-slab partial for free).
                 #_iket_push("outer_corr_accum")
                 for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                     acc[m] = Float32(0.0)
@@ -2594,13 +2737,25 @@ class Eigh:
                     cv = Float32(sSv[j])
                     for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                         p = tidx + m * num_threads
-                        acc[m] += Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
+                        if const_expr(self.cluster_size > 1):
+                            if p >= slab_row_lo and p < slab_row_hi:
+                                acc[m] += (
+                                    Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
+                                )
+                        else:
+                            acc[m] += (
+                                Float32(mVb[j, p]) * cw + Float32(mWb[j, p]) * cv
+                            )
                 #_iket_pop()
                 #_iket_push("outer_corr_apply")
                 for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                     p = tidx + m * num_threads
-                    if p < panel_n:
-                        sB[p] = Float32(sB[p]) - acc[m]
+                    if const_expr(self.cluster_size > 1):
+                        if p >= slab_row_lo and p < slab_row_hi:
+                            sB[p] = Float32(sB[p]) - acc[m]
+                    else:
+                        if p < panel_n:
+                            sB[p] = Float32(sB[p]) - acc[m]
                 #_iket_pop()
             _iket_pop()
             # Warp lane 0s rewrote sB; the w formation below reads every row.
@@ -2617,10 +2772,33 @@ class Eigh:
                 threads_per_row,
                 reduction_buffer[None, None, 0],
             )
+            if const_expr(self.cluster_size > 1):
+                # The reduction above covered only this CTA's slab (non-slab sB
+                # rows keep their zero init). Publish the partial, cluster-
+                # barrier (arrive releases the gmem store at cluster scope,
+                # wait acquires it), then re-sum every rank's slot in a fixed
+                # order so all CTAs reach the identical scalar — deterministic
+                # across graph replays, no atomics. The slots are safely
+                # reused next column: these reads precede the end-of-column
+                # cluster barrier, which precedes any rank's next publish.
+                if tidx == 0:
+                    mBtv[bidx, crank] = dot_bv
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                total_bv = Float32(0.0)
+                for c in cutlass.range_constexpr(self.cluster_size):
+                    total_bv += Float32(mBtv[bidx, c])
+                dot_bv = total_bv
             alpha_w = Float32(-0.5) * tau * tau * dot_bv
             for m in cutlass.range(tiler_n // num_threads, unroll_full=True):
                 p = tidx + m * num_threads
-                if p < panel_n:
+                in_slab_rows = p < panel_n
+                if const_expr(self.cluster_size > 1):
+                    # Each CTA appends only its slab's rows of v/w (and the
+                    # reflector persist below); the slabs tile [0, panel_n).
+                    in_slab_rows = p >= slab_row_lo and p < slab_row_hi
+                if in_slab_rows:
                     vp = Float32(sCol[p]) * inv_denom
                     if p == i:
                         vp = Float32(1.0)
@@ -2640,8 +2818,17 @@ class Eigh:
             # The w store reads sCol/sB and appends the V/W rows consumed by the next
             # column's inner GEMVs (CTA barrier orders the gmem writes for this CTA —
             # all its threads share one SM's L1); sync before cp.async reuses sCol.
+            # With a cluster the next column's redundant refresh reads V/W rows
+            # appended slab-wise by every rank, so the CTA barrier widens to a
+            # cluster barrier (arrive/wait release-acquire orders the gmem
+            # appends across the cluster and subsumes the intra-CTA sync).
             #_iket_push("column_sync")
-            cute.arch.barrier()
+            if const_expr(self.cluster_size > 1):
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+            else:
+                cute.arch.barrier()
             #_iket_pop()
             _iket_pop()
         _iket_pop()
@@ -2655,7 +2842,9 @@ class Eigh:
         mTau: cute.Tensor,
         mV: cute.Tensor,
         mW: cute.Tensor,
+        mBtv: cute.Tensor,
         panel_start: Int32,
+        q=None,
     ):
         mData = cute.make_tensor(
             mData.iterator,
@@ -2693,12 +2882,21 @@ class Eigh:
         )
         mV = cute.make_tensor(mV.iterator, workspace_layout)
         mW = cute.make_tensor(mW.iterator, workspace_layout)
+        # Per-matrix cross-CTA partial-b.v slots, one row of MAX_CLUSTER_SIZE
+        # per matrix so the buffer shape is independent of cluster_size.
+        mBtv = cute.make_tensor(
+            mBtv.iterator,
+            cute.make_layout(
+                (self.host_batch, MAX_CLUSTER_SIZE), stride=(MAX_CLUSTER_SIZE, 1)
+            ),
+        )
         assert mData.element_type == self.dtype
         assert mD.element_type == self.reduction_dtype
         assert mE.element_type == self.reduction_dtype
         assert mTau.element_type == self.reduction_dtype
         assert mV.element_type == self.reduction_dtype
         assert mW.element_type == self.reduction_dtype
+        assert mBtv.element_type == self.reduction_dtype
         tiled_copy, matvec_tiled_copy, tiler_n, threads_per_row = (
             self._get_column_tiled_copy()
         )
@@ -2707,6 +2905,11 @@ class Eigh:
             grid=[self.host_batch, 1, 1],
             block=[num_threads, 1, 1],
         )
+        if const_expr(self.cluster_size > 1):
+            # cluster_size cooperating CTAs per matrix, cluster along x so
+            # block x is the rank within the cluster and y is the matrix.
+            launch_kwargs["grid"] = [self.cluster_size, self.host_batch, 1]
+            launch_kwargs["cluster"] = [self.cluster_size, 1, 1]
         if const_expr(self.min_blocks_per_mp > 0):
             # nvvm.minctasm caps registers for occupancy; pass the exact smem so
             # the DSL's carveout requests a partition sized for that many CTAs
@@ -2714,6 +2917,8 @@ class Eigh:
             # smem instead). auto-smem stays in charge on the default path.
             launch_kwargs["min_blocks_per_mp"] = self.min_blocks_per_mp
             launch_kwargs["smem"] = self._smem_bytes(self.stage)
+        if const_expr(self.explicit_queue):
+            launch_kwargs["async_deps"] = q
         self.kernel(
             mData,
             mD,
@@ -2721,6 +2926,7 @@ class Eigh:
             mTau,
             mV,
             mW,
+            mBtv,
             panel_start,
             tiler_n,
             tiled_copy,
@@ -2741,6 +2947,8 @@ class Eigh:
         batch: int = 1,
         workspace_rows: Optional[int] = None,
         workspace_cols: Optional[int] = None,
+        explicit_queue: bool = False,
+        cluster_size: int = 1,
     ):
         obj = Eigh(
             data_dtype,
@@ -2750,6 +2958,7 @@ class Eigh:
             threads_per_row=threads_per_row,
             stage=stage,
             min_blocks_per_mp=min_blocks_per_mp,
+            cluster_size=cluster_size,
         )
         default_rows, default_cols = obj.workspace_shape()
         if workspace_rows is None:
@@ -2759,6 +2968,7 @@ class Eigh:
         obj.host_batch = batch
         obj.host_workspace_rows = workspace_rows
         obj.host_workspace_cols = workspace_cols
+        obj.explicit_queue = bool(explicit_queue)
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch * N * N,), div)
         d_cute = Eigh.make_fake_tensor(Float32, (batch * N,), 1)
@@ -2767,17 +2977,21 @@ class Eigh:
         workspace_elems = batch * workspace_rows * workspace_cols
         v_cute = Eigh.make_fake_tensor(Float32, (workspace_elems,), 4)
         w_cute = Eigh.make_fake_tensor(Float32, (workspace_elems,), 4)
+        btv_cute = Eigh.make_fake_tensor(Float32, (batch * MAX_CLUSTER_SIZE,), 4)
 
-        return cute.compile(
-            obj,
+        compile_args = [
             data_cute,
             d_cute,
             e_cute,
             tau_cute,
             v_cute,
             w_cute,
+            btv_cute,
             Int32(0),  # panel_start: dynamic per-launch argument
-        )
+        ]
+        if explicit_queue:
+            compile_args.append(queue_arg(0))
+        return cute.compile(obj, *compile_args)
 
 
 def backtransform_panel_spans(
@@ -2826,6 +3040,7 @@ class BacktransformT:
         self.N = N
         self.block_size = block_size
         self.panel_width = panel_width
+        self.explicit_queue = False
 
     @cute.kernel
     def kernel(
@@ -2937,6 +3152,7 @@ class BacktransformT:
         mTau: cute.Tensor,
         mT: cute.Tensor,
         panel_start: Int32,
+        q=None,
     ):
         mData = cute.make_tensor(
             mData.iterator,
@@ -2965,32 +3181,40 @@ class BacktransformT:
         assert mData.element_type == self.dtype
         assert mTau.element_type == Float32
         assert mT.element_type == Float32
-        self.kernel(mData, mTau, mT, panel_start).launch(
+        launch_kwargs = dict(
             grid=[self.host_batch, 1, 1],
             block=[128, 1, 1],
         )
+        if const_expr(self.explicit_queue):
+            launch_kwargs["async_deps"] = q
+        self.kernel(mData, mTau, mT, panel_start).launch(**launch_kwargs)
 
     @staticmethod
     @jit_cache
     def compile(
-        data_dtype, N: int, block_size: int, panel_width: int, batch: int = 1
+        data_dtype,
+        N: int,
+        block_size: int,
+        panel_width: int,
+        batch: int = 1,
+        explicit_queue: bool = False,
     ):
         obj = BacktransformT(data_dtype, N, block_size, panel_width)
         obj.host_batch = batch
+        obj.explicit_queue = bool(explicit_queue)
         div = math.gcd(128 // data_dtype.width, N)
         data_cute = Eigh.make_fake_tensor(data_dtype, (batch * N * N,), div)
         tau_cute = Eigh.make_fake_tensor(Float32, (batch * (N - 1),), 1)
         t_cute = Eigh.make_fake_tensor(Float32, (batch * block_size * block_size,), 1)
-        return cute.compile(
-            obj,
-            data_cute,
-            tau_cute,
-            t_cute,
-            Int32(0),
-        )
+        compile_args = [data_cute, tau_cute, t_cute, Int32(0)]
+        if explicit_queue:
+            compile_args.append(queue_arg(0))
+        return cute.compile(obj, *compile_args)
 
 
-def warm_backtransform_t(n: int, backtransform_block_size: int) -> None:
+def warm_backtransform_t(
+    n: int, backtransform_block_size: int, *, batch: int = 1
+) -> None:
     """Compile the full and optional tail T-builder specializations."""
     widths = {
         panel_width
@@ -2999,14 +3223,22 @@ def warm_backtransform_t(n: int, backtransform_block_size: int) -> None:
         )
     }
     for panel_width in sorted(widths):
-        BacktransformT.compile(
-            Float32, n, backtransform_block_size, panel_width
-        )
+        for explicit_queue in (False, True):
+            BacktransformT.compile(
+                Float32,
+                n,
+                backtransform_block_size,
+                panel_width,
+                batch,
+                explicit_queue,
+            )
 
 
-def warm_backtransform(n: int, backtransform_block_size: int) -> None:
+def warm_backtransform(
+    n: int, backtransform_block_size: int, *, batch: int = 1
+) -> None:
     """Warm every specialization needed by the blocked backtransform."""
-    warm_backtransform_t(n, backtransform_block_size)
+    warm_backtransform_t(n, backtransform_block_size, batch=batch)
 
 
 def _form_backtransform_t_unchecked_(
@@ -3015,19 +3247,24 @@ def _form_backtransform_t_unchecked_(
     T: torch.Tensor,
     panel_start: int,
     panel_width: int,
+    queue_handle: int = 0,
 ) -> None:
+    explicit_queue = queue_handle != 0
+    queue_args = (queue_arg(queue_handle),) if explicit_queue else ()
     compiled = BacktransformT.compile(
         torch2cute_dtype_map[data.dtype],
         data.size(1),
         T.size(1),
         panel_width,
         data.size(0),
+        explicit_queue,
     )
     compiled(
-        from_dlpack(data.reshape(-1)),
-        from_dlpack(tau.reshape(-1)),
-        from_dlpack(T.reshape(-1)),
+        _flat_cute_tensor(data),
+        _flat_cute_tensor(tau),
+        _flat_cute_tensor(T),
         panel_start,
+        *queue_args,
     )
 
 
@@ -3038,6 +3275,7 @@ def form_backtransform_t_(
     *,
     panel_start: int,
     panel_width: int,
+    queue_handle: int = 0,
 ) -> None:
     """Overwrite ``T`` with one lower-DSYTRD panel's compact-WY factor.
 
@@ -3079,7 +3317,9 @@ def form_backtransform_t_(
             f"start={panel_start}, width={panel_width}, N={n}"
         )
 
-    _form_backtransform_t_unchecked_(data, tau, T, panel_start, panel_width)
+    _form_backtransform_t_unchecked_(
+        data, tau, T, panel_start, panel_width, queue_handle
+    )
 
 
 def _backtransform_eigenvectors_unchecked_(
@@ -3088,6 +3328,7 @@ def _backtransform_eigenvectors_unchecked_(
     Z: torch.Tensor,
     T: torch.Tensor,
     dc_ws: DCWorkspace,
+    queue_handle: int = 0,
 ) -> None:
     batch, n, _ = data.shape
     block_size = T.size(1)
@@ -3100,7 +3341,7 @@ def _backtransform_eigenvectors_unchecked_(
         ):
             with _bt_range("form_T"):
                 _form_backtransform_t_unchecked_(
-                    data, tau, T, panel_start, panel_width
+                    data, tau, T, panel_start, panel_width, queue_handle
                 )
 
             V_source = data[
@@ -3137,6 +3378,8 @@ def backtransform_eigenvectors_(
     Z: torch.Tensor,
     T: torch.Tensor,
     dc_ws: DCWorkspace,
+    *,
+    queue_handle: int = 0,
 ) -> None:
     """Apply the persisted lower-DSYTRD reflectors to ``Z`` in place.
 
@@ -3196,7 +3439,7 @@ def backtransform_eigenvectors_(
                 f"{name} must be a contiguous CUDA tensor on data's device"
             )
 
-    _backtransform_eigenvectors_unchecked_(data, tau, Z, T, dc_ws)
+    _backtransform_eigenvectors_unchecked_(data, tau, Z, T, dc_ws, queue_handle)
 
 
 def run_panel_with_update(
@@ -3215,6 +3458,8 @@ def run_panel_with_update(
     min_blocks_per_mp: int = 0,
     queue_handle: int = 0,
     tau: Optional[torch.Tensor] = None,
+    cluster_size: int = 1,
+    btv: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Factor one DLATRD panel, then update its unreduced trailing block.
 
@@ -3222,17 +3467,27 @@ def run_panel_with_update(
     into the factored column's lower triangle (LAPACK dsytrd layout: explicit
     unit at the subdiagonal, zeros above) and the rank-2k update rewrites the
     trailing block.  ``tau`` is a (batch, N-1) FP32 buffer for the reflector
-    scalars (allocated here when omitted).  The panel kernel and native backend
-    both use PyTorch's ambient CUDA queue, so their launch order is sufficient
-    and no host synchronization is required.
+    scalars (allocated here when omitted).  ``cluster_size`` > 1 runs the
+    cluster-cooperative panel kernel (sm90+ only) with ``btv`` as the
+    (batch, MAX_CLUSTER_SIZE) FP32 cross-CTA scratch (allocated here when
+    omitted).  The panel kernel and native backend both use PyTorch's ambient
+    CUDA queue, so their launch order is sufficient and no host
+    synchronization is required.
     """
     if data.dtype not in torch2cute_dtype_map:
         raise TypeError(f"unsupported data dtype: {data.dtype}")
     if not 1 <= panel_size <= MAX_PANEL_SIZE:
         raise ValueError(f"panel_size must be in [1, {MAX_PANEL_SIZE}], got {panel_size}")
+    _check_cluster_size(cluster_size, data.device)
     data_dtype = torch2cute_dtype_map[data.dtype]
     if tau is None:
         tau = torch.empty_like(E)
+    if btv is None:
+        btv = torch.empty(
+            data.size(0), MAX_CLUSTER_SIZE, device=data.device, dtype=torch.float32
+        )
+    explicit_queue = queue_handle != 0
+    queue_args = (queue_arg(queue_handle),) if explicit_queue else ()
     compiled = Eigh.compile(
         data_dtype,
         data.size(1),
@@ -3244,15 +3499,19 @@ def run_panel_with_update(
         batch=data.size(0),
         workspace_rows=v_ws.size(1),
         workspace_cols=v_ws.size(2),
+        explicit_queue=explicit_queue,
+        cluster_size=cluster_size,
     )
     compiled(
-        from_dlpack(data.reshape(-1)),
-        from_dlpack(D.reshape(-1)),
-        from_dlpack(E.reshape(-1)),
-        from_dlpack(tau.reshape(-1)),
-        from_dlpack(v_ws.reshape(-1)),
-        from_dlpack(w_ws.reshape(-1)),
+        _flat_cute_tensor(data),
+        _flat_cute_tensor(D),
+        _flat_cute_tensor(E),
+        _flat_cute_tensor(tau),
+        _flat_cute_tensor(v_ws),
+        _flat_cute_tensor(w_ws),
+        _flat_cute_tensor(btv),
         panel_start,
+        *queue_args,
     )
     return rank2k_update_(
         data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
@@ -3274,6 +3533,8 @@ def tridiagonalize_(
     stage: int = 2,
     min_blocks_per_mp: int = 0,
     tau: Optional[torch.Tensor] = None,
+    cluster_size: int = 1,
+    btv: Optional[torch.Tensor] = None,
 ) -> None:
     """Full blocked Householder tridiagonalization (lower DSYTRD flow).
 
@@ -3287,9 +3548,12 @@ def tridiagonalize_(
     scalars (allocated internally when omitted); together with the lower
     triangle it is exactly what the eigenvector backtransform needs.
     ``v_ws``/``w_ws`` come zero-allocated from :meth:`Eigh.workspace_shape` at
-    this ``panel_size``. All work is issued on the ambient queue, so the whole
-    factorization is CUDA-graph capturable (the Python loop unrolls into the
-    graph).
+    this ``panel_size``. ``cluster_size`` > 1 fans each matrix's panel across
+    a thread-block cluster (sm90+ only; use for CTA-count-starved shapes) and
+    ``btv`` is its (batch, MAX_CLUSTER_SIZE) FP32 cross-CTA scratch, allocated
+    internally when omitted. All work is issued on the ambient queue, so the
+    whole factorization is CUDA-graph capturable (the Python loop unrolls into
+    the graph).
 
     The N-1 reflector columns split into ``(N-1) // panel_size`` full panels
     plus one tail panel of ``(N-1) % panel_size`` columns; each panel launch is
@@ -3301,11 +3565,18 @@ def tridiagonalize_(
     N = data.size(1)
     if not 1 <= panel_size <= MAX_PANEL_SIZE or panel_size >= N:
         raise ValueError(f"panel_size must be in [1, min({MAX_PANEL_SIZE}, N-1)]")
+    _check_cluster_size(cluster_size, data.device)
     data_dtype = torch2cute_dtype_map[data.dtype]
     if tau is None:
         tau = torch.empty_like(E)
+    if btv is None:
+        btv = torch.empty(
+            data.size(0), MAX_CLUSTER_SIZE, device=data.device, dtype=torch.float32
+        )
     n_cols = N - 1
     full, tail = divmod(n_cols, panel_size)
+    explicit_queue = queue_handle != 0
+    queue_args = (queue_arg(queue_handle),) if explicit_queue else ()
     if full:
         compiled = Eigh.compile(
             data_dtype,
@@ -3318,17 +3589,21 @@ def tridiagonalize_(
             batch=data.size(0),
             workspace_rows=v_ws.size(1),
             workspace_cols=v_ws.size(2),
+            explicit_queue=explicit_queue,
+            cluster_size=cluster_size,
         )
         for j in range(full):
             panel_start = j * panel_size
             compiled(
-                from_dlpack(data.reshape(-1)),
-                from_dlpack(D.reshape(-1)),
-                from_dlpack(E.reshape(-1)),
-                from_dlpack(tau.reshape(-1)),
-                from_dlpack(v_ws.reshape(-1)),
-                from_dlpack(w_ws.reshape(-1)),
+                _flat_cute_tensor(data),
+                _flat_cute_tensor(D),
+                _flat_cute_tensor(E),
+                _flat_cute_tensor(tau),
+                _flat_cute_tensor(v_ws),
+                _flat_cute_tensor(w_ws),
+                _flat_cute_tensor(btv),
                 panel_start,
+                *queue_args,
             )
             rank2k_update_(
                 data, v_ws, w_ws, panel_start, panel_size, backend, queue_handle
@@ -3345,16 +3620,20 @@ def tridiagonalize_(
             batch=data.size(0),
             workspace_rows=v_ws.size(1),
             workspace_cols=v_ws.size(2),
+            explicit_queue=explicit_queue,
+            cluster_size=cluster_size,
         )
         panel_start = full * panel_size
         tail_compiled(
-            from_dlpack(data.reshape(-1)),
-            from_dlpack(D.reshape(-1)),
-            from_dlpack(E.reshape(-1)),
-            from_dlpack(tau.reshape(-1)),
-            from_dlpack(v_ws.reshape(-1)),
-            from_dlpack(w_ws.reshape(-1)),
+            _flat_cute_tensor(data),
+            _flat_cute_tensor(D),
+            _flat_cute_tensor(E),
+            _flat_cute_tensor(tau),
+            _flat_cute_tensor(v_ws),
+            _flat_cute_tensor(w_ws),
+            _flat_cute_tensor(btv),
             panel_start,
+            *queue_args,
         )
         rank2k_update_(data, v_ws, w_ws, panel_start, tail, backend, queue_handle)
     # A[N-1, N-1] was finalized by the last (1x1) trailing update.
@@ -3374,6 +3653,9 @@ FullEighWorkspace = namedtuple(
         "panel_size",
         "backtransform_block_size",
         "leaf_size",
+        # (batch, MAX_CLUSTER_SIZE) FP32 cross-CTA partial-b.v slots for the
+        # cluster-cooperative panel kernel; untouched at cluster_size=1.
+        "panel_btv",
     ],
 )
 
@@ -3431,32 +3713,62 @@ def full_eigh_workspace(
         panel_size,
         backtransform_block_size,
         leaf_size,
+        torch.empty(batch, MAX_CLUSTER_SIZE, **f32),
     )
 
 
 def warm_full_eigh(
     n: int,
     *,
+    batch: int = 1,
     panel_size: int = 16,
     backtransform_block_size: int = 16,
     leaf_size: int = 32,
     backend: Rank2KBackend = "cublas",
+    cluster_size: Optional[int] = None,
 ) -> None:
-    """Compile and load every specialization used by the connected driver."""
+    """Compile and load every specialization used by the connected driver.
+
+    The compile keys (including ``batch`` and the workspace dims) must mirror
+    :func:`tridiagonalize_`'s exact calls or the warmed specializations are
+    never the ones the driver looks up. ``cluster_size`` None mirrors the
+    driver's shape-based dispatch on the current device.
+    """
     panel_size, backtransform_block_size, leaf_size = _effective_eigh_sizes(
         n, panel_size, backtransform_block_size, leaf_size
     )
+    if cluster_size is None:
+        cluster_size = dispatch_cluster_size(
+            batch, n, torch.device("cuda", torch.cuda.current_device())
+        )
     widths = {panel_size}
     tail = (n - 1) % panel_size
     if tail:
         widths.add(tail)
+    workspace_rows, workspace_cols = Eigh(
+        Float32, n, panel_size=panel_size
+    ).workspace_shape()
     for width in sorted(widths):
-        Eigh.compile(Float32, n, panel_size=width)
+        for explicit_queue in (False, True):
+            Eigh.compile(
+                Float32,
+                n,
+                debug_printf=False,
+                panel_size=width,
+                threads_per_row=None,
+                stage=2,
+                min_blocks_per_mp=0,
+                batch=batch,
+                workspace_rows=workspace_rows,
+                workspace_cols=workspace_cols,
+                explicit_queue=explicit_queue,
+                cluster_size=cluster_size,
+            )
     warm_rank2k_backend(panel_size, backend)
     if tail and backend == "cublasdx":
         warm_rank2k_backend(tail, backend)
     warm_dc(n, leaf_size)
-    warm_backtransform(n, backtransform_block_size)
+    warm_backtransform(n, backtransform_block_size, batch=batch)
 
 
 def _full_eigh_out_unchecked_(
@@ -3466,6 +3778,7 @@ def _full_eigh_out_unchecked_(
     workspace: FullEighWorkspace,
     backend: Rank2KBackend,
     queue_handle: int,
+    cluster_size: int = 1,
 ) -> None:
     workspace.work.copy_(data)
     matrix_scale = workspace.work.abs().amax(dim=(1, 2))
@@ -3481,6 +3794,8 @@ def _full_eigh_out_unchecked_(
         backend=backend,
         queue_handle=queue_handle,
         tau=workspace.tau,
+        cluster_size=cluster_size,
+        btv=workspace.panel_btv,
     )
     tridiag_eig_dc_(
         L,
@@ -3491,7 +3806,7 @@ def _full_eigh_out_unchecked_(
         queue_handle=queue_handle,
     )
     _backtransform_eigenvectors_unchecked_(
-        workspace.work, workspace.tau, Q, workspace.T, workspace.dc
+        workspace.work, workspace.tau, Q, workspace.T, workspace.dc, queue_handle
     )
     L.mul_(matrix_scale[:, None])
 
@@ -3504,12 +3819,15 @@ def full_eigh_out_(
     *,
     backend: Rank2KBackend = "cublas",
     queue_handle: int = 0,
+    cluster_size: Optional[int] = None,
 ) -> None:
     """Write the connected symmetric eigendecomposition into ``Q`` and ``L``.
 
     The input is preserved. ``Q`` receives eigenvectors in columns and ``L``
     receives ascending eigenvalues. All fields in ``workspace`` are reusable
     scratch and are overwritten; overlapping calls must use distinct scratch.
+    ``cluster_size`` None picks the shape-based default (see
+    :func:`dispatch_cluster_size`); pass 1 to force the single-CTA panel path.
     """
     if data.dtype != torch.float32 or data.ndim != 3:
         raise ValueError("data must be a batch x N x N FP32 tensor")
@@ -3541,7 +3859,13 @@ def full_eigh_out_(
         workspace.backtransform_block_size,
     ):
         raise ValueError("workspace T buffer has the wrong shape")
-    _full_eigh_out_unchecked_(data, Q, L, workspace, backend, queue_handle)
+    if workspace.panel_btv.shape != (batch, MAX_CLUSTER_SIZE):
+        raise ValueError("workspace panel_btv buffer has the wrong shape")
+    if cluster_size is None:
+        cluster_size = dispatch_cluster_size(batch, n, data.device)
+    _full_eigh_out_unchecked_(
+        data, Q, L, workspace, backend, queue_handle, cluster_size
+    )
 
 
 _CUSTOM_PANEL_SIZE = 16
@@ -3582,6 +3906,12 @@ def custom_kernel(data: input_t) -> output_t:
     vectors = torch.empty_like(data)
     values = torch.empty(batch, n, device=data.device, dtype=torch.float32)
     _full_eigh_out_unchecked_(
-        data, vectors, values, _custom_workspace(data), "cublas", 0
+        data,
+        vectors,
+        values,
+        _custom_workspace(data),
+        "cublas",
+        0,
+        dispatch_cluster_size(batch, n, data.device),
     )
     return vectors, values

@@ -202,6 +202,7 @@ def bench_official_eigh(
     backtransform_block_size: int,
     leaf_size: int,
     backend: str,
+    cluster_size: int = 0,
 ) -> dict:
     """Compare both providers with the ranked evaluator's timing contract."""
     import json
@@ -240,6 +241,11 @@ def bench_official_eigh(
             "panel_size=16, backtransform_block_size=16, leaf_size=32, "
             "backend=cublas"
         )
+
+    # 0 keeps custom_kernel's shape-based dispatch (production behavior);
+    # >0 forces one width for every case via the env override it honors.
+    if cluster_size > 0:
+        os.environ["EIGH_CLUSTER_SIZE"] = str(cluster_size)
 
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -416,6 +422,7 @@ def bench_official_eigh(
             "backtransform_block_size": backtransform_block_size,
             "leaf_size": leaf_size,
             "backend": backend,
+            "cluster_size": cluster_size or "shape-default",
             "matmul_precision": torch.get_float32_matmul_precision(),
             "preferred_linalg_library": str(
                 torch.backends.cuda.preferred_linalg_library()
@@ -455,6 +462,8 @@ def bench(
     tri_solve: bool,
     stages: str = "",
     min_ctas: str = "",
+    cluster_size: int = 1,
+    clusters: str = "",
 ) -> None:
     import os
     import sys
@@ -487,9 +496,12 @@ def bench(
 
     for batch, n in cases:
         label = f"case {batch}x{n} ps={panel_size} k={k}"
+        if cluster_size > 1:
+            label += f" cs={cluster_size}"
         print(f"=== {label} ===", flush=True)
         runner.PANEL_SIZE = panel_size
         runner.DC_LEAF_SIZE = leaf_size
+        runner.CLUSTER_SIZE = cluster_size
         torch.manual_seed(seed)
         data = runner.make_input(batch, n, runner.DTYPE, device)
 
@@ -558,13 +570,6 @@ def bench(
             # kernel driver vs the fair torch driver. One timed call is a full
             # factorization (tens of ms) — pass a small --calls (e.g. 20).
             tri_backends = backends or ["cublas"]
-            gate_results = [runner.check_tridiag(data, be) for be in tri_backends]
-            if not all(gate_results):
-                print(f"{label}: TRIDIAG GATE FAILED — skipping timings", flush=True)
-                summaries.append(f"{label}: TRIDIAG GATE FAILED")
-                failed = True
-                continue
-            torch.set_float32_matmul_precision(matmul_precision)
             parts = []
             first_ms = None
             # Empty -> single run at the kernel default; lists sweep the matvec
@@ -572,33 +577,59 @@ def bench(
             # register cap (both occupancy-only; correctness is invariant).
             stage_list = [int(x) for x in stages.split(",") if x.strip()] or [None]
             min_ctas_list = [int(x) for x in min_ctas.split(",") if x.strip()] or [None]
-            for be in tri_backends:
-                for st in stage_list:
-                    for mc in min_ctas_list:
-                        runner.STAGE = st
-                        runner.MIN_CTAS = mc
-                        samples, n_sets = runner.benchmark_tridiag(
-                            data, be, sets, calls, warmup_ms, repeats
-                        )
-                        tri_ms = runner.select_sample(samples, stat)
-                        if first_ms is None:
-                            first_ms = tri_ms
-                        tag = ("" if st is None else f" stage={st}") + (
-                            "" if mc is None else f" min_ctas={mc}"
-                        )
-                        print(
-                            f"tridiag_{be}{tag} sets={n_sets} "
-                            f"samples_ms={[f'{s:.4f}' for s in samples]}",
-                            flush=True,
-                        )
-                        key = be
-                        if st is not None:
-                            key = f"{key}@k{st}"
-                        if mc is not None:
-                            key = f"{key}@mc{mc}"
-                        parts.append(f"tridiag_{key}={tri_ms:.4f}ms")
+            # Empty -> single run at the case-level cluster width. The D/E gate
+            # re-runs per width: cluster mode changes the b.v summation order,
+            # so each width must independently prove the factorization.
+            cs_list = [int(x) for x in clusters.split(",") if x.strip()] or [None]
+            for cs in cs_list:
+                if cs is not None:
+                    runner.CLUSTER_SIZE = cs
+                cs_tag = "" if cs is None else f" cs={cs}"
+                torch.set_float32_matmul_precision("highest")
+                gate_results = [runner.check_tridiag(data, be) for be in tri_backends]
+                if not all(gate_results):
+                    print(
+                        f"{label}{cs_tag}: TRIDIAG GATE FAILED — skipping timings",
+                        flush=True,
+                    )
+                    summaries.append(f"{label}{cs_tag}: TRIDIAG GATE FAILED")
+                    failed = True
+                    continue
+                torch.set_float32_matmul_precision(matmul_precision)
+                for be in tri_backends:
+                    for st in stage_list:
+                        for mc in min_ctas_list:
+                            runner.STAGE = st
+                            runner.MIN_CTAS = mc
+                            samples, n_sets = runner.benchmark_tridiag(
+                                data, be, sets, calls, warmup_ms, repeats
+                            )
+                            tri_ms = runner.select_sample(samples, stat)
+                            if first_ms is None:
+                                first_ms = tri_ms
+                            tag = cs_tag + (
+                                "" if st is None else f" stage={st}"
+                            ) + ("" if mc is None else f" min_ctas={mc}")
+                            print(
+                                f"tridiag_{be}{tag} sets={n_sets} "
+                                f"samples_ms={[f'{s:.4f}' for s in samples]}",
+                                flush=True,
+                            )
+                            key = be
+                            if cs is not None:
+                                key = f"{key}@cs{cs}"
+                            if st is not None:
+                                key = f"{key}@k{st}"
+                            if mc is not None:
+                                key = f"{key}@mc{mc}"
+                            parts.append(f"tridiag_{key}={tri_ms:.4f}ms")
             runner.STAGE = None
             runner.MIN_CTAS = None
+            runner.CLUSTER_SIZE = cluster_size
+            if first_ms is None:
+                del data
+                torch.cuda.empty_cache()
+                continue
             samples, n_sets = runner.benchmark_torch_tridiag(
                 data, sets, calls, warmup_ms, repeats
             )
@@ -701,6 +732,7 @@ def trace_panel(
     panel_size: int,
     k: int,
     seed: int,
+    cluster_size: int = 1,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Gate and trace one panel launch, returning volume paths for its artifacts."""
     from datetime import datetime, timezone
@@ -711,7 +743,8 @@ def trace_panel(
 
     os.makedirs("/cache/tmp", exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_name = f"n{n}_ps{panel_size}_k{k}_{stamp}"
+    cs_tag = f"_cs{cluster_size}" if cluster_size > 1 else ""
+    run_name = f"n{n}_ps{panel_size}_k{k}{cs_tag}_{stamp}"
     output_dir = Path("/cache/iket") / run_name
 
     env = os.environ.copy()
@@ -730,6 +763,8 @@ def trace_panel(
         str(k),
         "--seed",
         str(seed),
+        "--cluster-size",
+        str(cluster_size),
         "--skip-expected",
     ]
 
@@ -790,6 +825,7 @@ def profile_nsys_pipeline(
     gpu_metrics: bool,
     gpu_metrics_frequency: int,
     seed: int,
+    cluster_size: int = 1,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Gate and profile one selected eigensolver stage."""
     from datetime import datetime, timezone
@@ -807,8 +843,9 @@ def profile_nsys_pipeline(
         if stage in ("backtransform-t", "backtransform")
         else ""
     )
+    cs_tag = f"_cs{cluster_size}" if cluster_size > 1 else ""
     run_name = (
-        f"b{batch}_n{n}_ps{panel_size}{bt_tag}_leaf{leaf_size}_"
+        f"b{batch}_n{n}_ps{panel_size}{cs_tag}{bt_tag}_leaf{leaf_size}_"
         f"{backend}_{stage}{metrics_tag}_{stamp}"
     )
     output_dir = Path("/cache/nsys") / run_name
@@ -841,6 +878,8 @@ def profile_nsys_pipeline(
         str(leaf_size),
         "--seed",
         str(seed),
+        "--cluster-size",
+        str(cluster_size),
         "--skip-expected",
     ]
     if stage == "backtransform-t":
@@ -986,6 +1025,12 @@ def main(
     official_output: str = "profiles/eigh_official",
     stages: str = "",
     min_ctas: str = "",
+    # Thread-block cluster width for the panel kernel. 0 = shape-based
+    # default (dispatch_cluster_size; the official path then behaves exactly
+    # like production). >0 forces that width everywhere it applies.
+    cluster_size: int = 0,
+    # Comma-separated cluster-width sweep for --tri (gates re-run per width).
+    clusters: str = "",
     trace: bool = False,
     trace_batch: int = 1,
     trace_output: str = "profiles/eigh_iket",
@@ -1023,6 +1068,13 @@ def main(
         raise SystemExit("--nsys-gpu-metrics-frequency must be in [10, 200000] Hz")
     if stat not in ("min", "mean", "median"):
         raise SystemExit(f"unknown stat: {stat}")
+    if not 0 <= cluster_size <= 16:
+        raise SystemExit("--cluster-size must be in [0, 16] (0 = shape default)")
+    cluster_list = [int(x) for x in clusters.split(",") if x.strip()]
+    if cluster_list and not tri:
+        raise SystemExit("--clusters sweeps are only supported with --tri")
+    if any(not 1 <= x <= 16 for x in cluster_list):
+        raise SystemExit("--clusters entries must be in [1, 16]")
     if official_eigh:
         if backend_list != ["cublas"]:
             raise SystemExit("--official-eigh requires --backends cublas")
@@ -1031,6 +1083,7 @@ def main(
             backtransform_block_size,
             leaf_size,
             "cublas",
+            cluster_size,
         )
         import json
         from pathlib import Path
@@ -1066,6 +1119,7 @@ def main(
             nsys_gpu_metrics,
             nsys_gpu_metrics_frequency,
             seed,
+            max(cluster_size, 1),
         )
 
         from pathlib import Path
@@ -1092,7 +1146,9 @@ def main(
         if trace_batch <= 0:
             raise SystemExit("--trace-batch must be positive")
         _, n = parsed_cases[0]
-        run_name, artifacts = trace_panel.remote(trace_batch, n, panel_size, k, seed)
+        run_name, artifacts = trace_panel.remote(
+            trace_batch, n, panel_size, k, seed, max(cluster_size, 1)
+        )
 
         from pathlib import Path
 
@@ -1127,4 +1183,6 @@ def main(
         tri_solve,
         stages,
         min_ctas,
+        max(cluster_size, 1),
+        clusters,
     )

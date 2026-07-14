@@ -30,6 +30,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Input RNG seed (default: 0).")
     parser.add_argument(
+        "--cluster-size",
+        type=int,
+        default=1,
+        help="Thread-block cluster width: CTAs cooperating per matrix (default: 1).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("profiles/eigh_iket"),
@@ -58,6 +64,8 @@ def _validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         parser.error("--batch must be positive")
     if args.k * args.panel_size + args.panel_size >= args.n:
         parser.error("k * panel_size + panel_size must be less than n")
+    if not 1 <= args.cluster_size <= 16:
+        parser.error("--cluster-size must be in [1, 16]")
 
 
 def _resolve_modal(path: Path) -> str:
@@ -80,7 +88,8 @@ def main() -> int:
 
     modal = _resolve_modal(args.modal)
     output_root = args.output.expanduser().resolve()
-    run_pattern = f"n{args.n}_ps{args.panel_size}_k{args.k}_*"
+    cs_tag = f"_cs{args.cluster_size}" if args.cluster_size > 1 else ""
+    run_pattern = f"n{args.n}_ps{args.panel_size}_k{args.k}{cs_tag}_*"
     before = set(output_root.glob(run_pattern)) if output_root.exists() else set()
 
     command = [
@@ -98,6 +107,8 @@ def main() -> int:
         str(args.k),
         "--seed",
         str(args.seed),
+        "--cluster-size",
+        str(args.cluster_size),
         "--trace-output",
         str(output_root),
     ]

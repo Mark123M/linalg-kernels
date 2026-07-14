@@ -29,6 +29,9 @@ from quack.bench.bench_utils import (  # noqa: E402
 # competition input is fp32, so the runner is fp32-only.
 DTYPE = torch.float32
 PANEL_SIZE = 1
+# Thread-block cluster width for the panel kernel (1 = single-CTA path;
+# >1 needs sm90+, so it is B200/Modal-only — the local RTX 4050 is sm89).
+CLUSTER_SIZE = 1
 BACKTRANSFORM_BLOCK_SIZE = 16
 DC_LEAF_SIZE = 32
 # Matvec cp.async prefetch depth K forwarded to tridiagonalize_; None -> eigh's
@@ -533,7 +536,10 @@ def check_tridiag_htev(data: torch.Tensor, backend: str) -> bool:
     work = data.clone()
     D, E = make_de(data)
     v_ws, w_ws = make_workspace(data)
-    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    eigh.tridiagonalize_(
+        work, D, E, v_ws, w_ws,
+        panel_size=PANEL_SIZE, backend=backend, cluster_size=CLUSTER_SIZE,
+    )
     D_tri, E_tri = D.clone(), E.clone()
     V, info = make_htev_outputs(D)
     eigh.htev_all_vectors_(D, E, V, info)
@@ -594,7 +600,10 @@ def check_tridiag_dc(data: torch.Tensor, backend: str) -> bool:
     work = data.clone()
     D, E = make_de(data)
     v_ws, w_ws = make_workspace(data)
-    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    eigh.tridiagonalize_(
+        work, D, E, v_ws, w_ws,
+        panel_size=PANEL_SIZE, backend=backend, cluster_size=CLUSTER_SIZE,
+    )
     D_tri, E_tri = D.clone(), E.clone()
     ws = eigh.dc_workspace(data.size(0), data.size(1), data.device, leaf_size=DC_LEAF_SIZE)
     Z = torch.zeros(data.size(0), data.size(1), data.size(1), device=data.device,
@@ -639,6 +648,9 @@ def factor_panel(
     # Work copy: the panel kernel persists reflectors into its input's lower
     # triangle, and callers (w-check mirror, rank2k gate) reread `data` after.
     work = data.clone()
+    btv = torch.empty(
+        data.size(0), eigh.MAX_CLUSTER_SIZE, device=data.device, dtype=torch.float32
+    )
     compiled(
         eigh._flat_cute_tensor(work),
         eigh._flat_cute_tensor(D),
@@ -646,6 +658,7 @@ def factor_panel(
         eigh._flat_cute_tensor(tau),
         eigh._flat_cute_tensor(v_ws),
         eigh._flat_cute_tensor(w_ws),
+        eigh._flat_cute_tensor(btv),
         k * PANEL_SIZE,
     )
     return D, E, v_ws, w_ws
@@ -751,6 +764,9 @@ def benchmark_panel_with_update(
     D, E = make_de(data)
     tau = torch.empty_like(E)
     v_ws, w_ws = make_workspace(data)
+    btv = torch.empty(
+        data.size(0), eigh.MAX_CLUSTER_SIZE, device=data.device, dtype=torch.float32
+    )
     # The public input must remain available to the eventual residual checker, so
     # combined timing includes the explicit source -> working-matrix copy.
     base_args = (data, data.clone())
@@ -768,6 +784,7 @@ def benchmark_panel_with_update(
             eigh._flat_cute_tensor(tau),
             eigh._flat_cute_tensor(v_ws),
             eigh._flat_cute_tensor(w_ws),
+            eigh._flat_cute_tensor(btv),
             k * PANEL_SIZE,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -820,6 +837,9 @@ def benchmark_direct(
     D, E = make_de(data)
     tau = torch.empty_like(E)
     v_ws, w_ws = make_workspace(data)
+    btv = torch.empty(
+        data.size(0), eigh.MAX_CLUSTER_SIZE, device=data.device, dtype=torch.float32
+    )
     base_args = (data,)
     base_kwargs = {}
     if n_sets == 0:
@@ -834,6 +854,7 @@ def benchmark_direct(
             eigh._flat_cute_tensor(tau),
             eigh._flat_cute_tensor(v_ws),
             eigh._flat_cute_tensor(w_ws),
+            eigh._flat_cute_tensor(btv),
             k * PANEL_SIZE,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -976,6 +997,7 @@ def validate_backtransform_t_factorization(
         w_ws,
         panel_size=PANEL_SIZE,
         backend=backend,
+        cluster_size=CLUSTER_SIZE,
         tau=tau,
     )
     torch.cuda.synchronize()
@@ -1180,6 +1202,7 @@ def prepare_backtransform_inputs(
         panel_size=PANEL_SIZE,
         backend=backend,
         queue_handle=queue_handle,
+        cluster_size=CLUSTER_SIZE,
         tau=tau,
     )
     dc_ws = eigh.dc_workspace(
@@ -1400,9 +1423,11 @@ def validate_full_eigh(
         backtransform_block_size=bt_size,
         leaf_size=leaf_size,
         backend=backend,
+        cluster_size=CLUSTER_SIZE,
     )
     eigh.full_eigh_out_(
-        data, Q, L, workspace, backend=backend, queue_handle=0
+        data, Q, L, workspace, backend=backend, queue_handle=0,
+        cluster_size=CLUSTER_SIZE,
     )
     torch.cuda.synchronize()
 
@@ -1431,6 +1456,7 @@ def validate_full_eigh(
                 workspace,
                 backend=backend,
                 queue_handle=torch.cuda.current_stream().cuda_stream,
+                cluster_size=CLUSTER_SIZE,
             )
         graph.replay()
         torch.cuda.synchronize()
@@ -1574,7 +1600,10 @@ def check_tridiag(data: torch.Tensor, backend: str) -> bool:
     work = data.clone()
     D, E = make_de(data)
     v_ws, w_ws = make_workspace(data)
-    eigh.tridiagonalize_(work, D, E, v_ws, w_ws, panel_size=PANEL_SIZE, backend=backend)
+    eigh.tridiagonalize_(
+        work, D, E, v_ws, w_ws,
+        panel_size=PANEL_SIZE, backend=backend, cluster_size=CLUSTER_SIZE,
+    )
     torch.cuda.synchronize()
     finite = bool(torch.isfinite(D).all().item() and torch.isfinite(E).all().item())
     D_ref, E_ref = torch_tridiag_reference(data, PANEL_SIZE)
@@ -1709,6 +1738,7 @@ def benchmark_tridiag(
             panel_size=PANEL_SIZE,
             backend=backend,
             queue_handle=torch.cuda.current_stream().cuda_stream,
+            cluster_size=CLUSTER_SIZE,
             **stage_kwargs,
         )
 
@@ -1819,6 +1849,7 @@ def benchmark_tridiag_htev(
             panel_size=PANEL_SIZE,
             backend=backend,
             queue_handle=queue_handle,
+            cluster_size=CLUSTER_SIZE,
         )
         eigh.htev_all_vectors_(
             values,
@@ -1939,6 +1970,7 @@ def benchmark_tridiag_dc(
             panel_size=PANEL_SIZE,
             backend=backend,
             queue_handle=queue_handle,
+            cluster_size=CLUSTER_SIZE,
         )
         eigh.tridiag_eig_dc_(
             values,
@@ -1992,6 +2024,7 @@ def benchmark_full_eigh(
         backtransform_block_size=bt_size,
         leaf_size=leaf_size,
         backend=backend,
+        cluster_size=CLUSTER_SIZE,
     )
     Q = torch.empty_like(data)
     L = torch.empty(batch, n, device=data.device, dtype=torch.float32)
@@ -2008,6 +2041,7 @@ def benchmark_full_eigh(
             workspace,
             backend=backend,
             queue_handle=torch.cuda.current_stream().cuda_stream,
+            cluster_size=CLUSTER_SIZE,
         )
 
     samples = [
@@ -2114,6 +2148,7 @@ def profile_backtransform_t_once(
         panel_size=PANEL_SIZE,
         backend=backend,
         queue_handle=queue_handle,
+        cluster_size=CLUSTER_SIZE,
         tau=tau,
     )
     eigh.warm_backtransform_t(
@@ -2247,6 +2282,7 @@ def profile_pipeline_once(
             backtransform_block_size=backtransform_block_size,
             leaf_size=DC_LEAF_SIZE,
             backend=backend,
+            cluster_size=CLUSTER_SIZE,
         )
         dc_ws = eigh.dc_workspace(
             data.size(0), data.size(1), data.device, leaf_size=DC_LEAF_SIZE
@@ -2284,6 +2320,7 @@ def profile_pipeline_once(
                 panel_size=PANEL_SIZE,
                 backend=backend,
                 queue_handle=queue_handle,
+                cluster_size=CLUSTER_SIZE,
                 tau=tau,
             )
 
@@ -2475,7 +2512,7 @@ def print_householder_reference(
 
 
 def main() -> None:
-    global PANEL_SIZE, DC_LEAF_SIZE
+    global PANEL_SIZE, DC_LEAF_SIZE, CLUSTER_SIZE
     parser = argparse.ArgumentParser(description="Local runner for eigh.py CuTeDSL skeleton.")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--n", type=int, default=512)
@@ -2492,6 +2529,14 @@ def main() -> None:
         default=PANEL_SIZE,
         help="Compile-time panel size (columns per panel) for both the kernel and "
         "the torch DLATRD-panel baseline.",
+    )
+    parser.add_argument(
+        "--cluster-size",
+        type=int,
+        default=CLUSTER_SIZE,
+        help="Thread-block cluster width for the panel kernel (CTAs cooperating "
+        "on one matrix). >1 needs sm90+ hardware, so it is rejected on the "
+        "local sm89 GPU — sweep it on B200 via the Modal launcher.",
     )
     parser.add_argument(
         "--update-backend",
@@ -2709,6 +2754,14 @@ def main() -> None:
     if not 1 <= args.panel_size <= eigh.MAX_PANEL_SIZE:
         parser.error(f"--panel-size must be in [1, {eigh.MAX_PANEL_SIZE}]")
     PANEL_SIZE = args.panel_size
+    if not 1 <= args.cluster_size <= eigh.MAX_CLUSTER_SIZE:
+        parser.error(f"--cluster-size must be in [1, {eigh.MAX_CLUSTER_SIZE}]")
+    if args.cluster_size > 1 and torch.cuda.get_device_capability() < (9, 0):
+        parser.error(
+            "--cluster-size > 1 needs an sm90+ GPU (thread-block clusters); "
+            "this device is pre-sm90 — run the sweep on B200 via Modal"
+        )
+    CLUSTER_SIZE = args.cluster_size
     if not 1 <= args.backtransform_block_size <= eigh.MAX_PANEL_SIZE:
         parser.error(
             f"--backtransform-block-size must be in [1, {eigh.MAX_PANEL_SIZE}]"
@@ -2837,6 +2890,7 @@ def main() -> None:
                 w_ws,
                 panel_size=PANEL_SIZE,
                 backend=backend,
+                cluster_size=CLUSTER_SIZE,
             )
             dc_samples, dc_sets = benchmark_dc(
                 D_input.clone(),
