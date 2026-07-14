@@ -232,17 +232,13 @@ def bench_official_eigh(
     import eigh_bench_local_rtx4050 as runner
     eigh = runner.eigh
 
-    if (panel_size, backtransform_block_size, leaf_size, backend) != (
-        16,
-        16,
-        32,
-        "cublas",
-    ):
+    if (backtransform_block_size, leaf_size, backend) != (16, 32, "cublas"):
         raise ValueError(
             "the official custom_kernel comparison requires "
-            "panel_size=16, backtransform_block_size=16, leaf_size=32, "
-            "backend=cublas"
+            "backtransform_block_size=16, leaf_size=32, backend=cublas"
         )
+    # panel_size is ignored here: custom_kernel resolves it per shape via
+    # eigh.dispatch_panel_size (production behavior under test).
 
     # 0 keeps custom_kernel's shape-based dispatch (production behavior);
     # >0 forces one width for every case via the env override it honors.
@@ -420,7 +416,7 @@ def bench_official_eigh(
         "source": "gpu-mode/reference-kernels problems/linalg/eigh_py",
         "timing_contract": "popcorn leaderboard",
         "configuration": {
-            "panel_size": panel_size,
+            "panel_size": "shape-default",
             "backtransform_block_size": backtransform_block_size,
             "leaf_size": leaf_size,
             "backend": backend,

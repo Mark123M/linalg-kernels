@@ -337,11 +337,29 @@ def dispatch_cluster_size(batch: int, n: int, device) -> int:
         cluster_size = int(env)
     elif n >= 2048:
         cluster_size = MAX_CLUSTER_SIZE
+    elif n >= 1024:
+        cluster_size = 4
     else:
         cluster_size = 1
     if cluster_size > 1 and not _device_supports_clusters(device):
         return 1
     return cluster_size
+
+
+def dispatch_panel_size(batch: int, n: int) -> int:
+    """Shape-based tridiagonalization panel size for the production path.
+
+    B200 sweeps at cs>1 (2026-07-14): 8x2048 cs=16 minimizes at ps=8
+    (73.9 ms vs 77.1 at ps=16, 82.7 at ps=4); 60x1024 cs=4 also prefers
+    ps=8 (45.1 ms). Occupancy-bound cs=1 shapes keep ps=16 (640x512 sweep).
+    The EIGH_PANEL_SIZE env var overrides for sweeps.
+    """
+    env = os.environ.get("EIGH_PANEL_SIZE")
+    if env:
+        return int(env)
+    if n >= 1024:
+        return 8
+    return 16
 
 
 @cute.jit
@@ -4203,20 +4221,20 @@ def full_eigh_out_(
     )
 
 
-_CUSTOM_PANEL_SIZE = 16
 _CUSTOM_BACKTRANSFORM_BLOCK_SIZE = 16
 _CUSTOM_LEAF_SIZE = 32
 _FULL_EIGH_WORKSPACE_CACHE: dict[tuple[Any, ...], FullEighWorkspace] = {}
 
 
 def _custom_workspace(data: torch.Tensor) -> FullEighWorkspace:
+    panel_size = dispatch_panel_size(data.size(0), data.size(1))
     key = (
         data.device.type,
         data.device.index,
         data.size(0),
         data.size(1),
         data.dtype,
-        _CUSTOM_PANEL_SIZE,
+        panel_size,
         _CUSTOM_BACKTRANSFORM_BLOCK_SIZE,
         _CUSTOM_LEAF_SIZE,
     )
@@ -4226,7 +4244,7 @@ def _custom_workspace(data: torch.Tensor) -> FullEighWorkspace:
             data.size(0),
             data.size(1),
             data.device,
-            panel_size=_CUSTOM_PANEL_SIZE,
+            panel_size=panel_size,
             backtransform_block_size=_CUSTOM_BACKTRANSFORM_BLOCK_SIZE,
             leaf_size=_CUSTOM_LEAF_SIZE,
         )
