@@ -632,12 +632,22 @@ def factor_panel(
     compiled = eigh.Eigh.compile(
         data_dtype,
         data.size(1),
+        batch=data.size(0),
         debug_printf=debug_printf,
         panel_size=PANEL_SIZE,
     )
     # Work copy: the panel kernel persists reflectors into its input's lower
     # triangle, and callers (w-check mirror, rank2k gate) reread `data` after.
-    compiled(data.clone(), D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
+    work = data.clone()
+    compiled(
+        eigh._flat_cute_tensor(work),
+        eigh._flat_cute_tensor(D),
+        eigh._flat_cute_tensor(E),
+        eigh._flat_cute_tensor(tau),
+        eigh._flat_cute_tensor(v_ws),
+        eigh._flat_cute_tensor(w_ws),
+        k * PANEL_SIZE,
+    )
     return D, E, v_ws, w_ws
 
 
@@ -732,8 +742,10 @@ def benchmark_panel_with_update(
     compiled = eigh.Eigh.compile(
         data_dtype,
         data.size(1),
+        batch=data.size(0),
         debug_printf=False,
         panel_size=PANEL_SIZE,
+        explicit_queue=True,
     )
     eigh.warm_rank2k_backend(PANEL_SIZE, backend)
     D, E = make_de(data)
@@ -749,7 +761,16 @@ def benchmark_panel_with_update(
 
     def launch(source: torch.Tensor, work: torch.Tensor) -> None:
         work.copy_(source)
-        compiled(work, D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
+        compiled(
+            eigh._flat_cute_tensor(work),
+            eigh._flat_cute_tensor(D),
+            eigh._flat_cute_tensor(E),
+            eigh._flat_cute_tensor(tau),
+            eigh._flat_cute_tensor(v_ws),
+            eigh._flat_cute_tensor(w_ws),
+            k * PANEL_SIZE,
+            torch.cuda.current_stream().cuda_stream,
+        )
         # Capture-time current stream: see benchmark_rank2k.
         eigh.rank2k_update_(
             work,
@@ -787,8 +808,10 @@ def benchmark_direct(
     compiled = eigh.Eigh.compile(
         data_dtype,
         data.size(1),
+        batch=data.size(0),
         debug_printf=False,
         panel_size=PANEL_SIZE,
+        explicit_queue=True,
     )
     # Rotate only the input matrices: D/E and the V/W workspace are fully
     # rewritten in their valid regions every call, and the torch baseline's
@@ -804,7 +827,16 @@ def benchmark_direct(
     arg_sets, kwarg_sets = _clone_l2_rotate_inputs(base_args, base_kwargs, n_sets)
 
     def launch(bench_data: torch.Tensor) -> None:
-        compiled(bench_data, D, E, tau, v_ws, w_ws, k * PANEL_SIZE)
+        compiled(
+            eigh._flat_cute_tensor(bench_data),
+            eigh._flat_cute_tensor(D),
+            eigh._flat_cute_tensor(E),
+            eigh._flat_cute_tensor(tau),
+            eigh._flat_cute_tensor(v_ws),
+            eigh._flat_cute_tensor(w_ws),
+            k * PANEL_SIZE,
+            torch.cuda.current_stream().cuda_stream,
+        )
 
     samples = [
         _bench_cuda_graph_l2_rotate(
@@ -1045,7 +1077,9 @@ def validate_backtransform_t_factorization(
     graph_ok = True
     if spans:
         panel_start, panel_width = spans[0]
-        eigh.warm_backtransform_t(data.size(1), backtransform_block_size)
+        eigh.warm_backtransform_t(
+            data.size(1), backtransform_block_size, batch=data.size(0)
+        )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             eigh.form_backtransform_t_(
@@ -1054,6 +1088,7 @@ def validate_backtransform_t_factorization(
                 T,
                 panel_start=panel_start,
                 panel_width=panel_width,
+                queue_handle=torch.cuda.current_stream().cuda_stream,
             )
         graph.replay()
         torch.cuda.synchronize()
@@ -1191,7 +1226,9 @@ def validate_backtransform(
         device=data.device,
         dtype=torch.float32,
     )
-    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+    eigh.warm_backtransform(
+        data.size(1), backtransform_block_size, batch=data.size(0)
+    )
     eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
     torch.cuda.synchronize()
 
@@ -1224,7 +1261,14 @@ def validate_backtransform(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             Z.copy_(Z_tri)
-            eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+            eigh.backtransform_eigenvectors_(
+                work,
+                tau,
+                Z,
+                T,
+                dc_ws,
+                queue_handle=torch.cuda.current_stream().cuda_stream,
+            )
         graph.replay()
         torch.cuda.synchronize()
         graph_result = Z.clone()
@@ -1351,14 +1395,14 @@ def validate_full_eigh(
     source_before = data.clone()
     eigh.warm_full_eigh(
         n,
+        batch=batch,
         panel_size=panel_size,
         backtransform_block_size=bt_size,
         leaf_size=leaf_size,
         backend=backend,
     )
-    queue_handle = torch.cuda.current_stream().cuda_stream
     eigh.full_eigh_out_(
-        data, Q, L, workspace, backend=backend, queue_handle=queue_handle
+        data, Q, L, workspace, backend=backend, queue_handle=0
     )
     torch.cuda.synchronize()
 
@@ -1943,6 +1987,7 @@ def benchmark_full_eigh(
     )
     eigh.warm_full_eigh(
         n,
+        batch=batch,
         panel_size=panel_size,
         backtransform_block_size=bt_size,
         leaf_size=leaf_size,
@@ -1997,7 +2042,9 @@ def benchmark_backtransform(
         device=data.device,
         dtype=torch.float32,
     )
-    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+    eigh.warm_backtransform(
+        data.size(1), backtransform_block_size, batch=data.size(0)
+    )
     base_args = (work, tau, Z)
     base_kwargs = {}
     if n_sets == 0:
@@ -2012,7 +2059,12 @@ def benchmark_backtransform(
         vectors: torch.Tensor,
     ) -> None:
         eigh.backtransform_eigenvectors_(
-            reflectors, reflector_tau, vectors, T, dc_ws
+            reflectors,
+            reflector_tau,
+            vectors,
+            T,
+            dc_ws,
+            queue_handle=torch.cuda.current_stream().cuda_stream,
         )
 
     samples = [
@@ -2064,7 +2116,9 @@ def profile_backtransform_t_once(
         queue_handle=queue_handle,
         tau=tau,
     )
-    eigh.warm_backtransform_t(data.size(1), backtransform_block_size)
+    eigh.warm_backtransform_t(
+        data.size(1), backtransform_block_size, batch=data.size(0)
+    )
 
     def launch(*, annotate: bool) -> None:
         from contextlib import nullcontext
@@ -2081,6 +2135,7 @@ def profile_backtransform_t_once(
                     T,
                     panel_start=panel_start,
                     panel_width=panel_width,
+                    queue_handle=queue_handle,
                 )
 
     # Compile, execute, and validate outside the profiler range.
@@ -2119,9 +2174,14 @@ def profile_backtransform_once(
         device=data.device,
         dtype=torch.float32,
     )
-    eigh.warm_backtransform(data.size(1), backtransform_block_size)
+    eigh.warm_backtransform(
+        data.size(1), backtransform_block_size, batch=data.size(0)
+    )
+    queue_handle = torch.cuda.current_stream().cuda_stream
 
-    eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+    eigh.backtransform_eigenvectors_(
+        work, tau, Z, T, dc_ws, queue_handle=queue_handle
+    )
     torch.cuda.synchronize()
     if not bool(torch.isfinite(Z).all().item()):
         raise RuntimeError("backtransform warmup produced non-finite eigenvectors")
@@ -2133,7 +2193,9 @@ def profile_backtransform_once(
     try:
         eigh.BT_NVTX = True
         with torch.cuda.nvtx.range("backtransform_sweep"):
-            eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+            eigh.backtransform_eigenvectors_(
+                work, tau, Z, T, dc_ws, queue_handle=queue_handle
+            )
             torch.cuda.synchronize()
     finally:
         eigh.BT_NVTX = False
@@ -2180,6 +2242,7 @@ def profile_pipeline_once(
     if stage == "full":
         eigh.warm_full_eigh(
             data.size(1),
+            batch=data.size(0),
             panel_size=PANEL_SIZE,
             backtransform_block_size=backtransform_block_size,
             leaf_size=DC_LEAF_SIZE,
@@ -2239,7 +2302,9 @@ def profile_pipeline_once(
             eigh.BT_NVTX = annotate
             try:
                 with torch.cuda.nvtx.range("backtransform") if annotate else nullcontext():
-                    eigh.backtransform_eigenvectors_(work, tau, Z, T, dc_ws)
+                    eigh.backtransform_eigenvectors_(
+                        work, tau, Z, T, dc_ws, queue_handle=queue_handle
+                    )
             finally:
                 eigh.BT_NVTX = False
 
