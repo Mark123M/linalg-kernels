@@ -1,5 +1,5 @@
 import torch
-
+import triton
 from task import input_t, output_t
 
 

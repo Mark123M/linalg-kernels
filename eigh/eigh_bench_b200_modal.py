@@ -229,7 +229,7 @@ def bench_official_eigh(
     ):
         sys.modules.setdefault(name, mod)
 
-    import eigh_bench_local_rtx4050 as runner
+    import eigh.eigh_bench_local_rtx4050 as runner
     eigh = runner.eigh
 
     if (backtransform_block_size, leaf_size, backend) != (16, 32, "cublas"):
@@ -464,7 +464,7 @@ def bench_small_heev_variant(nt: int, fill: str, repeats: int) -> dict:
     ):
         sys.modules.setdefault(name, mod)
 
-    import eigh_bench_local_rtx4050 as runner
+    import eigh.eigh_bench_local_rtx4050 as runner
 
     _report_env("start")
     if not runner.check_small_heev_20x32():
@@ -534,7 +534,7 @@ def bench(
     ):
         sys.modules.setdefault(name, mod)
 
-    import eigh_bench_local_rtx4050 as runner
+    import eigh.eigh_bench_local_rtx4050 as runner
 
     _report_env("start")
     device = torch.device("cuda")

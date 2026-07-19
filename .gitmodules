@@ -1,12 +1,1 @@
-[submodule "quack"]
-	path = quack
-	url = https://github.com/Dao-AILab/quack.git
-[submodule "magma"]
-	path = magma
-	url = https://github.com/icl-utk-edu/magma.git
-[submodule "popcorn-cli"]
-	path = popcorn-cli
-	url = https://github.com/gpu-mode/popcorn-cli.git
-[submodule "lapack"]
-	path = lapack
-	url = https://github.com/Reference-LAPACK/lapack.git
+

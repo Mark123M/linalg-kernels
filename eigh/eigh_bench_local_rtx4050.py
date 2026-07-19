@@ -17,7 +17,7 @@ task.input_t = torch.Tensor
 task.output_t = object
 sys.modules.setdefault("task", task)
 
-import eigh  # noqa: E402
+import eigh.eigh as eigh  # noqa: E402
 from quack.bench.bench_utils import (  # noqa: E402
     _bench_cuda_graph_l2_rotate,
     _clone_l2_rotate_inputs,
