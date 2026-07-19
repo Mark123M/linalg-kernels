@@ -22,11 +22,13 @@ Build an efficient batched dense Cholesky factorization algorithm for the B200 G
 - Keep unrelated user changes intact. In particular, do not modify `probe_submission.py`, vendored/reference trees, or untracked files unless the user places them in scope.
 
 ## References
-- lapack/ directory contains the golden correctness references
-- quack/ directory has the most efficient CuTeDSL kernel examples
-- cutlass/ directory also has efficient kernel examples
-- magma/ directory has linalg algorithm examples
-- popcorn-cli contains the full evaluation infrastructure, **DO NOT CHEAT**.
+- lapack/ directory contains linalg algorithm correctness references
+- magma/ directory contains efficient linalg algorithm examples
+- CUDALibrarySamples/ directory contains examples using GPU-accelerated libraries. I'm particularly interested in device extensions under CUDALibrarySamples/MathDx
+- cccl/cub/ directory contains efficient parallel computing primitives
+- cuda-samples/ directory contains general kernel examples
+- cutlass/ directory contains efficient kernel examples
+- popcorn-cli/ contains the full evaluation infrastructure, **DO NOT CHEAT**
 
 ## Problem Description
 Implement batched dense Cholesky factorization.
