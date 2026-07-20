@@ -36,7 +36,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 10
+VARIANT_COUNT = 34
 VARIANT_NAMES = (
     "w1_precise",
     "w1_refined",
@@ -48,6 +48,30 @@ VARIANT_NAMES = (
     "w8_refined",
     "w16_precise",
     "w16_refined",
+    "w2_refined_relaxed",
+    "w2_refined_tail2",
+    "w2_refined_tail4",
+    "w2_refined_tail6",
+    "w2_refined_tail8",
+    "w2_raw",
+    "w2_raw_tail2",
+    "w2_raw_tail4",
+    "w2_raw_tail6",
+    "w2_raw_tail8",
+    "w2_raw_ptx_lead1",
+    "w2_raw_ptx_lead2",
+    "w2_raw_acc2",
+    "w2_raw_acc4",
+    "w2_raw_look2",
+    "w2_raw_acc2_look2",
+    "w2_raw_acc4_look2",
+    "w2_raw_right",
+    "w2_raw_right_rootlook",
+    "w2_raw_sw16_left",
+    "w2_raw_sw16_right",
+    "w2_raw_sw16_right_rootlook",
+    "w2_raw_sw8_left",
+    "w2_raw_sw8_right",
 )
 LOCAL_SOLUTION = "cholesky/b4096n32/cholesky_b4096n32.py"
 LOCAL_SCRIPT = "cholesky/b4096n32/cholesky_b4096n32_modal.py"
@@ -248,12 +272,22 @@ def _resource_rows(solution) -> list[dict[str, Any]]:
         "variant",
         "warps_per_cta",
         "refined_root",
+        "raw_root",
         "threads_per_cta",
         "registers_per_thread",
         "local_bytes_per_thread",
         "static_shared_bytes_per_cta",
         "active_ctas_per_sm",
         "resident_warps_per_sm",
+        "tail_prefetch",
+        "launch_min_ctas_per_sm",
+        "ptx_prefetch_lead",
+        "dot_accumulators",
+        "shuffle_lookahead",
+        "right_looking",
+        "root_lookahead",
+        "subwarp_width",
+        "matrices_per_warp",
     )
     values = solution._variant_metadata().tolist()
     return [dict(zip(columns, row, strict=True)) for row in values]
@@ -389,14 +423,21 @@ def _worker_profile(variant: int, calls: int) -> None:
     torch.cuda.cudart().cudaProfilerStop()
 
 
-# NCU selects the profiled launch itself: --kernel-name matches the function
-# name base that every variant of the template shares, and --launch-skip counts
-# only launches matching that filter, so the warmup below is discarded without
-# the worker having to partition it. The timing worker's eight-tensor ring has
-# no purpose here because kernel replay flushes every cache between passes, so
-# one pair of buffers is enough.
-NCU_KERNEL_NAME = "crout_32_kernel"
+# NCU selects the profiled launch itself. The variant-to-kernel mapping below
+# chooses the function-name base for the original, subdivision-left, or
+# right-looking family; --launch-skip then counts only matching launches, so
+# the warmup is discarded without the worker having to partition it. The
+# timing worker's eight-tensor ring has no purpose here because kernel replay
+# flushes every cache between passes, so one pair of buffers is enough.
 NCU_WARMUP_LAUNCHES = 16
+
+
+def _ncu_kernel_name(variant: int) -> str:
+    if variant in (29, 32):
+        return "subwarp_left_32_kernel"
+    if variant >= 27:
+        return "right_looking_32_kernel"
+    return "crout_32_kernel"
 
 
 def _worker_ncu(variant: int) -> None:
@@ -517,6 +558,8 @@ NCU_SECTIONS = (
     "SchedulerStats",
     "SourceCounters",
     "SpeedOfLight",
+    "SpeedOfLight_RooflineChart",
+    "SpeedOfLight_HierarchicalSingleRooflineChart",
     "WarpStateStats",
 )
 
@@ -563,7 +606,7 @@ def ncu_remote(variant: int, run_name: str) -> list[str]:
         "--cache-control",
         "all",
         "--kernel-name",
-        NCU_KERNEL_NAME,
+        _ncu_kernel_name(variant),
         "--launch-skip",
         str(NCU_WARMUP_LAUNCHES),
         "--launch-count",
@@ -755,7 +798,7 @@ def _parse_public_score(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _run_popcorn_sweep(output_root: Path) -> None:
+def _run_popcorn_sweep(output_root: Path, variants: list[int]) -> None:
     source_path = _repo_root() / LOCAL_SOLUTION
     source = source_path.read_text()
     run_dir = output_root / f"popcorn_{_timestamp()}"
@@ -797,7 +840,7 @@ def _run_popcorn_sweep(output_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="chol_b4096n32_") as temporary:
         temporary_dir = Path(temporary)
         jobs: list[tuple[int, Path, Path]] = []
-        for variant in range(VARIANT_COUNT):
+        for variant in variants:
             submission_path = temporary_dir / f"cholesky_b4096n32_v{variant}.py"
             submission_path.write_text(_variant_source(source, variant))
             result_path = run_dir / f"v{variant}_{VARIANT_NAMES[variant]}.result.txt"
@@ -833,7 +876,8 @@ def _run_popcorn_sweep(output_root: Path) -> None:
     )
     summary = {
         "timestamp_utc": _timestamp(),
-        "policy": "all ten variants concurrently submitted through Popcorn leaderboard mode",
+        "policy": "selected variants concurrently submitted through Popcorn leaderboard mode",
+        "requested_variants": variants,
         "submissions": rows,
         "ranking": ranked,
         "winner": ranked[0] if ranked else None,
@@ -875,9 +919,14 @@ def main(
         )
         _write_json(output_path, payload)
         print(f"tuning JSON: {output_path}")
-        best = payload["timings"][0]
+        passing = [
+            row for row in payload["timings"] if row["modal_validation_passed"]
+        ]
+        if not passing:
+            raise RuntimeError("no variant passed the Modal correctness gate")
+        best = passing[0]
         print(
-            f"Modal winner: variant {best['variant']} ({best['name']}), "
+            f"Modal passing winner: variant {best['variant']} ({best['name']}), "
             f"median={best['median_ms']:.6f} ms"
         )
         return
@@ -897,10 +946,8 @@ def main(
         return
 
     if action == "popcorn":
-        if variants.strip():
-            raise ValueError("Popcorn policy requires all ten variants; omit --variants")
         output_root = Path(output) if output else default_artifacts
-        _run_popcorn_sweep(output_root)
+        _run_popcorn_sweep(output_root, selected)
         return
 
     raise ValueError("action must be one of: tune, profile, ncu, popcorn")

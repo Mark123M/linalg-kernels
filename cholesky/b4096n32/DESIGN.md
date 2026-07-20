@@ -3,11 +3,12 @@
 ## Status
 
 - Raw CUDA Cholesky--Crout extension implemented.
-- Ten B200 launch/math variants implemented.
+- Thirty-four B200 launch/math/prefetch/shuffle/algorithm variants implemented.
 - Modal correctness, timing, resource, Nsight Systems, and targeted Nsight
   Compute tooling implemented.
 - Popcorn leaderboard sweep implemented but not run by the assistant.
-- Production variant 3 was selected by the full Popcorn leaderboard sweep.
+- Production variant 3 was selected by the original full Popcorn leaderboard
+  sweep and remains the default while variants 10--33 are evaluated.
 
 ## Correctness reference
 
@@ -52,8 +53,8 @@ https://docs.nvidia.com/cuda/blackwell-tuning-guide/
 Variant IDs are stable because temporary Popcorn submissions replace only the
 production ID constant.
 
-| ID | Warps/CTA | Root and reciprocal |
-|---:|----------:|---------------------|
+| ID | Warps/CTA | Configuration |
+|---:|----------:|---------------|
 | 0 | 1 | round-to-nearest sqrt/divide |
 | 1 | 1 | approximate reciprocal sqrt + one Newton step |
 | 2 | 2 | round-to-nearest sqrt/divide |
@@ -64,10 +65,104 @@ production ID constant.
 | 7 | 8 | approximate reciprocal sqrt + one Newton step |
 | 8 | 16 | round-to-nearest sqrt/divide |
 | 9 | 16 | approximate reciprocal sqrt + one Newton step |
+| 10 | 2 | Newton-refined reciprocal sqrt, relaxed launch bound control |
+| 11 | 2 | Newton-refined reciprocal sqrt, prefetch final 2 columns |
+| 12 | 2 | Newton-refined reciprocal sqrt, prefetch final 4 columns |
+| 13 | 2 | Newton-refined reciprocal sqrt, prefetch final 6 columns |
+| 14 | 2 | Newton-refined reciprocal sqrt, prefetch final 8 columns |
+| 15 | 2 | unrefined reciprocal sqrt |
+| 16 | 2 | unrefined reciprocal sqrt, prefetch final 2 columns |
+| 17 | 2 | unrefined reciprocal sqrt, prefetch final 4 columns |
+| 18 | 2 | unrefined reciprocal sqrt, prefetch final 6 columns |
+| 19 | 2 | unrefined reciprocal sqrt, prefetch final 8 columns |
+| 20 | 2 | unrefined reciprocal sqrt, inline-PTX columns 26--31 one iteration ahead |
+| 21 | 2 | unrefined reciprocal sqrt, inline-PTX columns 26--31 two iterations ahead |
+| 22 | 2 | unrefined reciprocal sqrt, two dot-product accumulators |
+| 23 | 2 | unrefined reciprocal sqrt, four dot-product accumulators |
+| 24 | 2 | unrefined reciprocal sqrt, one accumulator, two-shuffle lookahead |
+| 25 | 2 | unrefined reciprocal sqrt, two accumulators, two-shuffle lookahead |
+| 26 | 2 | unrefined reciprocal sqrt, four accumulators, two-shuffle lookahead |
+| 27 | 2 | unrefined reciprocal sqrt, one-matrix right-looking outer product |
+| 28 | 2 | variant 27 with next-diagonal root lookahead |
+| 29 | 2 | left-looking, two matrices per warp in width-16 subdivisions |
+| 30 | 2 | right-looking, two matrices per warp in width-16 subdivisions |
+| 31 | 2 | variant 30 with next-diagonal root lookahead |
+| 32 | 2 | left-looking, four matrices per warp in width-8 subdivisions |
+| 33 | 2 | right-looking, four matrices per warp in width-8 subdivisions |
 
-Variant 3 is the production choice. The compiler uses `-O3`, fast global math,
-explicit vectorization, FMA contraction, and `sm_100a`; precise variants call
-explicit round-to-nearest intrinsics so they remain the numerical control group.
+Variant 3 remains the production choice until the expanded sweep completes.
+The compiler uses `-O3`, fast global math, explicit vectorization, FMA
+contraction, and `sm_100a`; precise variants call explicit round-to-nearest
+intrinsics so they remain the numerical control group.
+
+The NCU capture of variant 3 localized 80% of sampled not-issued
+long-scoreboard stalls to the first dependent operations for columns 27--30.
+Variants 11--14 keep selected final-column inputs live from kernel entry. They
+use explicit scalar registers plus a zero-instruction dependency point intended
+to preserve scalar form through CUDA front-end lowering. Final scheduling is a
+ptxas decision, so acceptance requires SASS to show that the selected LDGs
+actually moved ahead of factorization rather than back beside their consumers.
+
+All new variants are specialized to the winning two-warp CTA mapping. Their
+launch bound requires 14 CTAs/SM instead of 16. At 148 SMs, 14 resident CTAs
+per SM provide 2,072 slots for the 2,048-block grid, so allocations through
+roughly 72 registers/thread can still admit the entire workload in one wave.
+This deliberately trades unused theoretical occupancy for input-load
+lookahead. Runtime metadata must show zero local-memory allocation before a
+prefetch variant is accepted.
+
+Variant 10 is the no-prefetch control for the relaxed launch bound. Variants
+15--19 remove the Newton correction after `rsqrtf`. This deletes the correction
+dependency chain at every pivot, but its numerical accuracy is not assumed:
+Modal validation and the complete Popcorn checker remain mandatory.
+
+Variants 20 and 21 retain the raw-root control while replacing the ineffective
+entry-prefetch marker with explicit `ld.volatile.global.f32` inline PTX. Only
+columns 26--31 are loaded, either one or two full Cholesky iterations before
+their consumers. The compiler memory clobber prevents deletion and ordinary
+load folding, while the bounded lead limits register lifetimes. Acceptance
+still requires SASS to show the six LDGs at the intended lead distance; inline
+PTX makes the loads observable but ptxas remains responsible for scheduling.
+
+Variants 22--26 target the fixed 527-shuffle communication path without
+changing matrix ownership. Two- and four-accumulator variants split the serial
+dot-product FMA dependency chain, then combine the partial accumulators with a
+fixed reduction. Lookahead variants issue two independent pivot broadcasts
+before consuming either value. This keeps the shuffle count unchanged but gives
+ptxas independent FMA work with which to overlap shuffle-result latency. The
+changed FP32 summation order requires the full correctness gate, and register
+metadata plus local-memory allocation determine whether the additional live
+values are viable.
+
+Variants 27--33 change the factorization schedule or the physical warp mapping.
+The right-looking kernel keeps all 32 input residuals in the same register
+array that eventually holds the factor. After normalizing column `k`, it
+applies that column's outer product to all trailing residual columns. Each
+matrix still executes 496 FFMAs and 527 shuffles, and each individual residual
+receives its terms in increasing `k` order, but consecutive FFMAs target
+different registers instead of one serial dot-product accumulator. Variant 28
+updates column `k+1` first and issues its reciprocal square root before the
+remaining column-`k` updates; the eventual SASS, rather than source order, must
+confirm whether the root remains ahead of its consumer.
+
+The subdivision kernels exploit the `width` operand of warp shuffle. Width 16
+splits one physical warp into two independent matrices with two rows per
+thread; width 8 splits it into four matrices with four rows per thread. One
+hardware shuffle therefore carries two or four unrelated pivots, while each
+thread issues two or four row FFMAs. Relative to the raw one-matrix control,
+the expected full-workload shuffle totals are 2,158,592 at width 32, 1,079,296
+at width 16, and 539,648 at width 8. The tradeoff is fewer physical scheduler
+contexts and roughly two or four times as many persistent row registers per
+thread. Width-16 launches require seven CTAs/SM for one finite-grid wave;
+width-8 launches require four. Zero local-memory allocation is mandatory for
+accepting either mapping.
+
+The algorithm sweep deliberately excludes a row-wise Banachiewicz kernel. With
+row ownership it would remove the 31 inverse broadcasts, but would replace 31
+warp-wide column-normalization instructions with 496 mostly single-lane
+normalizations. Warp-reduction dot products would require roughly five
+shuffles per scalar output. Both mappings are structurally worse for the
+measured MIO/eligibility bottleneck than the right-looking loop interchange.
 
 The native extension explicitly uses C++20, matching the PyTorch 2.12 extension
 ABI on both Modal and the Popcorn evaluator. An earlier C++17 override compiled
@@ -87,10 +182,11 @@ The exact `(4096,32,32)` shape uses the custom extension. Every other shape
 uses `torch.linalg.cholesky_ex(..., check_errors=False).L`. Consequently all
 non-target leaderboard timings are held constant across temporary submissions.
 
-The Popcorn action launches all ten independent leaderboard submissions
-concurrently so Popcorn can queue them across its workers. It records each
-process's raw command output, parses the public B200 geomean, and emits a ranked
-JSON summary. It does not rewrite the tracked specialization. After the results
+The Popcorn action launches the variants selected by `--variants` concurrently
+so Popcorn can queue them across its workers; omitting the option selects all
+thirty-four. It records each process's raw command output, parses the public B200
+geomean, and emits a ranked JSON summary. It does not rewrite the tracked
+specialization. After the results
 are reviewed, update the production ID above and record the score here.
 
 Nsight Systems profiling retains the forward-compatible `.nsys-rep` plus small
@@ -104,9 +200,12 @@ one input/output pair in a plain loop and lets the profiler choose the launch:
 `--launch-skip` counts only matching launches, so the warmup is discarded by
 NCU rather than partitioned by hand. The timing worker's eight-tensor ring is
 pointless under kernel replay, which flushes the caches between passes anyway.
-The selected sections cover compute and memory throughput,
-occupancy, scheduler behavior, warp stalls, instruction mix, and source/SASS
-counters without paying for the indiscriminate `full` section set. Each run
+The selected sections cover compute and memory throughput, the overview and
+hierarchical single-precision rooflines, occupancy, scheduler behavior, warp
+stalls, instruction mix, and source/SASS counters without paying for the
+indiscriminate `full` section set. The hierarchical roofline distinguishes the
+L1, L2, and device-memory ceilings; the standard Speed-of-Light percentages
+remain available for comparison with earlier captures. Each run
 downloads Popcorn-compatible `ncu-details.txt`, `ncu-details.csv`, and
 `profile.ncu-rep` artifacts, plus preflight and profiler diagnostics. NCU uses
 kernel replay with cache flushing so every replay pass begins from a consistent
@@ -118,6 +217,9 @@ subprocess runs with `TMPDIR` redirected to container
 storage because its tree launcher creates FIFOs there and the Modal volume at
 `/cache` does not support them. Artifact naming follows
 `popcorn-cli/docs/profiling.md`.
+`artifacts/helpers/ncu/roofline_summary.py` extracts the overview and
+hierarchical FP32 roofline values from a run directory or individual report and
+can emit either a compact table or JSON.
 
 | Date | Selected ID | Public B200 geomean | Notes |
 |------|------------:|---------------------:|-------|
@@ -154,13 +256,37 @@ rg -n 'stream' cholesky/b4096n32/cholesky_b4096n32.py
 .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
   --action ncu --variants 2,3
 
+# Profile the relaxed-bound control and both new candidate families.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 10,11,12,13,14,15,16,17,18,19
+
+# Confirm placement and stalls for the raw-root control and bounded PTX loads.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 15,20,21
+
+# Compare accumulator counts and explicit two-shuffle lookahead.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 15,22,23,24,25,26
+
 # Check the provisional production route against the official tests.
 popcorn submit --no-tui --leaderboard cholesky --gpu B200 --mode test \
   cholesky/b4096n32/cholesky_b4096n32.py
 
-# Concurrently submit all ten variants, parse their public geomeans, and rank them.
+# Concurrently submit all thirty-four variants, parse their public geomeans, and rank them.
 .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
   --action popcorn
+
+# Or submit only an explicit subset.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action popcorn --variants 3,15,20,21,22,23,24,25,26
+
+# Isolate the raw left-looking control and the algorithm/subdivision sweep.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action popcorn --variants 15,27,28,29,30,31,32,33
+
+# Capture the high-signal occupancy, shuffle, and scoreboard metrics for the sweep.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 15,27,28,29,30,31,32,33
 ```
 
 The requested feedback after `--action tune` is its JSON output plus all ptxas
