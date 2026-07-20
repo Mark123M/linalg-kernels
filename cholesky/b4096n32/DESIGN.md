@@ -4,7 +4,8 @@
 
 - Raw CUDA Cholesky--Crout extension implemented.
 - Ten B200 launch/math variants implemented.
-- Modal correctness, timing, resource, and Nsight Systems tooling implemented.
+- Modal correctness, timing, resource, Nsight Systems, and targeted Nsight
+  Compute tooling implemented.
 - Popcorn leaderboard sweep implemented but not run by the assistant.
 - Production variant 3 was selected by the full Popcorn leaderboard sweep.
 
@@ -92,6 +93,32 @@ process's raw command output, parses the public B200 geomean, and emits a ranked
 JSON summary. It does not rewrite the tracked specialization. After the results
 are reviewed, update the production ID above and record the score here.
 
+Nsight Systems profiling retains the forward-compatible `.nsys-rep` plus small
+text/JSON summaries. `nsys stats` receives a temporary SQLite export under
+`/tmp`; that database is deleted before the Modal volume is committed and is
+never downloaded as an artifact.
+
+Nsight Compute profiling is deliberately opt-in per variant. The worker replays
+one input/output pair in a plain loop and lets the profiler choose the launch:
+`--kernel-name` matches the function name base shared by every variant and
+`--launch-skip` counts only matching launches, so the warmup is discarded by
+NCU rather than partitioned by hand. The timing worker's eight-tensor ring is
+pointless under kernel replay, which flushes the caches between passes anyway.
+The selected sections cover compute and memory throughput,
+occupancy, scheduler behavior, warp stalls, instruction mix, and source/SASS
+counters without paying for the indiscriminate `full` section set. Each run
+downloads Popcorn-compatible `ncu-details.txt`, `ncu-details.csv`, and
+`profile.ncu-rep` artifacts, plus preflight and profiler diagnostics. NCU uses
+kernel replay with cache flushing so every replay pass begins from a consistent
+cache state. Its durations are collected at the locked base SM clock, roughly
+1.7x the boost-clock kernel time the tuning and Nsight Systems runs report, so
+every environment record carries both the current and the maximum SM clock and
+NCU durations are never compared directly against those runs. The profiler
+subprocess runs with `TMPDIR` redirected to container
+storage because its tree launcher creates FIFOs there and the Modal volume at
+`/cache` does not support them. Artifact naming follows
+`popcorn-cli/docs/profiling.md`.
+
 | Date | Selected ID | Public B200 geomean | Notes |
 |------|------------:|---------------------:|-------|
 | 2026-07-20 | 3 (`w2_refined`) | 0.0018265698079868835 s | Best of ten full leaderboard submissions; IDs 7 and 9 were close runners-up |
@@ -119,6 +146,14 @@ rg -n 'stream' cholesky/b4096n32/cholesky_b4096n32.py
 .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
   --action profile
 
+# One targeted Nsight Compute capture for the production variant.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 3
+
+# Compare the precise-root control and production variant in separate captures.
+.venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+  --action ncu --variants 2,3
+
 # Check the provisional production route against the official tests.
 popcorn submit --no-tui --leaderboard cholesky --gpu B200 --mode test \
   cholesky/b4096n32/cholesky_b4096n32.py
@@ -130,5 +165,7 @@ popcorn submit --no-tui --leaderboard cholesky --gpu B200 --mode test \
 
 The requested feedback after `--action tune` is its JSON output plus all ptxas
 spill warnings. After `--action profile`, inspect or provide the downloaded
-statistics files. After `--action popcorn`, provide `summary.json` so the
-winning ID can replace the provisional default.
+statistics files. After `--action ncu`, provide `ncu-details.txt` for each
+selected variant; the `.ncu-rep` is only needed for GUI inspection. After
+`--action popcorn`, provide `summary.json` so the winning ID can replace the
+provisional default.

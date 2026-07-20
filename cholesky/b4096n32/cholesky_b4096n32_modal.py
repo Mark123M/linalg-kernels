@@ -10,6 +10,8 @@ Examples:
     .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
         --action profile
     .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
+        --action ncu --variants 3
+    .venv/bin/modal run cholesky/b4096n32/cholesky_b4096n32_modal.py \
         --action popcorn
 """
 
@@ -85,13 +87,16 @@ def _mount_sources(image: modal.Image) -> modal.Image:
 
 
 if _WORKER_PROCESS:
-    # Child processes launched under nsys only need the workload helpers below.
+    # Child processes launched under a profiler only need the workload helpers
+    # below.
     # Avoid asking Modal to resolve client-side mount paths inside the container.
     benchmark_image = modal.Image.debian_slim()
     nsys_image = benchmark_image
+    ncu_image = benchmark_image
 else:
     benchmark_image = _mount_sources(_base_image())
     nsys_image = _mount_sources(_base_image().apt_install("cuda-nsight-systems-13-1"))
+    ncu_image = _mount_sources(_base_image().apt_install("cuda-nsight-compute-13-1"))
 app = modal.App("cholesky-b4096n32-b200", image=benchmark_image)
 cache_volume = modal.Volume.from_name(
     "cholesky-b4096n32-cache", create_if_missing=True
@@ -127,18 +132,26 @@ def _load_solution():
 def _report_environment() -> dict[str, Any]:
     import torch
 
+    # Nsight Compute locks the SM clock to base while profiling, so recording
+    # both the current and the maximum clocks is what lets its durations be
+    # scaled back to the boost-clock numbers the timing worker reports. There
+    # is no nvidia-smi field for the SM count; asking for one makes the whole
+    # query fail, so it comes from torch instead.
     smi = subprocess.run(
         [
             "nvidia-smi",
-            "--query-gpu=name,driver_version,multiprocessor_count,clocks.sm,clocks.mem,power.limit",
+            "--query-gpu=name,driver_version,clocks.sm,clocks.max.sm,clocks.mem,"
+            "clocks.max.mem,power.limit",
             "--format=csv,noheader",
         ],
         capture_output=True,
         text=True,
     )
     nvcc = subprocess.run(["nvcc", "--version"], capture_output=True, text=True)
+    properties = torch.cuda.get_device_properties(0)
     return {
         "gpu": smi.stdout.strip() or smi.stderr.strip(),
+        "multiprocessor_count": properties.multi_processor_count,
         "torch": torch.__version__,
         "cuda_runtime": torch.version.cuda,
         "capability": list(torch.cuda.get_device_capability()),
@@ -376,6 +389,33 @@ def _worker_profile(variant: int, calls: int) -> None:
     torch.cuda.cudart().cudaProfilerStop()
 
 
+# NCU selects the profiled launch itself: --kernel-name matches the function
+# name base that every variant of the template shares, and --launch-skip counts
+# only launches matching that filter, so the warmup below is discarded without
+# the worker having to partition it. The timing worker's eight-tensor ring has
+# no purpose here because kernel replay flushes every cache between passes, so
+# one pair of buffers is enough.
+NCU_KERNEL_NAME = "crout_32_kernel"
+NCU_WARMUP_LAUNCHES = 16
+
+
+def _worker_ncu(variant: int) -> None:
+    import torch
+
+    solution = _load_solution()
+    data = _make_input("dense", 41032)
+    out = torch.empty_like(data)
+
+    # Profiling stays disabled until cudaProfilerStart, so the only launches
+    # NCU can count are the ones below: the first NCU_WARMUP_LAUNCHES cover
+    # module load and allocator reuse, and the last one is captured.
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(NCU_WARMUP_LAUNCHES + 1):
+        solution._run_variant(data, variant, out)
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+
+
 @app.function(
     image=nsys_image,
     gpu="B200",
@@ -411,7 +451,6 @@ def profile_remote(variant: int, calls: int, run_name: str) -> list[str]:
         "--capture-range=cudaProfilerApi",
         "--capture-range-end=stop",
         "--force-overwrite=true",
-        "--export=sqlite",
         "--output",
         str(report_base),
         "--",
@@ -431,16 +470,31 @@ def profile_remote(variant: int, calls: int, run_name: str) -> list[str]:
         )
 
     report_path = report_base.with_suffix(".nsys-rep")
-    sqlite_path = report_base.with_suffix(".sqlite")
-    for path in (report_path, sqlite_path):
-        if not path.is_file() or path.stat().st_size == 0:
-            raise RuntimeError(f"missing or empty Nsight artifact: {path}")
+    if not report_path.is_file() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"missing or empty Nsight artifact: {report_path}")
 
-    stats = subprocess.run(
-        ["nsys", "stats", "--format", "table", "--output", "-", str(sqlite_path)],
-        capture_output=True,
-        text=True,
-    )
+    # The report is the durable, forward-compatible artifact. nsys stats needs
+    # a SQLite export internally, so direct that transient database to /tmp and
+    # remove it immediately instead of storing/downloading one per variant.
+    temporary_sqlite = Path("/tmp") / f"cholesky_nsys_v{variant}_{os.getpid()}.sqlite"
+    try:
+        stats = subprocess.run(
+            [
+                "nsys",
+                "stats",
+                "--sqlite",
+                str(temporary_sqlite),
+                "--format",
+                "table",
+                "--output",
+                "-",
+                str(report_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        temporary_sqlite.unlink(missing_ok=True)
     stats_path = output_dir / "stats.txt"
     stats_path.write_text(stats.stdout + stats.stderr)
     if stats.returncode != 0 or not stats.stdout.strip():
@@ -448,7 +502,171 @@ def profile_remote(variant: int, calls: int, run_name: str) -> list[str]:
 
     cache_volume.commit()
     return [
-        str(path)
+        str(path.relative_to("/cache"))
+        for path in sorted(output_dir.iterdir())
+        if path.is_file() and path.stat().st_size > 0
+    ]
+
+
+NCU_SECTIONS = (
+    "ComputeWorkloadAnalysis",
+    "InstructionStats",
+    "LaunchStats",
+    "MemoryWorkloadAnalysis",
+    "Occupancy",
+    "SchedulerStats",
+    "SourceCounters",
+    "SpeedOfLight",
+    "WarpStateStats",
+)
+
+
+@app.function(
+    image=ncu_image,
+    gpu="B200",
+    timeout=3600,
+    volumes={"/cache": cache_volume},
+)
+def ncu_remote(variant: int, run_name: str) -> list[str]:
+    output_dir = Path("/cache/ncu") / run_name / f"v{variant}_{VARIANT_NAMES[variant]}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+
+    preflight = subprocess.run(
+        [sys.executable, REMOTE_SCRIPT, "_worker_preflight", str(variant)],
+        capture_output=True,
+        text=True,
+    )
+    preflight_path = output_dir / "preflight.json"
+    preflight_path.write_text(preflight.stdout)
+    if preflight.returncode != 0:
+        (output_dir / "preflight.stderr.txt").write_text(preflight.stderr)
+        raise RuntimeError(
+            f"variant {variant} preflight failed with code {preflight.returncode}: "
+            f"{preflight.stderr[-2000:]}"
+        )
+
+    version = subprocess.run(["ncu", "--version"], capture_output=True, text=True)
+    version_path = output_dir / "ncu-version.txt"
+    version_path.write_text(version.stdout + version.stderr)
+    if version.returncode != 0:
+        raise RuntimeError(f"ncu --version failed: {version.stderr[-2000:]}")
+
+    report_base = output_dir / "profile"
+    command = [
+        "ncu",
+        "--profile-from-start",
+        "off",
+        "--verbose",
+        "--replay-mode",
+        "kernel",
+        "--cache-control",
+        "all",
+        "--kernel-name",
+        NCU_KERNEL_NAME,
+        "--launch-skip",
+        str(NCU_WARMUP_LAUNCHES),
+        "--launch-count",
+        "1",
+        "--force-overwrite",
+        "--export",
+        str(report_base),
+    ]
+    for section in NCU_SECTIONS:
+        command.extend(("--section", section))
+    # NCU expects the application directly after its options; unlike nsys,
+    # inserting a `--` separator makes it try to launch that token as a file.
+    command.extend(
+        (
+            sys.executable,
+            REMOTE_SCRIPT,
+            "_worker_ncu",
+            str(variant),
+        )
+    )
+    (output_dir / "ncu-command.json").write_text(
+        json.dumps(command, indent=2) + "\n"
+    )
+    # The Nsight Compute tree launcher talks to the target application over
+    # named pipes created under TMPDIR, and the Modal volume mounted at /cache
+    # cannot create FIFOs. Only the profiler and its child need the override.
+    profiler_scratch = Path("/tmp") / f"cholesky_ncu_v{variant}_{os.getpid()}"
+    profiler_scratch.mkdir(parents=True, exist_ok=True)
+    ncu_environment = os.environ.copy()
+    ncu_environment["TMPDIR"] = str(profiler_scratch)
+    profiled = subprocess.run(
+        command, capture_output=True, text=True, env=ncu_environment
+    )
+    (output_dir / "ncu.stdout.txt").write_text(profiled.stdout)
+    (output_dir / "ncu.stderr.txt").write_text(profiled.stderr)
+    if profiled.returncode != 0:
+        diagnostics = _subprocess_diagnostics(profiled)
+        if "Launching the target application failed" in diagnostics:
+            # NVIDIA recommends NVLOG for otherwise opaque launcher failures.
+            # Retry only this fast-failing case and preserve the expanded log.
+            nvlog_path = output_dir / "nvlog.config"
+            nvlog_path.write_text(
+                "UseStdout\n"
+                "ForceFlush\n"
+                "Format  $sev:${level:-3}|$proc|$name|$sfunc>> $text\n"
+                "+ 0i 0w 100ef 0IW 100EF global\n"
+            )
+            debug_environment = ncu_environment.copy()
+            debug_environment["NVLOG_CONFIG_FILE"] = str(nvlog_path)
+            debugged = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=debug_environment,
+            )
+            (output_dir / "ncu-debug.stdout.txt").write_text(debugged.stdout)
+            (output_dir / "ncu-debug.stderr.txt").write_text(debugged.stderr)
+            diagnostics = (
+                f"{diagnostics}\nNVLOG retry:\n"
+                f"{_subprocess_diagnostics(debugged)}"
+            )
+        raise RuntimeError(
+            f"variant {variant} ncu failed with code {profiled.returncode}:\n"
+            f"command: {json.dumps(command)}\n"
+            f"{diagnostics[-16000:]}"
+        )
+
+    report_path = report_base.with_suffix(".ncu-rep")
+    if not report_path.is_file() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"missing or empty Nsight Compute artifact: {report_path}")
+
+    detail_outputs = (
+        (output_dir / "ncu-details.txt", ()),
+        (
+            output_dir / "ncu-details.csv",
+            ("--csv", "--print-units", "base"),
+        ),
+    )
+    for detail_path, extra_arguments in detail_outputs:
+        details = subprocess.run(
+            [
+                "ncu",
+                "--import",
+                str(report_path),
+                "--page",
+                "details",
+                "--print-details",
+                "all",
+                *extra_arguments,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        detail_path.write_text(details.stdout)
+        if details.returncode != 0 or not details.stdout.strip():
+            diagnostics = _subprocess_diagnostics(details)
+            raise RuntimeError(
+                f"failed to export {detail_path.name}:\n{diagnostics[-4000:]}"
+            )
+
+    cache_volume.commit()
+    return [
+        str(path.relative_to("/cache"))
         for path in sorted(output_dir.iterdir())
         if path.is_file() and path.stat().st_size > 0
     ]
@@ -463,6 +681,15 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     if path.stat().st_size == 0:
         raise RuntimeError(f"wrote empty result: {path}")
+
+
+def _subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
+    parts = []
+    if completed.stdout.strip():
+        parts.append(f"stdout:\n{completed.stdout.strip()}")
+    if completed.stderr.strip():
+        parts.append(f"stderr:\n{completed.stderr.strip()}")
+    return "\n".join(parts) or "profiler produced no stdout or stderr"
 
 
 def _parse_variants(text: str) -> list[int]:
@@ -481,6 +708,22 @@ def _download_profile_artifacts(
     destination = output_root / run_name
     for variant in variants:
         remote_paths = profile_remote.remote(variant, calls, run_name)
+        variant_dir = destination / f"v{variant}_{VARIANT_NAMES[variant]}"
+        for remote_path in remote_paths:
+            local_path = variant_dir / Path(remote_path).name
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as file_object:
+                cache_volume.read_file_into_fileobj(remote_path, file_object)
+            if local_path.stat().st_size == 0:
+                raise RuntimeError(f"downloaded empty artifact: {local_path}")
+            print(f"downloaded {local_path}")
+
+
+def _download_ncu_artifacts(variants: list[int], output_root: Path) -> None:
+    run_name = f"b4096_n32_{_timestamp()}"
+    destination = output_root / run_name
+    for variant in variants:
+        remote_paths = ncu_remote.remote(variant, run_name)
         variant_dir = destination / f"v{variant}_{VARIANT_NAMES[variant]}"
         for remote_path in remote_paths:
             local_path = variant_dir / Path(remote_path).name
@@ -646,6 +889,13 @@ def main(
         _download_profile_artifacts(selected, profile_calls, output_root)
         return
 
+    if action == "ncu":
+        if not variants.strip():
+            raise ValueError("--action ncu requires an explicit --variants list")
+        output_root = Path(output) if output else default_artifacts / "ncu"
+        _download_ncu_artifacts(selected, output_root)
+        return
+
     if action == "popcorn":
         if variants.strip():
             raise ValueError("Popcorn policy requires all ten variants; omit --variants")
@@ -653,7 +903,7 @@ def main(
         _run_popcorn_sweep(output_root)
         return
 
-    raise ValueError("action must be one of: tune, profile, popcorn")
+    raise ValueError("action must be one of: tune, profile, ncu, popcorn")
 
 
 def _worker_cli() -> None:
@@ -670,6 +920,11 @@ def _worker_cli() -> None:
         if len(sys.argv) != 4:
             raise SystemExit("profile worker requires call count")
         _worker_profile(variant, int(sys.argv[3]))
+        return
+    if mode == "_worker_ncu":
+        if len(sys.argv) != 3:
+            raise SystemExit("ncu worker takes only a variant")
+        _worker_ncu(variant)
         return
     raise SystemExit(f"unknown worker mode: {mode}")
 
