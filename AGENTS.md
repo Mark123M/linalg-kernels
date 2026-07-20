@@ -30,6 +30,10 @@ Build an efficient batched dense Cholesky factorization algorithm for the B200 G
 - cutlass/ directory contains efficient kernel examples
 - popcorn-cli/ contains the full evaluation infrastructure, **DO NOT CHEAT**
 
+## Commands
+- Correctness test: `popcorn submit --leaderboard cholesky --gpu B200 --mode test --no-tui cholesky/bBnN/cholesky_bBnN.py`
+- Leaderboard submission (true performance): `popcorn submit --leaderboard cholesky --gpu B200 --mode leaderboard --no-tui cholesky/bBnN/cholesky_bBnN.py`
+
 ## Problem Description
 Implement batched dense Cholesky factorization.
 
