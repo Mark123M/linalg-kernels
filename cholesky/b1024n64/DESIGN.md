@@ -2,9 +2,11 @@
 
 ## Status
 
-- Implemented: raw CUDA extension with 19 custom variants across three kernel
-  families, plus a cuSolverDx POTRF baseline as variant 19. Modal
-  tune/nsys/ncu/popcorn tooling adapted from `b4096n32`.
+- Implemented: raw CUDA extension with 21 active custom variants across four
+  kernel families, plus a cuSolverDx POTRF baseline as variant 19. Modal
+  tune/nsys/ncu/popcorn tooling adapted from `b4096n32`. IDs 20 and 21 are
+  reserved for the measured-and-retired rendezvous experiments; the two new
+  instruction-footprint hybrids are active as variants 22 and 23.
 - Measured (2026-07-20/21): Modal tune (×2), full 20-variant Popcorn
   leaderboard sweep, and two NCU rounds (crout family; smem + library family).
   See **Profiling findings** below.
@@ -15,12 +17,26 @@
   signal across 15 shapes and is noise-dominated within the top cluster; NCU
   locked-clock+cache-flush durations are diagnostic only and can invert the
   real ranking (they did for v18 — see findings).
-- Production default: still variant 4 in the tracked file. Recommend flipping
+- Production default: variant 6 in the current file. Recommend flipping
   to **variant 13**, after a focused leaderboard re-submit of {13, 6, 10}
   confirms it (the first sweep's noise put v6 nominally on top). v13 is a
   right-looking rank-1 kernel that fits in 255 registers with **zero spills**;
   its no-lookahead siblings v12/v14 spill 512 B/thread and are ~8× slower, so
   the win is real but sits at the edge of the register cap.
+- Rejected after B200 sweep: experimental variants 20 and 21 added one late
+  CTA rendezvous to the v6 and v13 algorithms, respectively. Both were
+  spill-free and correct, but v20 tied/slightly lost to v6 and v21 was 1.98%
+  slower than v13. Their IDs remain reserved but are omitted from all active
+  sweeps; baselines 6 and 13 remain unchanged.
+- Awaiting B200 measurement: v22 keeps v6's register Crout columns 0--47 and
+  factors only the 16x16 tail with compact, non-unrolled shared-memory loops.
+  v23 keeps v13's root-lookahead right-looking prefix through k=31, then
+  factors the resulting 32x32 Schur complement with compact shared-memory
+  rank-1 loops. These test whether deleting the late unrolled instruction
+  footprint works where a one-time CTA rendezvous did not. A local CUDA 13.1
+  SM100a build passes: v22 is 4,344 static instructions / 69,504 bytes, 164
+  registers, 16,640 B shared, zero stack/spills; v23 is 5,512 instructions /
+  88,192 bytes, 255 registers, 16,896 B shared, zero stack/spills.
 
 ## Correctness reference
 
@@ -80,6 +96,14 @@ admissible if the residual gate holds.
   `smem_reg` keeps the own row in registers (full unroll) so each dot FMA
   reads one register + one broadcast shared operand — half the shared-memory
   traffic of the pure version.
+- **Prefix/tail hybrids (E)**: retain one warp per matrix and the measured
+  register algorithm only through the instruction-fetch inflection, then
+  publish the remaining rows into a private shared tile. v22 uses a 16x65
+  tile per warp (16.25 KiB/CTA at Warps=4); v23 uses a 32x33 tile per warp
+  (16.5 KiB/CTA). Their tail loops use `#pragma unroll 1`, so the goal is fewer
+  unique instructions rather than more warp alignment. Only warp rendezvous
+  are used: once at handoff and where a completed shared column must become
+  visible to the next iteration.
 - **cuSolverDx baseline (variant 19)**: `Size<64,64> + Precision<float> +
   Type<real> + Function<potrf> + FillMode<lower> + Arrangement<row_major> +
   SM<1000> + Block() + BlockDim<128> + BatchesPerBlock<1>`, one CTA per
@@ -118,6 +142,10 @@ admissible if the residual gate holds.
 | 17 | `smem64_m2_raw` | smem_64 | 128 threads, 2 matrices/CTA, MinBlocks=4 |
 | 18 | `smem64_reg_raw` | smem_reg_64 | register-row hybrid, MinBlocks=7 |
 | 19 | `cusolverdx_potrf` | potrf_dx | library baseline, BlockDim=128 |
+| 20 | `retired_sync47` | reserved | rejected v6 + CTA rendezvous experiment |
+| 21 | `retired_sync27` | reserved | rejected v13 + CTA rendezvous experiment |
+| 22 | `w4_int_scalar_raw_shared_tail16` | crout_hybrid_64 | v6 through column 47, compact shared 16x16 tail |
+| 23 | `w4_int_f2_raw_right_rootlook_shared_tail32` | right_hybrid_64 | v13 through k=31, compact shared 32x32 tail |
 
 Family rationale:
 
@@ -141,9 +169,14 @@ Family rationale:
 - **D (19)**: state-of-the-art library reference measured in the identical
   harness, and a real submission variant per project decision (MathDx assumed
   available on the eval box, as in eigh).
+- **E (22–23)**: instruction-footprint hybrids derived from the two measured
+  champions. The existing kernels are deliberately unchanged so the focused
+  sweep compares each hybrid to an exact baseline.
 
-Variant IDs are stable and append-only; the popcorn sweep rewrites only the
-`_DEFAULT_VARIANT = N  # POPCORN_VARIANT` line in temporary copies.
+Variant IDs are stable and append-only. IDs 20 and 21 are reserved and rejected
+by the CLI; an empty variant selection expands to active IDs 0--19, 22, and 23.
+The popcorn sweep rewrites only the `_DEFAULT_VARIANT = N  # POPCORN_VARIANT`
+line in temporary copies.
 
 ## Measurement policy
 
@@ -281,29 +314,42 @@ single 0.86 wave → ~7 warps/SM regardless of any per-thread knob.
 
 **Levers, ranked by evidence:**
 
-1. **Late CTA rendezvous in the register kernels.** A deeper SASS pass over
+1. **Late CTA rendezvous in the register kernels — tested, rejected.** A deeper SASS pass over
    `b1024_n64_20260721T074424Z` found that v6's 6,960-static-instruction,
    111,360-byte body is fetch-stall-free for almost all of the first 48 Crout
    columns: only 19 of 768 not-issued `no_instruction` samples occur through
    column 47. Columns 48--63 contribute 702 and output contributes 47. The
    same late-body cliff appears in v10 (951 samples, 117,376-byte body) and v13
-   (909 samples, 111,616-byte body). This supports a minimal experiment that
-   keeps the register algorithm but realigns independent CTA warps with one
-   `__syncthreads()` after v6 column 47; only then sweep a second tail barrier
-   or a short tail cadence. For v13, the SASS transition is near static
-   instruction 4,000 (around the root marker after k=27), but compiler motion
-   makes that source mapping approximate, so every candidate needs a fresh
-   SASS capture. NCU's 37.7% local speedup estimate is only an upper bound on
-   the fetch component, not a predicted kernel speedup; barrier wait and lost
-   load motion can consume it.
-2. **Root-lookahead + right-looking remains the current measured best (v13).**
+   (909 samples, 111,616-byte body). Variants 20 and 21 tested the minimal
+   experiment: keep the register algorithms but realign independent CTA warps
+   once, after v6 column 47 and v13 k=27. On the same focused warm run, v20 was
+   26.744 us versus v6 at 26.730 us (+0.05%, effectively tied/slightly worse),
+   while v21 was 25.540 us versus v13 at 25.044 us (+1.98%). Both retained
+   identical register counts, zero local bytes, and passed all six cases.
+   Therefore the sampled fetch-stall localization does not translate into a
+   warm-runtime win: barrier wait and/or constrained scheduling consumes the
+   benefit. Do not add a barrier cadence sweep.
+2. **Reduce unique late-body instructions with a register/shared hybrid — now
+   implemented as v22/v23, awaiting B200.** v22 cuts over exactly where v6's
+   sampled fetch cliff begins: columns 0--47 remain the scalar-load register
+   Crout algorithm, while a non-unrolled shared loop handles columns 48--63.
+   v23 cuts the root-lookahead right-looking algorithm after k=31, near its
+   observed instruction-cache inflection, and handles the 32x32 remainder in
+   a compact shared rank-1 loop. Unlike v20/v21, this actually removes static
+   instructions; it pays shared-memory address/load cost only in the tail.
+   Local SM100a SASS confirms a 37.6% reduction for v22 versus v6 (4,344
+   versus 6,960 instructions) and a 21.0% reduction for v23 versus v13 (5,512
+   versus 6,976).
+   Accept only if all six cases pass, local bytes remain zero, and the warm
+   timing beats its unchanged parent.
+3. **Root-lookahead + right-looking remains the current measured best (v13).**
    Its warm-tune edge comes from avoiding the spill cliff and hiding diagonal
    `rsqrt` latency. The new cold-cache NCU capture does not rank it: v13 is
    59.65 us versus v6 at 58.50 us and has similar long-scoreboard (1.49 versus
    1.43 cycles/issued instruction) plus worse no-instruction (3.79 versus
    3.13). This is another direct example of NCU cache-flush timing inverting
    the authoritative warm result (24.69 versus 26.70 us).
-3. **Do not start with naive explicit prefetch or generic coalescing advice.**
+4. **Do not start with naive explicit prefetch or generic coalescing advice.**
    nvcc already hoists v6's 127 scalar LDGs far ahead through the fully
    unrolled body, including 48 static LDGs in the first 512 instructions.
    NCU's 50% excessive-sector warning is real but splits evenly: LDG accounts
@@ -311,9 +357,9 @@ single 0.86 wave → ~7 warps/SM regardless of any per-thread knob.
    coalesced float2 v5 was already slower than scalar v6 on warm tune, while
    coalescing output would require a register/shared-memory transpose. These
    are lower priority than the localized fetch cliff. Revisit explicit
-   prefetch only after the rendezvous sweep, and verify that it changes SASS
+   prefetch only after the hybrid sweep, and verify that it changes SASS
    load/use distance rather than merely source order.
-4. **Avoid the precise root** — now **confirmed** by the low-jitter tune, not
+5. **Avoid the precise root** — now **confirmed** by the low-jitter tune, not
    just hypothesized: `fsqrt.rn` + `fdiv.rn` on the serial column critical path
    costs interleaved f2 precise (v3) 50.73 µs vs refined (v4) 28.75 (+76%), and
    blocked precise (v0) 46.53 vs refined (v1) 32.53 (+43%). Refined ≈ raw
@@ -341,19 +387,22 @@ python3 -m py_compile cholesky/b1024n64/cholesky_b1024n64.py \
 rg -n 'stream' cholesky/b1024n64/cholesky_b1024n64.py   # must print nothing
 git diff --check
 
-# Correctness + resources + kernel timing (report JSON + ptxas spill warnings)
-.venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py --action tune
+# Focused correctness + resources + warm kernel timing for each hybrid and its
+# unchanged parent (report JSON + ptxas spill warnings).
+.venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py \
+    --action tune --variants 6,13,22,23
 
 # Official checker on the default variant
 popcorn submit --leaderboard cholesky --gpu B200 --mode test --no-tui \
     cholesky/b1024n64/cholesky_b1024n64.py
 
-# Profiling for the family champions after tune
-.venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py --action profile
+# Profile only after the correctness/resource/timing gate passes
+.venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py \
+    --action profile --variants 6,13,22,23
 .venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py --action ncu \
-    --variants 4,12,16,19
+    --variants 6,13,22,23
 
-# Full 20-variant leaderboard sweep, ranked summary.json
+# Full 22-active-variant leaderboard sweep, ranked summary.json
 .venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py --action popcorn
 ```
 
@@ -367,3 +416,8 @@ popcorn submit --leaderboard cholesky --gpu B200 --mode test --no-tui \
 | 2026-07-21 | NCU round 2 (v16 smem, v18 smem_reg, v19 cuSolverDx) | barrier synchronization (not occupancy) kills the I-cache stall (`no_instruction` 3.1→0.11); pure smem loses on 3× instruction count not barriers; cuSolverDx uncompetitive |
 | 2026-07-21 | Modal tune #2 (all 20, low-jitter, eval methodology) | **v13 fastest at 24.69 µs** (right-looking + rootlook), v6 26.70, v10 26.74; v18 mid-pack 37.15 (NCU duration was a cache-flush artifact); v12/v14 spill 512 B → ~208 µs; precise root confirmed +43–76%. Recommend default → v13 after a focused {13,6,10} leaderboard re-submit |
 | 2026-07-21 | Deep SASS pass on same-round v6/v10/v13 NCU captures | fetch stalls localize to the late ~40% of all three 111--117 KB register bodies; first experiment is a minimal late CTA rendezvous, not more occupancy or naive prefetch; exact LDG/STG excessive-sector attribution recorded above |
+| 2026-07-21 | Added append-only CTA-rendezvous variants 20/21 and focused tune selection | v20 = v6 + sync after j=47; v21 = v13 + sync after k=27; awaiting B200 correctness/resource/warm-timing sweep of 6,13,20,21 |
+| 2026-07-21 | Focused Modal tune of 6,13,20,21 | all pass and remain spill-free; v20 26.744 us vs v6 26.730 (+0.05%, no win); v21 25.540 us vs v13 25.044 (+1.98%, regression). The baseline v6 stayed within +0.13% of both prior runs, while v13 was +1.45% with wider jitter, so this is not a general runtime regression |
+| 2026-07-21 | Retired failed rendezvous variants | restored the active kernel/harness to variants 0--19 and the original 19-column metadata ABI; retained focused `--variants` tune selection and added an explicit metadata-shape check |
+| 2026-07-21 | Added v22/v23 instruction-footprint hybrids | v22 = v6 register columns 0--47 + compact shared 16x16 tail; v23 = v13 root-lookahead through k=31 + compact shared 32x32 tail; original v6/v13 untouched; awaiting focused B200 sweep of 6,13,22,23 |
+| 2026-07-21 | Local CUDA 13.1 SM100a build + SASS count | build/load passes; v22: 164 regs, 16,640 B smem, zero stack/spills, 4,344 instructions (−37.6% vs v6); v23: 255 regs, 16,896 B smem, zero stack/spills, 5,512 instructions (−21.0% vs v13) |

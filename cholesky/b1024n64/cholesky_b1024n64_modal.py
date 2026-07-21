@@ -6,7 +6,7 @@ runs exercise identical kernels.
 
 Examples:
     .venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py \
-        --action tune
+        --action tune --variants 6,13,22,23
     .venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py \
         --action profile
     .venv/bin/modal run cholesky/b1024n64/cholesky_b1024n64_modal.py \
@@ -36,7 +36,8 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 20
+VARIANT_COUNT = 24
+VARIANT_IDS = (*range(20), 22, 23)
 VARIANT_NAMES = (
     "w4_blk_precise",
     "w4_blk_refined",
@@ -58,6 +59,10 @@ VARIANT_NAMES = (
     "smem64_m2_raw",
     "smem64_reg_raw",
     "cusolverdx_potrf",
+    "retired_sync47",
+    "retired_sync27",
+    "w4_int_scalar_raw_shared_tail16",
+    "w4_int_f2_raw_right_rootlook_shared_tail32",
 )
 LOCAL_SOLUTION = "cholesky/b1024n64/cholesky_b1024n64.py"
 LOCAL_SCRIPT = "cholesky/b1024n64/cholesky_b1024n64_modal.py"
@@ -287,26 +292,36 @@ def _resource_rows(solution) -> list[dict[str, Any]]:
         "threads_per_matrix",
         "matrices_per_cta",
     )
-    values = solution._variant_metadata().tolist()
+    metadata = solution._variant_metadata()
+    expected_shape = (VARIANT_COUNT, len(columns))
+    if tuple(metadata.shape) != expected_shape:
+        raise RuntimeError(
+            "native metadata ABI mismatch: "
+            f"expected {expected_shape}, got {tuple(metadata.shape)}; "
+            "bump the native extension cache version after changing metadata"
+        )
+    values = metadata.tolist()
     return [dict(zip(columns, row, strict=True)) for row in values]
 
 
-def _measure_variants(solution, calls: int, repeats: int) -> list[dict[str, Any]]:
+def _measure_variants(
+    solution, variants: list[int], calls: int, repeats: int
+) -> list[dict[str, Any]]:
     import torch
 
     ring_size = 8
     inputs = [_make_input("dense", 41064 + index) for index in range(ring_size)]
     outputs = [torch.empty_like(inputs[0]) for _ in range(ring_size)]
-    samples: dict[int, list[float]] = {variant: [] for variant in range(VARIANT_COUNT)}
+    samples: dict[int, list[float]] = {variant: [] for variant in variants}
 
-    for variant in range(VARIANT_COUNT):
+    for variant in variants:
         for index in range(16):
             slot = index % ring_size
             solution._run_variant(inputs[slot], variant, outputs[slot])
     torch.cuda.synchronize()
 
     for repeat in range(repeats):
-        order = list(range(VARIANT_COUNT))
+        order = list(variants)
         if repeat & 1:
             order.reverse()
         for variant in order:
@@ -335,34 +350,40 @@ def _measure_variants(solution, calls: int, repeats: int) -> list[dict[str, Any]
     return results
 
 
-def _run_tuning(calls: int, repeats: int) -> dict[str, Any]:
+def _run_tuning(
+    variants: list[int], calls: int, repeats: int
+) -> dict[str, Any]:
     import torch
 
     Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
     solution = _load_solution()
     validation: dict[str, list[dict[str, Any]]] = {
-        str(variant): [] for variant in range(VARIANT_COUNT)
+        str(variant): [] for variant in variants
     }
     cases = ("dense", "spectrum", "diagonal", "lowrank", "rowscale", "tridiagonal")
     for case_index, case in enumerate(cases):
         data = _make_input(case, 53125 + case_index)
         reference = torch.linalg.cholesky_ex(data, check_errors=False).L
         reference_scaled = _scaled_reconstruction_residual(data, reference)
-        for variant in range(VARIANT_COUNT):
+        for variant in variants:
             factor = solution._run_variant(data, variant)
             result = _validate_factor(data, factor, reference_scaled)
             result["case"] = case
             validation[str(variant)].append(result)
         del data, reference
 
-    resources = _resource_rows(solution)
-    timings = _measure_variants(solution, calls, repeats)
+    selected = set(variants)
+    resources = [
+        row for row in _resource_rows(solution) if row["variant"] in selected
+    ]
+    timings = _measure_variants(solution, variants, calls, repeats)
     for row in timings:
         checks = validation[str(row["variant"])]
         row["modal_validation_passed"] = all(check["passed"] for check in checks)
     return {
         "timestamp_utc": _timestamp(),
         "environment": _report_environment(),
+        "variants": variants,
         "calls_per_sample": calls,
         "repeats": repeats,
         "resources": resources,
@@ -372,8 +393,10 @@ def _run_tuning(calls: int, repeats: int) -> dict[str, Any]:
 
 
 @app.function(gpu="B200", timeout=3600, volumes={"/cache": cache_volume})
-def tune_remote(calls: int, repeats: int) -> dict[str, Any]:
-    return _run_tuning(calls, repeats)
+def tune_remote(
+    variants: list[int], calls: int, repeats: int
+) -> dict[str, Any]:
+    return _run_tuning(variants, calls, repeats)
 
 
 def _worker_preflight(variant: int) -> None:
@@ -433,11 +456,15 @@ NCU_WARMUP_LAUNCHES = 16
 def _ncu_kernel_name(variant: int) -> str:
     if variant == 19:
         return "potrf_dx_kernel"
+    if variant == 23:
+        return "right_hybrid_64_kernel"
+    if variant == 22:
+        return "crout_hybrid_64_kernel"
     if variant == 18:
         return "smem_reg_64_kernel"
-    if variant >= 15:
+    if variant in (15, 16, 17):
         return "smem_64_kernel"
-    if variant >= 12:
+    if variant in (12, 13, 14):
         return "right_looking_64_kernel"
     return "crout_64_kernel"
 
@@ -739,10 +766,10 @@ def _subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
 
 def _parse_variants(text: str) -> list[int]:
     if not text.strip():
-        return list(range(VARIANT_COUNT))
+        return list(VARIANT_IDS)
     result = sorted({int(item.strip()) for item in text.split(",") if item.strip()})
-    if not result or result[0] < 0 or result[-1] >= VARIANT_COUNT:
-        raise ValueError(f"variants must be comma-separated IDs in [0, {VARIANT_COUNT - 1}]")
+    if not result or any(variant not in VARIANT_IDS for variant in result):
+        raise ValueError(f"variants must be comma-separated IDs from {VARIANT_IDS}")
     return result
 
 
@@ -848,7 +875,7 @@ def _run_popcorn_sweep(output_root: Path, variants: list[int]) -> None:
             result_path = run_dir / f"v{variant}_{VARIANT_NAMES[variant]}.result.txt"
             jobs.append((variant, submission_path, result_path))
 
-        with ThreadPoolExecutor(max_workers=VARIANT_COUNT) as executor:
+        with ThreadPoolExecutor(max_workers=len(VARIANT_IDS)) as executor:
             pending = {}
             for variant, submission_path, result_path in jobs:
                 future = executor.submit(
@@ -913,7 +940,7 @@ def main(
     if action == "tune":
         if calls <= 0 or repeats <= 0:
             raise ValueError("calls and repeats must be positive")
-        payload = tune_remote.remote(calls, repeats)
+        payload = tune_remote.remote(selected, calls, repeats)
         output_path = (
             Path(output)
             if output
@@ -960,8 +987,8 @@ def _worker_cli() -> None:
         raise SystemExit("worker mode requires a variant")
     mode = sys.argv[1]
     variant = int(sys.argv[2])
-    if not 0 <= variant < VARIANT_COUNT:
-        raise SystemExit(f"variant must be in [0, {VARIANT_COUNT - 1}]")
+    if variant not in VARIANT_IDS:
+        raise SystemExit(f"variant must be one of {VARIANT_IDS}")
     if mode == "_worker_preflight":
         _worker_preflight(variant)
         return

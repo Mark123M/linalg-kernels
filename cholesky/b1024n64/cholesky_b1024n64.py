@@ -15,7 +15,8 @@ from torch.utils.cpp_extension import load_inline
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
 # 8, 5, 11, 4, 7, 10
 _DEFAULT_VARIANT = 6  # POPCORN_VARIANT
-_VARIANT_COUNT = 20
+_VARIANT_COUNT = 24
+_VARIANT_IDS = (*range(20), 22, 23)
 _CUSOLVERDX_VARIANT = 19
 
 _CPP_SOURCE = r"""
@@ -51,7 +52,7 @@ constexpr int kPreciseRoot = 0;
 constexpr int kRefinedRoot = 1;
 constexpr int kRawRoot = 2;
 constexpr int kMetadataColumns = 19;
-constexpr int kNativeVariants = 19;
+constexpr int kVariantCount = 24;
 
 void check_input(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda(), "input must be a CUDA tensor");
@@ -368,6 +369,317 @@ void right_looking_64_kernel(const float* __restrict__ input,
   }
 }
 
+// Keep the instruction-efficient register Crout prefix, then move only the
+// 16x16 late factor into shared memory. The compact tail loop replaces the
+// large unrolled region where v6's instruction-fetch stalls concentrate.
+template <int Warps, int MinBlocks>
+__global__ __launch_bounds__(Warps * 32, MinBlocks)
+void crout_hybrid_64_kernel(const float* __restrict__ input,
+                            float* __restrict__ output) {
+  constexpr int kTailStart = 48;
+  constexpr int kTailN = kN - kTailStart;
+  constexpr int kTailLd = kN + 1;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int matrix = static_cast<int>(blockIdx.x) * Warps + warp;
+  const float* a = input + static_cast<int64_t>(matrix) * kN * kN;
+  float* result = output + static_cast<int64_t>(matrix) * kN * kN;
+
+  float row[2][kTailStart];
+#pragma unroll
+  for (int owned = 0; owned < 2; ++owned) {
+#pragma unroll
+    for (int k = 0; k < kTailStart; ++k) {
+      row[owned][k] = 0.0f;
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < kTailStart; ++j) {
+    float value0 = a[j * kN + 2 * lane];
+    float value1 = a[j * kN + 2 * lane + 1];
+    const int pivot_lane = j >> 1;
+    const int pivot_slot = j & 1;
+#pragma unroll
+    for (int k = 0; k < j; ++k) {
+      const float pivot =
+          __shfl_sync(kFullMask, row[pivot_slot][k], pivot_lane);
+      value0 = fmaf(-row[0][k], pivot, value0);
+      value1 = fmaf(-row[1][k], pivot, value1);
+    }
+
+    float inverse = 0.0f;
+    if (lane == pivot_lane) {
+      const float diagonal_value = pivot_slot == 0 ? value0 : value1;
+      inverse = rsqrtf(diagonal_value);
+      row[pivot_slot][j] = diagonal_value * inverse;
+    }
+    inverse = __shfl_sync(kFullMask, inverse, pivot_lane);
+    if (2 * lane > j) {
+      row[0][j] = value0 * inverse;
+    }
+    if (2 * lane + 1 > j) {
+      row[1][j] = value1 * inverse;
+    }
+  }
+
+  __shared__ float tail_tiles[Warps * kTailN * kTailLd];
+  float* factor = tail_tiles + warp * kTailN * kTailLd;
+
+  // The original owners of rows 48--63 publish their register prefix. After
+  // this point lanes 0--15 each own one tail row in the compact loop.
+  if (lane >= kTailStart / 2) {
+    const int first_tail_row = 2 * (lane - kTailStart / 2);
+#pragma unroll
+    for (int owned = 0; owned < 2; ++owned) {
+      const int tail_row = first_tail_row + owned;
+#pragma unroll
+      for (int k = 0; k < kTailStart; ++k) {
+        factor[tail_row * kTailLd + k] = row[owned][k];
+      }
+    }
+  }
+  __syncwarp(kFullMask);
+
+#pragma unroll 1
+  for (int j = kTailStart; j < kN; ++j) {
+    const int pivot_lane = j - kTailStart;
+    float value = 0.0f;
+    if (lane < kTailN) {
+      value = a[j * kN + kTailStart + lane];
+    }
+#pragma unroll 1
+    for (int k = 0; k < j; ++k) {
+      if (lane < kTailN) {
+        value = fmaf(-factor[lane * kTailLd + k],
+                     factor[pivot_lane * kTailLd + k], value);
+      }
+    }
+
+    float inverse = 0.0f;
+    if (lane == pivot_lane) {
+      inverse = rsqrtf(value);
+      factor[lane * kTailLd + j] = value * inverse;
+    }
+    inverse = __shfl_sync(kFullMask, inverse, pivot_lane);
+    if (lane > pivot_lane && lane < kTailN) {
+      factor[lane * kTailLd + j] = value * inverse;
+    }
+    __syncwarp(kFullMask);
+  }
+
+  // Prefix columns remain in the original two-row register layout.
+#pragma unroll
+  for (int owned = 0; owned < 2; ++owned) {
+    const int matrix_row = 2 * lane + owned;
+    float* out_row = result + matrix_row * kN;
+#pragma unroll
+    for (int vector_index = 0; vector_index < kTailStart / 4; ++vector_index) {
+      const int column = vector_index * 4;
+      float4 values;
+      values.x = column <= matrix_row ? row[owned][column] : 0.0f;
+      values.y = column + 1 <= matrix_row ? row[owned][column + 1] : 0.0f;
+      values.z = column + 2 <= matrix_row ? row[owned][column + 2] : 0.0f;
+      values.w = column + 3 <= matrix_row ? row[owned][column + 3] : 0.0f;
+      reinterpret_cast<float4*>(out_row)[vector_index] = values;
+    }
+#pragma unroll
+    for (int vector_index = kTailStart / 4; vector_index < kN / 4;
+         ++vector_index) {
+      const int column = vector_index * 4;
+      float4 values{0.0f, 0.0f, 0.0f, 0.0f};
+      if (matrix_row >= kTailStart) {
+        const int tail_row = matrix_row - kTailStart;
+        values.x = column <= matrix_row
+                       ? factor[tail_row * kTailLd + column]
+                       : 0.0f;
+        values.y = column + 1 <= matrix_row
+                       ? factor[tail_row * kTailLd + column + 1]
+                       : 0.0f;
+        values.z = column + 2 <= matrix_row
+                       ? factor[tail_row * kTailLd + column + 2]
+                       : 0.0f;
+        values.w = column + 3 <= matrix_row
+                       ? factor[tail_row * kTailLd + column + 3]
+                       : 0.0f;
+      }
+      reinterpret_cast<float4*>(out_row)[vector_index] = values;
+    }
+  }
+}
+
+// The right-looking prefix maintains the trailing Schur complement directly.
+// At column 32 it can therefore publish the 32x32 remainder and reuse one
+// compact shared-memory update loop instead of emitting the large SASS tail.
+template <int Warps, int MinBlocks>
+__global__ __launch_bounds__(Warps * 32, MinBlocks)
+void right_hybrid_64_kernel(const float* __restrict__ input,
+                            float* __restrict__ output) {
+  constexpr int kTailStart = 32;
+  constexpr int kTailN = kN - kTailStart;
+  constexpr int kTailLd = kTailN + 1;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int matrix = static_cast<int>(blockIdx.x) * Warps + warp;
+  const float* a = input + static_cast<int64_t>(matrix) * kN * kN;
+  float* result = output + static_cast<int64_t>(matrix) * kN * kN;
+
+  float state[2][kN];
+#pragma unroll
+  for (int j = 0; j < kN; ++j) {
+    const float2 loaded = reinterpret_cast<const float2*>(a + j * kN)[lane];
+    state[0][j] = loaded.x;
+    state[1][j] = loaded.y;
+  }
+
+  float inverse = 0.0f;
+  if (lane == 0) {
+    inverse = rsqrtf(state[0][0]);
+    state[0][0] *= inverse;
+  }
+  inverse = __shfl_sync(kFullMask, inverse, 0);
+#pragma unroll
+  for (int owned = 0; owned < 2; ++owned) {
+    if (2 * lane + owned > 0) {
+      state[owned][0] *= inverse;
+    }
+  }
+
+  // Processing k=31 applies the last prefix update and normalizes column 32.
+#pragma unroll
+  for (int k = 0; k < kTailStart; ++k) {
+    const int next = k + 1;
+    const int next_lane = next >> 1;
+    const int next_slot = next & 1;
+    const float next_pivot =
+        __shfl_sync(kFullMask, state[next_slot][k], next_lane);
+    state[0][next] = fmaf(-state[0][k], next_pivot, state[0][next]);
+    state[1][next] = fmaf(-state[1][k], next_pivot, state[1][next]);
+
+    float next_inverse = 0.0f;
+    float next_diagonal = 0.0f;
+    if (lane == next_lane) {
+      next_diagonal = state[next_slot][next];
+      next_inverse = rsqrtf(next_diagonal);
+    }
+#pragma unroll
+    for (int j = k + 2; j < kN; ++j) {
+      const int pivot_lane = j >> 1;
+      const int pivot_slot = j & 1;
+      const float pivot =
+          __shfl_sync(kFullMask, state[pivot_slot][k], pivot_lane);
+      state[0][j] = fmaf(-state[0][k], pivot, state[0][j]);
+      state[1][j] = fmaf(-state[1][k], pivot, state[1][j]);
+    }
+    if (lane == next_lane) {
+      state[next_slot][next] = next_diagonal * next_inverse;
+    }
+    next_inverse = __shfl_sync(kFullMask, next_inverse, next_lane);
+#pragma unroll
+    for (int owned = 0; owned < 2; ++owned) {
+      if (2 * lane + owned > next) {
+        state[owned][next] *= next_inverse;
+      }
+    }
+  }
+
+  __shared__ float tail_tiles[Warps * kTailN * kTailLd];
+  float* factor = tail_tiles + warp * kTailN * kTailLd;
+  if (lane >= kTailStart / 2) {
+    const int first_tail_row = 2 * (lane - kTailStart / 2);
+#pragma unroll
+    for (int owned = 0; owned < 2; ++owned) {
+      const int tail_row = first_tail_row + owned;
+#pragma unroll
+      for (int column = 0; column < kTailN; ++column) {
+        if (column <= tail_row) {
+          factor[tail_row * kTailLd + column] =
+              state[owned][kTailStart + column];
+        }
+      }
+    }
+  }
+  __syncwarp(kFullMask);
+
+  // Column zero of the tile (global column 32) was normalized by the prefix.
+#pragma unroll 1
+  for (int k = 0; k < kTailN - 1; ++k) {
+    const int next = k + 1;
+    float own_factor = 0.0f;
+    if (lane >= k) {
+      own_factor = factor[lane * kTailLd + k];
+    }
+    const float next_pivot = factor[next * kTailLd + k];
+    if (lane >= next) {
+      factor[lane * kTailLd + next] =
+          fmaf(-own_factor, next_pivot,
+               factor[lane * kTailLd + next]);
+    }
+
+    float next_inverse = 0.0f;
+    float next_diagonal = 0.0f;
+    if (lane == next) {
+      next_diagonal = factor[next * kTailLd + next];
+      next_inverse = rsqrtf(next_diagonal);
+    }
+#pragma unroll 1
+    for (int j = k + 2; j < kTailN; ++j) {
+      const float pivot = factor[j * kTailLd + k];
+      if (lane >= j) {
+        factor[lane * kTailLd + j] =
+            fmaf(-own_factor, pivot, factor[lane * kTailLd + j]);
+      }
+    }
+    if (lane == next) {
+      factor[next * kTailLd + next] = next_diagonal * next_inverse;
+    }
+    next_inverse = __shfl_sync(kFullMask, next_inverse, next);
+    if (lane > next) {
+      factor[lane * kTailLd + next] *= next_inverse;
+    }
+    __syncwarp(kFullMask);
+  }
+
+#pragma unroll
+  for (int owned = 0; owned < 2; ++owned) {
+    const int matrix_row = 2 * lane + owned;
+    float* out_row = result + matrix_row * kN;
+#pragma unroll
+    for (int vector_index = 0; vector_index < kTailStart / 4; ++vector_index) {
+      const int column = vector_index * 4;
+      float4 values;
+      values.x = column <= matrix_row ? state[owned][column] : 0.0f;
+      values.y = column + 1 <= matrix_row ? state[owned][column + 1] : 0.0f;
+      values.z = column + 2 <= matrix_row ? state[owned][column + 2] : 0.0f;
+      values.w = column + 3 <= matrix_row ? state[owned][column + 3] : 0.0f;
+      reinterpret_cast<float4*>(out_row)[vector_index] = values;
+    }
+#pragma unroll
+    for (int vector_index = kTailStart / 4; vector_index < kN / 4;
+         ++vector_index) {
+      const int column = vector_index * 4;
+      float4 values{0.0f, 0.0f, 0.0f, 0.0f};
+      if (matrix_row >= kTailStart) {
+        const int tail_row = matrix_row - kTailStart;
+        const int tail_column = column - kTailStart;
+        values.x = tail_column <= tail_row
+                       ? factor[tail_row * kTailLd + tail_column]
+                       : 0.0f;
+        values.y = tail_column + 1 <= tail_row
+                       ? factor[tail_row * kTailLd + tail_column + 1]
+                       : 0.0f;
+        values.z = tail_column + 2 <= tail_row
+                       ? factor[tail_row * kTailLd + tail_column + 2]
+                       : 0.0f;
+        values.w = tail_column + 3 <= tail_row
+                       ? factor[tail_row * kTailLd + tail_column + 3]
+                       : 0.0f;
+      }
+      reinterpret_cast<float4*>(out_row)[vector_index] = values;
+    }
+  }
+}
+
 // Block-per-matrix factorization in shared memory: 64 threads own one row
 // each and cooperate through barriers instead of shuffles. The loop body
 // stays tiny (dynamic column index into shared memory), so this family is
@@ -527,6 +839,24 @@ void launch_right_looking(const float* input, float* output) {
       <<<blocks, threads>>>(input, output);
 }
 
+template <int Warps, int MinBlocks>
+void launch_crout_hybrid(const float* input, float* output) {
+  constexpr int threads = Warps * 32;
+  constexpr int blocks = kBatch / Warps;
+  static_assert(kBatch % Warps == 0);
+  crout_hybrid_64_kernel<Warps, MinBlocks>
+      <<<blocks, threads>>>(input, output);
+}
+
+template <int Warps, int MinBlocks>
+void launch_right_hybrid(const float* input, float* output) {
+  constexpr int threads = Warps * 32;
+  constexpr int blocks = kBatch / Warps;
+  static_assert(kBatch % Warps == 0);
+  right_hybrid_64_kernel<Warps, MinBlocks>
+      <<<blocks, threads>>>(input, output);
+}
+
 template <int MatricesPerCta, int RootMode, int MinBlocks>
 void launch_smem(const float* input, float* output) {
   constexpr int threads = MatricesPerCta * kN;
@@ -564,7 +894,9 @@ void launch_variant(const float* input,
     case 16: launch_smem<1, kRawRoot,     7>(input, output); break;
     case 17: launch_smem<2, kRawRoot,     4>(input, output); break;
     case 18: launch_smem_reg<kRawRoot,    7>(input, output); break;
-    default: TORCH_CHECK(false, "native variant must be in [0, 18]");
+    case 22: launch_crout_hybrid<4, 2>(input, output); break;
+    case 23: launch_right_hybrid<4, 2>(input, output); break;
+    default: TORCH_CHECK(false, "native variant must be 0--18, 22, or 23");
   }
 }
 
@@ -644,6 +976,26 @@ void write_right_looking_metadata(int64_t* rows, int variant) {
                     RootLookahead ? 1 : 0, 32, 0);
 }
 
+template <int Warps, int MinBlocks>
+void write_crout_hybrid_metadata(int64_t* rows, int variant) {
+  cudaFuncAttributes attributes{};
+  int active_blocks = 0;
+  query_kernel(crout_hybrid_64_kernel<Warps, MinBlocks>, Warps * 32,
+               &attributes, &active_blocks);
+  fill_metadata_row(rows, variant, attributes, active_blocks, Warps, kRawRoot,
+                    Warps * 32, 1, MinBlocks, 1, 1, 1, 0, 0, 32, 0);
+}
+
+template <int Warps, int MinBlocks>
+void write_right_hybrid_metadata(int64_t* rows, int variant) {
+  cudaFuncAttributes attributes{};
+  int active_blocks = 0;
+  query_kernel(right_hybrid_64_kernel<Warps, MinBlocks>, Warps * 32,
+               &attributes, &active_blocks);
+  fill_metadata_row(rows, variant, attributes, active_blocks, Warps, kRawRoot,
+                    Warps * 32, 1, MinBlocks, 2, 1, 1, 1, 1, 32, 0);
+}
+
 template <int MatricesPerCta, int RootMode, int MinBlocks>
 void write_smem_metadata(int64_t* rows, int variant) {
   cudaFuncAttributes attributes{};
@@ -672,8 +1024,9 @@ void cholesky_1024x64_out(const at::Tensor& data,
                           int64_t variant) {
   check_input(data);
   check_output(data, out);
-  TORCH_CHECK(variant >= 0 && variant < kNativeVariants,
-              "native variant must be in [0, 18]");
+  TORCH_CHECK((variant >= 0 && variant <= 18) ||
+                  (variant >= 22 && variant < kVariantCount),
+              "native variant must be 0--18, 22, or 23");
   launch_variant(data.data_ptr<float>(), out.data_ptr<float>(),
                  static_cast<int>(variant));
   const auto status = cudaPeekAtLastError();
@@ -689,7 +1042,7 @@ at::Tensor cholesky_1024x64(const at::Tensor& data,
 }
 
 at::Tensor cholesky_1024x64_metadata() {
-  auto result = at::zeros({20, kMetadataColumns},
+  auto result = at::zeros({kVariantCount, kMetadataColumns},
                           at::TensorOptions().dtype(at::kLong).device(at::kCPU));
   int64_t* rows = result.data_ptr<int64_t>();
   write_crout_metadata<4, 0, 1, kPreciseRoot, 1, 1, 2>(rows, 0);
@@ -718,6 +1071,10 @@ at::Tensor cholesky_1024x64_metadata() {
   dx_row[4] = 128;
   dx_row[17] = kN;
   dx_row[18] = 1;
+  rows[20 * kMetadataColumns] = 20;
+  rows[21 * kMetadataColumns] = 21;
+  write_crout_hybrid_metadata<4, 2>(rows, 22);
+  write_right_hybrid_metadata<4, 2>(rows, 23);
   return result;
 }
 """
@@ -1031,7 +1388,7 @@ def _native_module():
     os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
     try:
         return load_inline(
-            name="cholesky_b1024n64_algorithms_v1",
+            name="cholesky_b1024n64_algorithms_v4",
             cpp_sources=_CPP_SOURCE,
             cuda_sources=_CUDA_SOURCE,
             functions=None,
@@ -1060,8 +1417,10 @@ def _run_variant(
     variant: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if not 0 <= variant < _VARIANT_COUNT:
-        raise ValueError(f"variant must be in [0, {_VARIANT_COUNT - 1}], got {variant}")
+    if variant not in _VARIANT_IDS:
+        raise ValueError(
+            f"variant must be one of {_VARIANT_IDS}, got {variant}"
+        )
     if variant == _CUSOLVERDX_VARIANT:
         module = _cusolverdx_module()
         if out is None:
