@@ -18,8 +18,12 @@ Build an efficient batched dense Cholesky factorization algorithm for the B200 G
 ## Build and Submission Constraints
 - MathDx 26.06/cuSolverDx 0.5 must provide `cusolverdx.hpp`, its bundled CUTLASS headers, and `libcusolverdx.fatbin`. Discover a complete installation from `MATHDX_ROOT` or the installed MathDx package and fail with a clear error if any component is missing.
 - The cuSolverDx native extension requires relocatable device code and device LTO, followed by a device-link step that includes the packaged fatbin. Warm the specialization and configure block-kernel dynamic shared memory before CUDA graph capture.
-- The evaluation server rejects `cholesky.py` if it contains the substring formed by the letters `s-t-r-e-a-m`, even inside a longer word or comment. Preserve the raw `queue_handle` convention and check the submission file before handoff.
+- The evaluation server rejects any submission file containing the substring formed by the letters `s-t-r-e-a-m` — anywhere, even inside a longer word or comment. They also reject any workarounds like _QUEUE_TYPE = "cuda" + "Str" + "eam_t"
 - Keep unrelated user changes intact. In particular, do not modify `probe_submission.py`, vendored/reference trees, or untracked files unless the user places them in scope.
+
+## Profiling Analysis Guidelines
+- After analyzing a trace, copy any helpful scripts you executed under cholesky/bBnN/artifacts/helpers/ncu/
+- When Nsight Compute helpers report missing metrics, or metric names, units, or normalization differ between profiler versions, explicitly flag the mismatch to the user before interpreting any substituted or equivalent metrics. State the expected and actual metric names, distinguish direct measurements from inference, and never silently substitute metrics.
 
 ## References
 - lapack/ directory contains linalg algorithm correctness references
