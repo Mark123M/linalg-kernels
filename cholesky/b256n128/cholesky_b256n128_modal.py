@@ -1,0 +1,994 @@
+"""B200 tuning, profiling, and Popcorn orchestration for batched 256x128.
+
+Examples:
+    .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+        --action tune
+    .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+        --action nsys --variants 6,8,11,14,17,18,19
+    .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+        --action ncu --variants 6,8,11,14,17,18,19
+    .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+        --action popcorn
+"""
+
+from __future__ import annotations
+
+import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+from types import ModuleType
+from typing import Any
+
+import modal
+
+
+VARIANT_COUNT = 20
+VARIANT_IDS = tuple(range(VARIANT_COUNT))
+VARIANT_NAMES = (
+    "phase_v6_precise_u8",
+    "phase_v6_refined_u8",
+    "phase_v6_raw_u8",
+    "phase_v13_raw_full",
+    "phase_v13_raw_u8",
+    "phase_rows_raw",
+    "rank1_rows_raw",
+    "rank1_warptail_raw",
+    "async_phase_v13_raw",
+    "simt_tile_v13_raw",
+    "tf32_wmma_v13_raw",
+    "full128_refined",
+    "full128_raw",
+    "phase_shared_v6_precise_u8",
+    "phase_shared_v6_refined_u8",
+    "phase_shared_v6_raw_u8",
+    "phase_shared_v13_raw_full",
+    "phase_shared_v13_raw_u8",
+    "simt_shared_v13_raw",
+    "tf32_shared_v13_raw",
+)
+
+LOCAL_SOLUTION = "cholesky/b256n128/cholesky_b256n128.py"
+LOCAL_SCRIPT = "cholesky/b256n128/cholesky_b256n128_modal.py"
+REMOTE_SOLUTION = "/workspace/cholesky_b256n128.py"
+REMOTE_SCRIPT = "/workspace/cholesky_b256n128_modal.py"
+_WORKER_PROCESS = len(sys.argv) > 1 and sys.argv[1].startswith("_worker_")
+
+
+def _base_image() -> modal.Image:
+    return (
+        modal.Image.from_registry(
+            "nvidia/cuda:13.1.1-devel-ubuntu24.04", add_python="3.13"
+        )
+        .entrypoint([])
+        .pip_install(
+            "torch==2.12.0",
+            "ninja",
+            extra_index_url="https://download.pytorch.org/whl/cu130",
+        )
+        .env(
+            {
+                "TORCH_EXTENSIONS_DIR": "/cache/torch_extensions",
+                "TMPDIR": "/cache/tmp",
+                "CC": "gcc",
+                "CXX": "g++",
+            }
+        )
+    )
+
+
+def _mount_sources(image: modal.Image) -> modal.Image:
+    return image.add_local_file(
+        LOCAL_SOLUTION, REMOTE_SOLUTION, copy=False
+    ).add_local_file(LOCAL_SCRIPT, REMOTE_SCRIPT, copy=False)
+
+
+if _WORKER_PROCESS:
+    benchmark_image = modal.Image.debian_slim()
+    nsys_image = benchmark_image
+    ncu_image = benchmark_image
+else:
+    benchmark_image = _mount_sources(_base_image())
+    nsys_image = _mount_sources(
+        _base_image().apt_install("cuda-nsight-systems-13-1")
+    )
+    ncu_image = _mount_sources(
+        _base_image().apt_install("cuda-nsight-compute-13-1")
+    )
+
+app = modal.App("cholesky-b256n128-b200", image=benchmark_image)
+cache_volume = modal.Volume.from_name(
+    "cholesky-b256n128-cache", create_if_missing=True
+)
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _install_task_stub() -> None:
+    if "task" in sys.modules:
+        return
+    import torch
+
+    task = ModuleType("task")
+    task.input_t = torch.Tensor
+    task.output_t = torch.Tensor
+    sys.modules["task"] = task
+
+
+def _load_solution():
+    _install_task_stub()
+    path = Path(REMOTE_SOLUTION)
+    spec = importlib.util.spec_from_file_location("chol_b256n128_solution", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _report_environment() -> dict[str, Any]:
+    import torch
+
+    smi = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,driver_version,clocks.sm,clocks.max.sm,clocks.mem,"
+            "clocks.max.mem,power.limit",
+            "--format=csv,noheader",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    nvcc = subprocess.run(["nvcc", "--version"], capture_output=True, text=True)
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "gpu": smi.stdout.strip() or smi.stderr.strip(),
+        "multiprocessor_count": properties.multi_processor_count,
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "capability": list(torch.cuda.get_device_capability()),
+        "nvcc": nvcc.stdout.strip(),
+    }
+
+
+def _generator(seed: int):
+    import torch
+
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    return generator
+
+
+def _make_input(case: str, seed: int):
+    import torch
+
+    batch, n = 256, 128
+    device = torch.device("cuda")
+    generator = _generator(seed)
+    eye = torch.eye(n, device=device, dtype=torch.float32).expand(batch, n, n)
+
+    if case == "diagonal":
+        values = torch.logspace(0.0, math.log10(5.0), n, device=device)
+        return torch.diag_embed(values.expand(batch, n)).contiguous()
+
+    if case == "tridiagonal":
+        diagonal = torch.full((batch, n), 2.0, device=device)
+        off_diagonal = torch.full((batch, n - 1), -0.25, device=device)
+        return (
+            torch.diag_embed(diagonal)
+            + torch.diag_embed(off_diagonal, offset=1)
+            + torch.diag_embed(off_diagonal, offset=-1)
+        ).contiguous()
+
+    if case == "lowrank":
+        factors = torch.randn(
+            batch, n, 4, device=device, dtype=torch.float32, generator=generator
+        )
+        return (factors @ factors.transpose(1, 2) + 0.5 * eye).contiguous()
+
+    source = torch.randn(
+        batch, n, n, device=device, dtype=torch.float32, generator=generator
+    )
+    if case == "spectrum":
+        q, _ = torch.linalg.qr(source)
+        values = torch.logspace(0.0, math.log10(5.0), n, device=device)
+        return ((q * values.view(1, 1, n)) @ q.transpose(1, 2)).contiguous()
+
+    dense = source @ source.transpose(1, 2) + 4.0 * eye
+    if case == "rowscale":
+        scales = torch.logspace(
+            0.0, 0.5 * math.log10(4.0), n, device=device
+        ).view(1, n)
+        dense = dense * scales.unsqueeze(2) * scales.unsqueeze(1)
+    elif case != "dense":
+        raise ValueError(f"unknown case: {case}")
+    return dense.contiguous()
+
+
+def _scaled_reconstruction_residual(data, factor) -> float:
+    import torch
+
+    reconstructed = factor @ factor.transpose(1, 2)
+    residual_norm = (data - reconstructed).abs().sum(dim=2).amax(dim=1)
+    data_norm = data.abs().sum(dim=2).amax(dim=1).clamp_min(1.0e-30)
+    scaled = residual_norm / (torch.finfo(torch.float32).eps * 128 * data_norm)
+    return float(scaled.amax().item())
+
+
+def _validate_factor(data, factor, reference_scaled: float) -> dict[str, Any]:
+    import torch
+
+    shape_ok = tuple(factor.shape) == tuple(data.shape)
+    dtype_ok = factor.dtype == data.dtype
+    device_ok = factor.device == data.device
+    finite = bool(torch.isfinite(factor).all().item())
+    upper_max = float(torch.triu(factor, diagonal=1).abs().amax().item())
+    diagonal_min = float(factor.diagonal(dim1=1, dim2=2).amin().item())
+    scaled = _scaled_reconstruction_residual(data, factor) if finite else math.inf
+    limit = max(16.0, 8.0 * reference_scaled)
+    passed = (
+        shape_ok
+        and dtype_ok
+        and device_ok
+        and finite
+        and upper_max == 0.0
+        and diagonal_min > 0.0
+        and scaled <= limit
+    )
+    return {
+        "passed": passed,
+        "shape_ok": shape_ok,
+        "dtype_ok": dtype_ok,
+        "device_ok": device_ok,
+        "finite": finite,
+        "upper_max": upper_max,
+        "diagonal_min": diagonal_min,
+        "scaled_reconstruction_residual": scaled,
+        "reference_scaled_reconstruction_residual": reference_scaled,
+        "modal_gate": limit,
+    }
+
+
+RESOURCE_COLUMNS = (
+    "variant",
+    "threads_per_cta",
+    "registers_per_thread",
+    "local_bytes_per_thread",
+    "static_shared_bytes_per_cta",
+    "dynamic_shared_bytes_per_cta",
+    "active_ctas_per_sm",
+    "resident_warps_per_sm",
+    "first_factor",
+    "root_mode",
+    "update_mode",
+    "last_factor",
+    "async_load",
+    "full_trsm_unroll",
+    "unblocked",
+    "tensor_update",
+    "launch_min_ctas_per_sm",
+    "matrices_per_cta",
+)
+
+
+def _resource_rows(solution) -> list[dict[str, Any]]:
+    metadata = solution._variant_metadata()
+    expected_shape = (VARIANT_COUNT, len(RESOURCE_COLUMNS))
+    if tuple(metadata.shape) != expected_shape:
+        raise RuntimeError(
+            "native metadata ABI mismatch: "
+            f"expected {expected_shape}, got {tuple(metadata.shape)}"
+        )
+    return [
+        dict(zip(RESOURCE_COLUMNS, row, strict=True))
+        for row in metadata.tolist()
+    ]
+
+
+def _measure_variants(
+    solution, variants: list[int], calls: int, repeats: int
+) -> list[dict[str, Any]]:
+    import torch
+
+    ring_size = 8
+    inputs = [_make_input("dense", 41128 + index) for index in range(ring_size)]
+    outputs = [torch.empty_like(inputs[0]) for _ in range(ring_size)]
+    samples: dict[int, list[float]] = {variant: [] for variant in variants}
+
+    for variant in variants:
+        for index in range(16):
+            slot = index % ring_size
+            solution._run_variant(inputs[slot], variant, outputs[slot])
+    torch.cuda.synchronize()
+
+    for repeat in range(repeats):
+        order = list(variants)
+        if repeat & 1:
+            order.reverse()
+        for variant in order:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for index in range(calls):
+                slot = index % ring_size
+                solution._run_variant(inputs[slot], variant, outputs[slot])
+            end.record()
+            end.synchronize()
+            samples[variant].append(float(start.elapsed_time(end)) / calls)
+
+    results = []
+    for variant, values in samples.items():
+        results.append(
+            {
+                "variant": variant,
+                "name": VARIANT_NAMES[variant],
+                "samples_ms": values,
+                "median_ms": statistics.median(values),
+                "minimum_ms": min(values),
+            }
+        )
+    results.sort(key=lambda row: row["median_ms"])
+    return results
+
+
+def _run_tuning(
+    variants: list[int], calls: int, repeats: int
+) -> dict[str, Any]:
+    import torch
+
+    Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+    solution = _load_solution()
+    resources_by_variant = {
+        row["variant"]: row for row in _resource_rows(solution)
+    }
+    validation: dict[str, list[dict[str, Any]]] = {
+        str(variant): [] for variant in variants
+    }
+    cases = (
+        "dense",
+        "spectrum",
+        "diagonal",
+        "lowrank",
+        "rowscale",
+        "tridiagonal",
+    )
+    for case_index, case in enumerate(cases):
+        data = _make_input(case, 3321 + case_index)
+        reference = torch.linalg.cholesky_ex(data, check_errors=False).L
+        reference_scaled = _scaled_reconstruction_residual(data, reference)
+        for variant in variants:
+            factor = solution._run_variant(data, variant)
+            result = _validate_factor(data, factor, reference_scaled)
+            result["case"] = case
+            validation[str(variant)].append(result)
+        del data, reference
+
+    timings = _measure_variants(solution, variants, calls, repeats)
+    for row in timings:
+        checks = validation[str(row["variant"])]
+        row["modal_validation_passed"] = all(
+            check["passed"] for check in checks
+        )
+
+    return {
+        "timestamp_utc": _timestamp(),
+        "environment": _report_environment(),
+        "variants": variants,
+        "calls_per_sample": calls,
+        "repeats": repeats,
+        "resources": [resources_by_variant[variant] for variant in variants],
+        "validation": validation,
+        "timings": timings,
+    }
+
+
+@app.function(gpu="B200", timeout=3600, volumes={"/cache": cache_volume})
+def tune_remote(
+    variants: list[int], calls: int, repeats: int
+) -> dict[str, Any]:
+    return _run_tuning(variants, calls, repeats)
+
+
+def _worker_preflight(variant: int) -> None:
+    import torch
+
+    solution = _load_solution()
+    data = _make_input("dense", 41128)
+    out = torch.empty_like(data)
+    for _ in range(8):
+        solution._run_variant(data, variant, out)
+    torch.cuda.synchronize()
+    resources = _resource_rows(solution)[variant]
+    factor = solution._run_variant(data, variant)
+    reference = torch.linalg.cholesky_ex(data, check_errors=False).L
+    reference_scaled = _scaled_reconstruction_residual(data, reference)
+    payload = {
+        "variant": variant,
+        "name": VARIANT_NAMES[variant],
+        "resources": resources,
+        "validation": _validate_factor(data, factor, reference_scaled),
+        "environment": _report_environment(),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+
+
+def _worker_nsys(variant: int, calls: int) -> None:
+    import torch
+
+    solution = _load_solution()
+    ring_size = 8
+    inputs = [_make_input("dense", 41128 + index) for index in range(ring_size)]
+    outputs = [torch.empty_like(inputs[0]) for _ in range(ring_size)]
+    for index in range(16):
+        slot = index % ring_size
+        solution._run_variant(inputs[slot], variant, outputs[slot])
+    torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(f"variant_{variant}_{VARIANT_NAMES[variant]}")
+    for index in range(calls):
+        slot = index % ring_size
+        solution._run_variant(inputs[slot], variant, outputs[slot])
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.cudart().cudaProfilerStop()
+
+
+NCU_WARMUP_LAUNCHES = 16
+
+
+def _ncu_kernel_name(variant: int) -> str:
+    if variant in (11, 12):
+        return "unblocked_128_kernel"
+    if variant >= 13:
+        return "shared_blocked_128_kernel"
+    return "blocked_128_kernel"
+
+
+def _worker_ncu(variant: int) -> None:
+    import torch
+
+    solution = _load_solution()
+    data = _make_input("dense", 41128)
+    out = torch.empty_like(data)
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(NCU_WARMUP_LAUNCHES + 1):
+        solution._run_variant(data, variant, out)
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+
+
+def _write_preflight(output_dir: Path, variant: int) -> None:
+    completed = subprocess.run(
+        [sys.executable, REMOTE_SCRIPT, "_worker_preflight", str(variant)],
+        capture_output=True,
+        text=True,
+    )
+    (output_dir / "preflight.json").write_text(completed.stdout)
+    if completed.stderr.strip():
+        (output_dir / "preflight.stderr.txt").write_text(completed.stderr)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"variant {variant} preflight failed with code "
+            f"{completed.returncode}: {completed.stderr[-4000:]}"
+        )
+
+
+@app.function(
+    image=nsys_image,
+    gpu="B200",
+    timeout=3600,
+    volumes={"/cache": cache_volume},
+)
+def nsys_remote(variant: int, calls: int, run_name: str) -> list[str]:
+    output_dir = Path("/cache/nsys") / run_name / (
+        f"v{variant}_{VARIANT_NAMES[variant]}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=False)
+    Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+    _write_preflight(output_dir, variant)
+
+    report_base = output_dir / "profile"
+    command = [
+        "nsys",
+        "profile",
+        "--trace=cuda,nvtx",
+        "--sample=none",
+        "--cpuctxsw=none",
+        "--capture-range=cudaProfilerApi",
+        "--capture-range-end=stop",
+        "--force-overwrite=true",
+        "--output",
+        str(report_base),
+        "--",
+        sys.executable,
+        REMOTE_SCRIPT,
+        "_worker_nsys",
+        str(variant),
+        str(calls),
+    ]
+    (output_dir / "nsys-command.json").write_text(
+        json.dumps(command, indent=2) + "\n"
+    )
+    completed = subprocess.run(command, capture_output=True, text=True)
+    (output_dir / "nsys.stdout.txt").write_text(completed.stdout)
+    (output_dir / "nsys.stderr.txt").write_text(completed.stderr)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"variant {variant} nsys failed with code {completed.returncode}: "
+            f"{completed.stderr[-4000:]}"
+        )
+
+    report_path = report_base.with_suffix(".nsys-rep")
+    if not report_path.is_file() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"missing or empty Nsight artifact: {report_path}")
+
+    temporary_sqlite = Path("/tmp") / (
+        f"cholesky_b256n128_nsys_v{variant}_{os.getpid()}.sqlite"
+    )
+    try:
+        stats = subprocess.run(
+            [
+                "nsys",
+                "stats",
+                "--sqlite",
+                str(temporary_sqlite),
+                "--format",
+                "table",
+                "--output",
+                "-",
+                str(report_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        temporary_sqlite.unlink(missing_ok=True)
+    (output_dir / "stats.txt").write_text(stats.stdout + stats.stderr)
+    if stats.returncode != 0 or not stats.stdout.strip():
+        raise RuntimeError(f"variant {variant} nsys stats failed")
+
+    cache_volume.commit()
+    return [
+        str(path.relative_to("/cache"))
+        for path in sorted(output_dir.iterdir())
+        if path.is_file() and path.stat().st_size > 0
+    ]
+
+
+NCU_SECTIONS = (
+    "ComputeWorkloadAnalysis",
+    "InstructionStats",
+    "LaunchStats",
+    "MemoryWorkloadAnalysis",
+    "Occupancy",
+    "SchedulerStats",
+    "SourceCounters",
+    "SpeedOfLight",
+    "SpeedOfLight_RooflineChart",
+    "SpeedOfLight_HierarchicalSingleRooflineChart",
+    "WarpStateStats",
+)
+
+
+def _subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
+    parts = []
+    if completed.stdout.strip():
+        parts.append(f"stdout:\n{completed.stdout.strip()}")
+    if completed.stderr.strip():
+        parts.append(f"stderr:\n{completed.stderr.strip()}")
+    return "\n".join(parts) or "profiler produced no stdout or stderr"
+
+
+@app.function(
+    image=ncu_image,
+    gpu="B200",
+    timeout=3600,
+    volumes={"/cache": cache_volume},
+)
+def ncu_remote(variant: int, run_name: str) -> list[str]:
+    output_dir = Path("/cache/ncu") / run_name / (
+        f"v{variant}_{VARIANT_NAMES[variant]}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=False)
+    Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+    _write_preflight(output_dir, variant)
+
+    version = subprocess.run(["ncu", "--version"], capture_output=True, text=True)
+    (output_dir / "ncu-version.txt").write_text(
+        version.stdout + version.stderr
+    )
+    if version.returncode != 0:
+        raise RuntimeError(f"ncu --version failed: {version.stderr[-2000:]}")
+
+    report_base = output_dir / "profile"
+    command = [
+        "ncu",
+        "--profile-from-start",
+        "off",
+        "--verbose",
+        "--replay-mode",
+        "kernel",
+        "--cache-control",
+        "all",
+        "--kernel-name",
+        _ncu_kernel_name(variant),
+        "--launch-skip",
+        str(NCU_WARMUP_LAUNCHES),
+        "--launch-count",
+        "1",
+        "--force-overwrite",
+        "--export",
+        str(report_base),
+    ]
+    for section in NCU_SECTIONS:
+        command.extend(("--section", section))
+    command.extend((sys.executable, REMOTE_SCRIPT, "_worker_ncu", str(variant)))
+    (output_dir / "ncu-command.json").write_text(
+        json.dumps(command, indent=2) + "\n"
+    )
+
+    profiler_scratch = Path("/tmp") / (
+        f"cholesky_b256n128_ncu_v{variant}_{os.getpid()}"
+    )
+    profiler_scratch.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(profiler_scratch)
+    completed = subprocess.run(
+        command, capture_output=True, text=True, env=environment
+    )
+    (output_dir / "ncu.stdout.txt").write_text(completed.stdout)
+    (output_dir / "ncu.stderr.txt").write_text(completed.stderr)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Nsight Compute failed; requested sections are not replaced by "
+            "different metrics.\n"
+            f"command: {json.dumps(command)}\n"
+            f"{_subprocess_diagnostics(completed)[-16000:]}"
+        )
+
+    report_path = report_base.with_suffix(".ncu-rep")
+    if not report_path.is_file() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"missing or empty Nsight artifact: {report_path}")
+
+    detail_outputs = (
+        (output_dir / "ncu-details.txt", ()),
+        (output_dir / "ncu-details.csv", ("--csv", "--print-units", "base")),
+    )
+    for detail_path, extra_arguments in detail_outputs:
+        details = subprocess.run(
+            [
+                "ncu",
+                "--import",
+                str(report_path),
+                "--page",
+                "details",
+                "--print-details",
+                "all",
+                *extra_arguments,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        detail_path.write_text(details.stdout)
+        if details.returncode != 0 or not details.stdout.strip():
+            raise RuntimeError(
+                f"failed to export {detail_path.name}:\n"
+                f"{_subprocess_diagnostics(details)[-4000:]}"
+            )
+
+    cache_volume.commit()
+    return [
+        str(path.relative_to("/cache"))
+        for path in sorted(output_dir.iterdir())
+        if path.is_file() and path.stat().st_size > 0
+    ]
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if path.stat().st_size == 0:
+        raise RuntimeError(f"wrote empty result: {path}")
+
+
+def _parse_variants(text: str) -> list[int]:
+    if not text.strip():
+        return list(VARIANT_IDS)
+    result = sorted({int(item.strip()) for item in text.split(",") if item.strip()})
+    if not result or any(variant not in VARIANT_IDS for variant in result):
+        raise ValueError(f"variants must be comma-separated IDs from {VARIANT_IDS}")
+    return result
+
+
+def _download_artifacts(
+    kind: str,
+    variants: list[int],
+    output_root: Path,
+    calls: int = 0,
+) -> None:
+    run_name = f"b256_n128_{_timestamp()}"
+    destination = output_root / run_name
+    for variant in variants:
+        if kind == "nsys":
+            remote_paths = nsys_remote.remote(variant, calls, run_name)
+        elif kind == "ncu":
+            remote_paths = ncu_remote.remote(variant, run_name)
+        else:
+            raise ValueError(f"unknown artifact kind: {kind}")
+        variant_dir = destination / f"v{variant}_{VARIANT_NAMES[variant]}"
+        for remote_path in remote_paths:
+            local_path = variant_dir / Path(remote_path).name
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as file_object:
+                cache_volume.read_file_into_fileobj(remote_path, file_object)
+            if local_path.stat().st_size == 0:
+                raise RuntimeError(f"downloaded empty artifact: {local_path}")
+            print(f"downloaded {local_path}")
+
+
+def _variant_source(source: str, variant: int) -> str:
+    pattern = r"^_DEFAULT_VARIANT = \d+  # POPCORN_VARIANT$"
+    replacement = f"_DEFAULT_VARIANT = {variant}  # POPCORN_VARIANT"
+    rendered, count = re.subn(pattern, replacement, source, flags=re.MULTILINE)
+    if count != 1:
+        raise RuntimeError(f"expected one production variant marker, replaced {count}")
+    ast.parse(rendered)
+    rejected = "s" + "tream"
+    if rejected in rendered:
+        raise RuntimeError(f"temporary submission contains rejected token: {rejected}")
+    return rendered
+
+
+def _parse_public_score(text: str) -> float | None:
+    match = re.search(
+        r"Geomean score \(public\) on B200:\s*([0-9.eE+-]+)\s*s", text
+    )
+    return float(match.group(1)) if match else None
+
+
+def _run_popcorn_sweep(
+    output_root: Path, variants: list[int], rounds: int
+) -> None:
+    source_path = _repo_root() / LOCAL_SOLUTION
+    source = source_path.read_text()
+    run_dir = output_root / f"popcorn_{_timestamp()}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    rows: list[dict[str, Any]] = []
+
+    def submit_one(
+        round_index: int,
+        variant: int,
+        submission_path: Path,
+        result_path: Path,
+    ) -> dict[str, Any]:
+        command = [
+            "popcorn",
+            "submit",
+            "--no-tui",
+            "--leaderboard",
+            "cholesky",
+            "--gpu",
+            "B200",
+            "--mode",
+            "leaderboard",
+            "--output",
+            str(result_path),
+            str(submission_path),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True)
+        prefix = run_dir / f"r{round_index}_v{variant}"
+        prefix.with_suffix(".stdout.txt").write_text(completed.stdout)
+        prefix.with_suffix(".stderr.txt").write_text(completed.stderr)
+        result_text = result_path.read_text() if result_path.is_file() else ""
+        combined = "\n".join((result_text, completed.stdout, completed.stderr))
+        return {
+            "round": round_index,
+            "variant": variant,
+            "name": VARIANT_NAMES[variant],
+            "returncode": completed.returncode,
+            "public_b200_geomean_seconds": _parse_public_score(combined),
+            "result_file": str(result_path),
+        }
+
+    with tempfile.TemporaryDirectory(prefix="chol_b256n128_") as temporary:
+        temporary_dir = Path(temporary)
+        submissions: dict[int, Path] = {}
+        for variant in variants:
+            submission_path = temporary_dir / f"cholesky_b256n128_v{variant}.py"
+            submission_path.write_text(_variant_source(source, variant))
+            submissions[variant] = submission_path
+
+        for round_index in range(1, rounds + 1):
+            with ThreadPoolExecutor(max_workers=len(variants)) as executor:
+                pending = {}
+                for variant in variants:
+                    result_path = run_dir / (
+                        f"r{round_index}_v{variant}_{VARIANT_NAMES[variant]}.result.txt"
+                    )
+                    future = executor.submit(
+                        submit_one,
+                        round_index,
+                        variant,
+                        submissions[variant],
+                        result_path,
+                    )
+                    pending[future] = variant
+                    print(
+                        f"queued round {round_index} variant {variant}: "
+                        f"{VARIANT_NAMES[variant]}",
+                        flush=True,
+                    )
+
+                for future in as_completed(pending):
+                    row = future.result()
+                    rows.append(row)
+                    rows.sort(key=lambda item: (item["round"], item["variant"]))
+                    _write_json(run_dir / "progress.json", {"submissions": rows})
+                    print(
+                        f"completed round {row['round']} variant {row['variant']} "
+                        f"returncode={row['returncode']} "
+                        f"score={row['public_b200_geomean_seconds']}",
+                        flush=True,
+                    )
+
+    aggregates = []
+    for variant in variants:
+        scores = [
+            row["public_b200_geomean_seconds"]
+            for row in rows
+            if row["variant"] == variant
+            and row["public_b200_geomean_seconds"] is not None
+        ]
+        aggregates.append(
+            {
+                "variant": variant,
+                "name": VARIANT_NAMES[variant],
+                "successful_rounds": len(scores),
+                "scores_seconds": scores,
+                "median_seconds": statistics.median(scores) if scores else None,
+                "minimum_seconds": min(scores) if scores else None,
+            }
+        )
+    ranking = sorted(
+        (row for row in aggregates if row["median_seconds"] is not None),
+        key=lambda row: row["median_seconds"],
+    )
+    summary = {
+        "timestamp_utc": _timestamp(),
+        "policy": (
+            "report-only median public geomean; tracked production ID is not changed"
+        ),
+        "requested_variants": variants,
+        "rounds": rounds,
+        "submissions": rows,
+        "aggregates": aggregates,
+        "ranking": ranking,
+        "winner": ranking[0] if ranking else None,
+    }
+    summary_path = run_dir / "summary.json"
+    _write_json(summary_path, summary)
+    if ranking:
+        winner = ranking[0]
+        print(
+            f"reported winner: variant {winner['variant']} ({winner['name']}), "
+            f"median geomean={winner['median_seconds']} s"
+        )
+    else:
+        print("no successful public B200 score was parsed")
+    print(f"Popcorn summary: {summary_path}")
+
+
+@app.local_entrypoint()
+def main(
+    action: str = "tune",
+    output: str = "",
+    variants: str = "",
+    calls: int = 200,
+    repeats: int = 5,
+    profile_calls: int = 64,
+    rounds: int = 1,
+) -> None:
+    selected = _parse_variants(variants)
+    root = _repo_root()
+    default_artifacts = root / "cholesky/b256n128/artifacts"
+
+    if action == "tune":
+        if calls <= 0 or repeats <= 0:
+            raise ValueError("calls and repeats must be positive")
+        payload = tune_remote.remote(selected, calls, repeats)
+        output_path = (
+            Path(output)
+            if output
+            else default_artifacts / f"tuning_{payload['timestamp_utc']}.json"
+        )
+        _write_json(output_path, payload)
+        print(f"tuning JSON: {output_path}")
+        correct = [
+            row for row in payload["timings"] if row["modal_validation_passed"]
+        ]
+        if not correct:
+            failed_validation = [
+                row["variant"]
+                for row in payload["timings"]
+                if not row["modal_validation_passed"]
+            ]
+            raise RuntimeError(
+                "no variant passed numerical validation; "
+                f"failed_validation={failed_validation}; details={output_path}"
+            )
+        best = correct[0]
+        print(
+            f"Modal fastest correct: variant {best['variant']} ({best['name']}), "
+            f"median={best['median_ms']:.6f} ms"
+        )
+        return
+
+    if action == "nsys":
+        if profile_calls <= 0:
+            raise ValueError("profile_calls must be positive")
+        output_root = Path(output) if output else default_artifacts / "nsys"
+        _download_artifacts(
+            "nsys", selected, output_root, calls=profile_calls
+        )
+        return
+
+    if action == "ncu":
+        if not variants.strip():
+            raise ValueError("--action ncu requires an explicit --variants list")
+        output_root = Path(output) if output else default_artifacts / "ncu"
+        _download_artifacts("ncu", selected, output_root)
+        return
+
+    if action == "popcorn":
+        if rounds <= 0:
+            raise ValueError("rounds must be positive")
+        output_root = Path(output) if output else default_artifacts
+        _run_popcorn_sweep(output_root, selected, rounds)
+        return
+
+    raise ValueError("action must be one of: tune, nsys, ncu, popcorn")
+
+
+def _worker_cli() -> None:
+    if len(sys.argv) < 3:
+        raise SystemExit("worker mode requires a variant")
+    mode = sys.argv[1]
+    variant = int(sys.argv[2])
+    if variant not in VARIANT_IDS:
+        raise SystemExit(f"variant must be one of {VARIANT_IDS}")
+    if mode == "_worker_preflight":
+        _worker_preflight(variant)
+        return
+    if mode == "_worker_nsys":
+        if len(sys.argv) != 4:
+            raise SystemExit("nsys worker requires call count")
+        _worker_nsys(variant, int(sys.argv[3]))
+        return
+    if mode == "_worker_ncu":
+        if len(sys.argv) != 3:
+            raise SystemExit("ncu worker takes only a variant")
+        _worker_ncu(variant)
+        return
+    raise SystemExit(f"unknown worker mode: {mode}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].startswith(
+    "_worker_"
+):
+    _worker_cli()
