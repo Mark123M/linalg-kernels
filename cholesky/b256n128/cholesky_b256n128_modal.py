@@ -4,9 +4,9 @@ Examples:
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
         --action tune
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
-        --action nsys --variants 6,8,11,14,17,18,19
+        --action nsys --variants 9,20,21,22,23,24,25
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
-        --action ncu --variants 6,8,11,14,17,18,19
+        --action ncu --variants 9,20,21,22,23,24,25
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
         --action popcorn
 """
@@ -32,7 +32,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 20
+VARIANT_COUNT = 26
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "phase_v6_precise_u8",
@@ -55,21 +55,56 @@ VARIANT_NAMES = (
     "phase_shared_v13_raw_u8",
     "simt_shared_v13_raw",
     "tf32_shared_v13_raw",
+    "simt_tile_v13_raw_overlap",
+    "simt_tile_v6_raw",
+    "simt_balanced_v13_raw",
+    "simt_balanced_v13_raw_overlap",
+    "simt_tile_v6_raw_overlap",
+    "simt_balanced_v6_raw_overlap",
 )
 
 LOCAL_SOLUTION = "cholesky/b256n128/cholesky_b256n128.py"
 LOCAL_SCRIPT = "cholesky/b256n128/cholesky_b256n128_modal.py"
 REMOTE_SOLUTION = "/workspace/cholesky_b256n128.py"
 REMOTE_SCRIPT = "/workspace/cholesky_b256n128_modal.py"
+CUDA_IMAGE = "nvidia/cuda:13.3.0-devel-ubuntu24.04"
+CUDA_UPDATE_PACKAGES = (
+    "cuda-command-line-tools-13-3=13.3.1-1",
+    "cuda-compiler-13-3=13.3.1-1",
+    "cuda-libraries-dev-13-3=13.3.1-1",
+    "libcublas-13-3=13.6.0.2-1",
+    "libcublas-dev-13-3=13.6.0.2-1",
+)
+NCU_APT_PACKAGE = "cuda-nsight-compute-13-3=13.3.1-1"
+NSYS_DEB_URL = (
+    "https://developer.nvidia.com/downloads/assets/tools/secure/"
+    "nsight-systems/2026_3/"
+    "NsightSystems-linux-cli-public-2026.3.1.157-3804839.deb"
+)
+NSYS_DEB_PATH = "/tmp/NsightSystems-linux-cli-public-2026.3.1.157-3804839.deb"
+NSYS_DEB_SHA256 = (
+    "3eb87ec08e5f8b8f153537847747bd5cfabb51b9c8793873b26a3c55dc813ad1"
+)
 _WORKER_PROCESS = len(sys.argv) > 1 and sys.argv[1].startswith("_worker_")
 
 
 def _base_image() -> modal.Image:
     return (
-        modal.Image.from_registry(
-            "nvidia/cuda:13.1.1-devel-ubuntu24.04", add_python="3.13"
-        )
+        modal.Image.from_registry(CUDA_IMAGE, add_python="3.13")
         .entrypoint([])
+        # NVIDIA has not published a 13.3 Update 1 container tag. Upgrade the
+        # compiler, command-line tools, and development libraries from its
+        # signed Ubuntu repository without adding the visual/profiler bundle.
+        # The 13.3.0 runtime and devel images deliberately hold their cuBLAS
+        # packages, so release only those holds for this explicit upgrade and
+        # restore them immediately afterward.
+        .run_commands(
+            "apt-mark unhold libcublas-13-3 libcublas-dev-13-3"
+        )
+        .apt_install(*CUDA_UPDATE_PACKAGES)
+        .run_commands(
+            "apt-mark hold libcublas-13-3 libcublas-dev-13-3"
+        )
         .pip_install(
             "torch==2.12.0",
             "ninja",
@@ -81,8 +116,45 @@ def _base_image() -> modal.Image:
                 "TMPDIR": "/cache/tmp",
                 "CC": "gcc",
                 "CXX": "g++",
+                "NV_CUDA_LIB_VERSION": "13.3.1-1",
+                "NV_LIBCUBLAS_VERSION": "13.6.0.2-1",
+                "NV_LIBCUBLAS_PACKAGE": "libcublas-13-3=13.6.0.2-1",
+                "NV_LIBCUBLAS_DEV_VERSION": "13.6.0.2-1",
+                "NV_LIBCUBLAS_DEV_PACKAGE": (
+                    "libcublas-dev-13-3=13.6.0.2-1"
+                ),
             }
         )
+    )
+
+
+def _nsys_base_image() -> modal.Image:
+    return (
+        _base_image()
+        .apt_install("curl")
+        .run_commands(
+            f"curl -fL --retry 3 {NSYS_DEB_URL} -o {NSYS_DEB_PATH}",
+            (
+                f"echo '{NSYS_DEB_SHA256}  {NSYS_DEB_PATH}' "
+                "| sha256sum --check --strict"
+            ),
+            (
+                "apt-get update && apt-get install -y --no-install-recommends "
+                f"{NSYS_DEB_PATH} && rm -f {NSYS_DEB_PATH}"
+            ),
+            "nsys --version | grep -F '2026.3.1'",
+        )
+    )
+
+
+def _ncu_base_image() -> modal.Image:
+    return _base_image().apt_install(NCU_APT_PACKAGE).env(
+        {
+            "NV_CUDA_NSIGHT_COMPUTE_VERSION": "13.3.1-1",
+            "NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE": NCU_APT_PACKAGE,
+        }
+    ).run_commands(
+        "ncu --version | grep -F 'Version 2026.2.1'"
     )
 
 
@@ -98,12 +170,8 @@ if _WORKER_PROCESS:
     ncu_image = benchmark_image
 else:
     benchmark_image = _mount_sources(_base_image())
-    nsys_image = _mount_sources(
-        _base_image().apt_install("cuda-nsight-systems-13-1")
-    )
-    ncu_image = _mount_sources(
-        _base_image().apt_install("cuda-nsight-compute-13-1")
-    )
+    nsys_image = _mount_sources(_nsys_base_image())
+    ncu_image = _mount_sources(_ncu_base_image())
 
 app = modal.App("cholesky-b256n128-b200", image=benchmark_image)
 cache_volume = modal.Volume.from_name(
@@ -498,6 +566,13 @@ def nsys_remote(variant: int, calls: int, run_name: str) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=False)
     Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
     _write_preflight(output_dir, variant)
+
+    version = subprocess.run(
+        ["nsys", "--version"], capture_output=True, text=True
+    )
+    (output_dir / "nsys-version.txt").write_text(version.stdout + version.stderr)
+    if version.returncode != 0:
+        raise RuntimeError(f"nsys --version failed: {version.stderr[-2000:]}")
 
     report_base = output_dir / "profile"
     command = [

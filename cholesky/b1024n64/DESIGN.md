@@ -379,6 +379,31 @@ measurements; the explanation that late warp-PC drift causes the concentration
 is an architectural inference supported by the synchronized-smem comparison,
 not a direct cache-miss counter.
 
+### Toolchain image pin — 2026-07-22
+
+The Modal image now starts from NVIDIA's newest published development container,
+`nvidia/cuda:13.3.0-devel-ubuntu24.04`, then installs the CUDA 13.3 Update 1
+compiler, command-line, and development-library meta-packages (`13.3.1-1`) from
+NVIDIA's signed Ubuntu repository. NVIDIA has not published a `13.3.1` container
+tag. Because NVIDIA's 13.3.0 runtime and development images hold cuBLAS at
+13.5.1.27, the build explicitly removes both cuBLAS holds, installs runtime and
+development packages 13.6.0.2, and restores the holds. The profiling layers are
+pinned independently: Nsight Compute
+`2026.2.1` comes from `cuda-nsight-compute-13-3=13.3.1-1`, while Nsight Systems
+CLI `2026.3.1.157` comes from NVIDIA's standalone package and is checked against
+its recorded SHA-256 before installation. Each Systems capture now records
+`nsys-version.txt`, matching the existing `ncu-version.txt` provenance.
+
+PyTorch remains `2.12.0` with the `cu130` wheel to avoid changing the benchmark
+runtime at the same time as the system compiler and profilers. A CUDA 13.3
+compiler versus CUDA 13.0 PyTorch build warning is therefore expected and is
+not suppressed. Existing NCU 2025.4.x reports remain valid historical artifacts,
+but their metric names, section availability, and helper column layouts must not
+be assumed to match 2026.2.1. The previously observed Modal driver 580.95.05
+meets CUDA 13.x's `>=580` minor-compatibility floor, but it is older than the
+610.43.02 driver associated with CUDA 13.3; new-driver-only features are not
+assumed available until a fresh preflight confirms them.
+
 ## Verification commands (user-run; the sandbox has no GPU)
 
 ```bash

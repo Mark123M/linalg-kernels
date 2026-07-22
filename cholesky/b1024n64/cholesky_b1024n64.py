@@ -13,8 +13,8 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
-# 8, 5, 11, 4, 7, 10
-_DEFAULT_VARIANT = 6  # POPCORN_VARIANT
+# 6, 8, 5, 11, 4, 7, 10
+_DEFAULT_VARIANT = 13  # POPCORN_VARIANT
 _VARIANT_COUNT = 24
 _VARIANT_IDS = (*range(20), 22, 23)
 _CUSOLVERDX_VARIANT = 19

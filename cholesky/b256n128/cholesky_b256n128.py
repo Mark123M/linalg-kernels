@@ -8,8 +8,8 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
-_DEFAULT_VARIANT = 1  # POPCORN_VARIANT
-_VARIANT_COUNT = 20
+_DEFAULT_VARIANT = 23  # POPCORN_VARIANT
+_VARIANT_COUNT = 26
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
 
 _CPP_SOURCE = r"""
@@ -51,7 +51,7 @@ constexpr int kThreads = 128;
 constexpr int kSmemFloats = kN * kLd;
 constexpr int kSmemBytes = kSmemFloats * static_cast<int>(sizeof(float));
 constexpr int kAsyncBase = 8320;
-constexpr int kVariantCount = 20;
+constexpr int kVariantCount = 26;
 constexpr int kMetadataColumns = 18;
 constexpr unsigned kFullMask = 0xffffffffu;
 
@@ -66,6 +66,7 @@ constexpr int kPhaseUpdate = 0;
 constexpr int kRank1Update = 1;
 constexpr int kSimtUpdate = 2;
 constexpr int kTf32Update = 3;
+constexpr int kSimtBalancedUpdate = 4;
 
 constexpr int kL11Crout = 0;
 constexpr int kL11Right = 1;
@@ -497,6 +498,137 @@ __device__ __forceinline__ void simt_trailing_update(float* tile) {
   }
 }
 
+__device__ __forceinline__ void packed_diagonal_coordinate(
+    int packed, int& row, int& column) {
+  // Invert the 16x16 lower-triangle packed index with a short decision tree.
+  // This runs once per accumulator, outside the 64-step dot product.
+  if (packed >= 36) {
+    if (packed >= 91) {
+      if (packed >= 120) {
+        row = 15;
+      } else if (packed >= 105) {
+        row = 14;
+      } else {
+        row = 13;
+      }
+    } else if (packed >= 66) {
+      row = packed >= 78 ? 12 : 11;
+    } else if (packed >= 55) {
+      row = 10;
+    } else if (packed >= 45) {
+      row = 9;
+    } else {
+      row = 8;
+    }
+  } else if (packed >= 10) {
+    if (packed >= 21) {
+      row = packed >= 28 ? 7 : 6;
+    } else {
+      row = packed >= 15 ? 5 : 4;
+    }
+  } else if (packed >= 3) {
+    row = packed >= 6 ? 3 : 2;
+  } else {
+    row = packed >= 1 ? 1 : 0;
+  }
+  column = packed - row * (row + 1) / 2;
+}
+
+__device__ __forceinline__ void simt_full_tile_update(
+    float* tile, int block_row, int block_column) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  float accumulators[8];
+#pragma unroll
+  for (int q = 0; q < 8; ++q) {
+    const int element = lane + 32 * q;
+    const int row = 16 * block_row + (element >> 4);
+    const int column = 16 * block_column + (element & 15);
+    accumulators[q] = tile[(kHalf + row) * kLd + kHalf + column];
+  }
+#pragma unroll 8
+  for (int k = 0; k < kHalf; ++k) {
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const int element = lane + 32 * q;
+      const int row = 16 * block_row + (element >> 4);
+      const int column = 16 * block_column + (element & 15);
+      accumulators[q] = fmaf(
+          -tile[(kHalf + row) * kLd + k],
+          tile[(kHalf + column) * kLd + k], accumulators[q]);
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 8; ++q) {
+    const int element = lane + 32 * q;
+    const int row = 16 * block_row + (element >> 4);
+    const int column = 16 * block_column + (element & 15);
+    tile[(kHalf + row) * kLd + kHalf + column] = accumulators[q];
+  }
+}
+
+__device__ __forceinline__ void simt_diagonal_tile_update(
+    float* tile, int block) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  float accumulators[5];
+  int rows[5];
+  int columns[5];
+#pragma unroll
+  for (int q = 0; q < 5; ++q) {
+    const int packed = lane + 32 * q;
+    if (packed < 136) {
+      packed_diagonal_coordinate(packed, rows[q], columns[q]);
+      const int row = 16 * block + rows[q];
+      const int column = 16 * block + columns[q];
+      accumulators[q] = tile[(kHalf + row) * kLd + kHalf + column];
+    }
+  }
+#pragma unroll 8
+  for (int k = 0; k < kHalf; ++k) {
+#pragma unroll
+    for (int q = 0; q < 5; ++q) {
+      const int packed = lane + 32 * q;
+      if (packed < 136) {
+        const int row = 16 * block + rows[q];
+        const int column = 16 * block + columns[q];
+        accumulators[q] = fmaf(
+            -tile[(kHalf + row) * kLd + k],
+            tile[(kHalf + column) * kLd + k], accumulators[q]);
+      }
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 5; ++q) {
+    const int packed = lane + 32 * q;
+    if (packed < 136) {
+      const int row = 16 * block + rows[q];
+      const int column = 16 * block + columns[q];
+      tile[(kHalf + row) * kLd + kHalf + column] = accumulators[q];
+    }
+  }
+}
+
+__device__ __forceinline__ void simt_balanced_trailing_update(float* tile) {
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+
+  // Six full tiles and four packed diagonal tiles are assigned as
+  // 512, 512, 528, and 528 useful output elements across the four warps.
+  if (warp == 0) {
+    simt_full_tile_update(tile, 1, 0);
+    simt_full_tile_update(tile, 3, 1);
+  } else if (warp == 1) {
+    simt_full_tile_update(tile, 2, 0);
+    simt_full_tile_update(tile, 3, 2);
+  } else if (warp == 2) {
+    simt_full_tile_update(tile, 2, 1);
+    simt_diagonal_tile_update(tile, 0);
+    simt_diagonal_tile_update(tile, 2);
+  } else {
+    simt_full_tile_update(tile, 3, 0);
+    simt_diagonal_tile_update(tile, 1);
+    simt_diagonal_tile_update(tile, 3);
+  }
+}
+
 __device__ __forceinline__ void tf32_trailing_update(float* tile) {
   using namespace nvcuda;
   const int tid = static_cast<int>(threadIdx.x);
@@ -584,6 +716,50 @@ __device__ __forceinline__ void output_tile(const float* tile, float* output) {
   }
 }
 
+__device__ __forceinline__ void store_output_vector(
+    const float* tile, float* output, int row, int column) {
+  float4 values;
+  values.x = column <= row ? tile[row * kLd + column] : 0.0f;
+  values.y = column + 1 <= row ? tile[row * kLd + column + 1] : 0.0f;
+  values.z = column + 2 <= row ? tile[row * kLd + column + 2] : 0.0f;
+  values.w = column + 3 <= row ? tile[row * kLd + column + 3] : 0.0f;
+  reinterpret_cast<float4*>(output)[row * (kN / 4) + column / 4] = values;
+}
+
+__device__ __forceinline__ void output_upper_right_zeros(float* output) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const float4 zeros = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+  for (int vector = lane; vector < kHalf * kHalf / 4; vector += 32) {
+    const int row = vector >> 4;
+    const int column = kHalf + (vector & 15) * 4;
+    reinterpret_cast<float4*>(output)[row * (kN / 4) + column / 4] = zeros;
+  }
+}
+
+__device__ __forceinline__ void output_completed_left(
+    const float* tile, float* output) {
+  const int worker = static_cast<int>(threadIdx.x) - 32;
+  if (worker < 0) return;
+#pragma unroll
+  for (int vector = worker; vector < kN * kHalf / 4; vector += 96) {
+    const int row = vector >> 4;
+    const int column = (vector & 15) * 4;
+    store_output_vector(tile, output, row, column);
+  }
+}
+
+__device__ __forceinline__ void output_l11(const float* tile, float* output) {
+  const int tid = static_cast<int>(threadIdx.x);
+#pragma unroll
+  for (int vector = tid; vector < kHalf * kHalf / 4;
+       vector += kThreads) {
+    const int row = kHalf + (vector >> 4);
+    const int column = kHalf + (vector & 15) * 4;
+    store_output_vector(tile, output, row, column);
+  }
+}
+
 template <int FirstFactor, int RootMode, bool FullTrsm, int UpdateMode,
           int LastFactor>
 __global__ __launch_bounds__(kThreads, 2)
@@ -658,10 +834,15 @@ void shared_blocked_128_kernel(const float* __restrict__ input,
 }
 
 template <int FirstFactor, int RootMode, bool FullTrsm, int UpdateMode,
-          int LastFactor, bool AsyncLoad>
+          int LastFactor, bool AsyncLoad, bool OverlapOutput = false>
 __global__ __launch_bounds__(kThreads, 2)
 void blocked_128_kernel(const float* __restrict__ input,
                         float* __restrict__ output) {
+  static_assert(!OverlapOutput ||
+                (UpdateMode == kSimtUpdate ||
+                 UpdateMode == kSimtBalancedUpdate));
+  static_assert(!OverlapOutput || LastFactor == kL11Crout ||
+                LastFactor == kL11Right);
   extern __shared__ __align__(16) float tile[];
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5;
@@ -698,6 +879,12 @@ void blocked_128_kernel(const float* __restrict__ input,
       local[k] = a[k * kN + kHalf + row];
       local[kHalf + k] = a[(kHalf + k) * kN + kHalf + row];
     }
+  }
+
+  // Warp 3 has no panel row to stage. On overlap variants it initializes the
+  // independent upper-right output quadrant while warp 0 factors A00.
+  if constexpr (OverlapOutput) {
+    if (warp == 3) output_upper_right_zeros(result);
   }
 
   if (warp == 0) {
@@ -779,6 +966,8 @@ void blocked_128_kernel(const float* __restrict__ input,
       __syncthreads();
       if constexpr (UpdateMode == kSimtUpdate) {
         simt_trailing_update(tile);
+      } else if constexpr (UpdateMode == kSimtBalancedUpdate) {
+        simt_balanced_trailing_update(tile);
       } else {
         tf32_trailing_update(tile);
       }
@@ -822,10 +1011,17 @@ void blocked_128_kernel(const float* __restrict__ input,
         factor64_right<false, kHalf>(a, tile, false);
       }
     }
+    if constexpr (OverlapOutput) {
+      if (warp != 0) output_completed_left(tile, result);
+    }
     __syncthreads();
   }
 
-  output_tile(tile, result);
+  if constexpr (OverlapOutput) {
+    output_l11(tile, result);
+  } else {
+    output_tile(tile, result);
+  }
 }
 
 template <int RootMode>
@@ -917,6 +1113,21 @@ void configure_all() {
                                              kSimtUpdate, kL11Right>);
   configure_kernel(shared_blocked_128_kernel<kRight64, kRawRoot, false,
                                              kTf32Update, kL11Right>);
+  configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
+                                      kSimtUpdate, kL11Right, false, true>);
+  configure_kernel(blocked_128_kernel<kCrout64, kRawRoot, false,
+                                      kSimtUpdate, kL11Crout, false, false>);
+  configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
+                                      kSimtBalancedUpdate, kL11Right,
+                                      false, false>);
+  configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
+                                      kSimtBalancedUpdate, kL11Right,
+                                      false, true>);
+  configure_kernel(blocked_128_kernel<kCrout64, kRawRoot, false,
+                                      kSimtUpdate, kL11Crout, false, true>);
+  configure_kernel(blocked_128_kernel<kCrout64, kRawRoot, false,
+                                      kSimtBalancedUpdate, kL11Crout,
+                                      false, true>);
 }
 
 void launch_variant(const float* input, float* output, int variant) {
@@ -1019,8 +1230,38 @@ void launch_variant(const float* input, float* output, int variant) {
                                 kTf32Update, kL11Right>
           <<<kBatch, kThreads, kSmemBytes>>>(input, output);
       break;
+    case 20:
+      blocked_128_kernel<kRight64, kRawRoot, false,
+                         kSimtUpdate, kL11Right, false, true>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 21:
+      blocked_128_kernel<kCrout64, kRawRoot, false,
+                         kSimtUpdate, kL11Crout, false, false>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 22:
+      blocked_128_kernel<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Right, false, false>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 23:
+      blocked_128_kernel<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Right, false, true>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 24:
+      blocked_128_kernel<kCrout64, kRawRoot, false,
+                         kSimtUpdate, kL11Crout, false, true>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 25:
+      blocked_128_kernel<kCrout64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Crout, false, true>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 19]");
+      TORCH_CHECK(false, "native variant must be in [0, 25]");
   }
 }
 
@@ -1070,12 +1311,13 @@ void fill_metadata(int64_t* rows,
 }
 
 template <int FirstFactor, int RootMode, bool FullTrsm, int UpdateMode,
-          int LastFactor, bool AsyncLoad>
+          int LastFactor, bool AsyncLoad, bool OverlapOutput = false>
 void write_blocked_metadata(int64_t* rows, int variant) {
   cudaFuncAttributes attributes{};
   int active_blocks = 0;
   query_kernel(blocked_128_kernel<FirstFactor, RootMode, FullTrsm,
-                                  UpdateMode, LastFactor, AsyncLoad>,
+                                  UpdateMode, LastFactor, AsyncLoad,
+                                  OverlapOutput>,
                &attributes, &active_blocks);
   fill_metadata(rows, variant, attributes, active_blocks, FirstFactor,
                 RootMode, UpdateMode, LastFactor, AsyncLoad ? 1 : 0,
@@ -1116,7 +1358,7 @@ void cholesky_256x128_out(const at::Tensor& data,
   check_input(data);
   check_output(data, out);
   TORCH_CHECK(variant >= 0 && variant < kVariantCount,
-              "native variant must be in [0, 19]");
+              "native variant must be in [0, 25]");
   launch_variant(data.data_ptr<float>(), out.data_ptr<float>(),
                  static_cast<int>(variant));
   const auto status = cudaPeekAtLastError();
@@ -1173,6 +1415,21 @@ at::Tensor cholesky_256x128_metadata() {
                                 kSimtUpdate, kL11Right>(rows, 18);
   write_shared_blocked_metadata<kRight64, kRawRoot, false,
                                 kTf32Update, kL11Right>(rows, 19);
+  write_blocked_metadata<kRight64, kRawRoot, false,
+                         kSimtUpdate, kL11Right, false, true>(rows, 20);
+  write_blocked_metadata<kCrout64, kRawRoot, false,
+                         kSimtUpdate, kL11Crout, false, false>(rows, 21);
+  write_blocked_metadata<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Right,
+                         false, false>(rows, 22);
+  write_blocked_metadata<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Right,
+                         false, true>(rows, 23);
+  write_blocked_metadata<kCrout64, kRawRoot, false,
+                         kSimtUpdate, kL11Crout, false, true>(rows, 24);
+  write_blocked_metadata<kCrout64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Crout,
+                         false, true>(rows, 25);
   return result;
 }
 """

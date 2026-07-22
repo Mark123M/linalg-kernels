@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load_inline
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
 # Variant 3 won the full Popcorn B200 leaderboard sweep on 2026-07-20.
-_DEFAULT_VARIANT = 3  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 32  # POPCORN_VARIANT
 _VARIANT_COUNT = 34
 
 _CPP_SOURCE = r"""
