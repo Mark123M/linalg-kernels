@@ -1,5 +1,11 @@
 """B200 tuning, profiling, and Popcorn orchestration for batched 256x128.
 
+``--action ncu`` profiles through the hosted GPU Mode Brev B200 Nsight Compute
+service (popcorn-cli ``--profile-brev``), because Modal does not reliably expose
+hardware performance counters. ``--action ncu-modal`` keeps the older
+self-hosted Modal NCU path. Both keep the ``--variants`` interface by baking each
+variant into a temporary submission via the ``# POPCORN_VARIANT`` marker.
+
 Examples:
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
         --action tune
@@ -7,6 +13,8 @@ Examples:
         --action nsys --variants 9,20,21,22,23,24,25
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
         --action ncu --variants 9,20,21,22,23,24,25
+    .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+        --action ncu-modal --variants 9,20,21
     .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
         --action popcorn
 """
@@ -26,13 +34,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from types import ModuleType
 from typing import Any
 
 import modal
 
 
-VARIANT_COUNT = 26
+VARIANT_COUNT = 28
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "phase_v6_precise_u8",
@@ -61,12 +70,29 @@ VARIANT_NAMES = (
     "simt_balanced_v13_raw_overlap",
     "simt_tile_v6_raw_overlap",
     "simt_balanced_v6_raw_overlap",
+    "simt_balanced_v13_warptail",
+    "simt_balanced_v13_rows",
 )
 
 LOCAL_SOLUTION = "cholesky/b256n128/cholesky_b256n128.py"
 LOCAL_SCRIPT = "cholesky/b256n128/cholesky_b256n128_modal.py"
 REMOTE_SOLUTION = "/workspace/cholesky_b256n128.py"
 REMOTE_SCRIPT = "/workspace/cholesky_b256n128_modal.py"
+POPCORN_LEADERBOARD = "cholesky"
+# ``--action ncu`` profiles the tuned kernel on the hosted GPU Mode Brev B200
+# Nsight Compute service. custom_kernel only runs the specialized kernel for the
+# exact (256, 128, 128) benchmark, so the profiler must target that entry:
+# index 2 in the leaderboard benchmark grid (CLAUDE.md "Benchmark Shapes":
+# 0=b4096n32, 1=b1024n64, 2=b256n128). Any other index profiles the torch
+# fallback instead. Confirm the index against the live leaderboard before
+# trusting a capture; override with --benchmark-index.
+BREV_BENCHMARK_INDEX = 2
+# Hosted profiler URL from popcorn-cli/docs/profiling.md. The popcorn CLI reads
+# POPCORN_BREV_PROFILER_URL (or BREV_PROFILER_URL); this default is only used
+# when neither is exported.
+POPCORN_BREV_PROFILER_URL_DEFAULT = (
+    "https://http--brev-profiler-proxy--dxfjds728w5v.code.run"
+)
 CUDA_IMAGE = "nvidia/cuda:13.3.0-devel-ubuntu24.04"
 CUDA_UPDATE_PACKAGES = (
     "cuda-command-line-tools-13-3=13.3.1-1",
@@ -519,7 +545,12 @@ NCU_WARMUP_LAUNCHES = 16
 def _ncu_kernel_name(variant: int) -> str:
     if variant in (11, 12):
         return "unblocked_128_kernel"
-    if variant >= 13:
+    # Only cases 13-19 launch shared_blocked_128_kernel; the simt_tile /
+    # simt_balanced overlap family (variants 20-25) is templated on
+    # blocked_128_kernel (the v13/v6 in their names is the kRight64/kCrout64
+    # factorization mode, not the shared-memory kernel). Keep this aligned
+    # with launch_variant() in cholesky_b256n128.py.
+    if 13 <= variant <= 19:
         return "shared_blocked_128_kernel"
     return "blocked_128_kernel"
 
@@ -656,6 +687,17 @@ NCU_SECTIONS = (
     "WarpStateStats",
 )
 
+# Named section presets. "fast" is the smoke test (basic set, ~3-5 replay
+# passes): use it to confirm NCU can profile a kernel at all before escalating.
+# "full" is the expensive custom list above; SourceCounters + the two roofline
+# charts, collected in a single pass with --cache-control all, can stall NCU's
+# CPU-side processing for many minutes on sm_100 / ncu 2026.2.1, especially on
+# the newer heavily-unrolled variants (20-25).
+NCU_SECTION_SETS: dict[str, tuple[str, ...]] = {
+    "fast": ("LaunchStats", "Occupancy", "SpeedOfLight"),
+    "full": NCU_SECTIONS,
+}
+
 
 def _subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
     parts = []
@@ -666,19 +708,57 @@ def _subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(parts) or "profiler produced no stdout or stderr"
 
 
+def _run_streaming(
+    command: list[str],
+    env: dict[str, str],
+    echo_prefix: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess, teeing combined output to our stdout so live progress
+    (nsight's ``--verbose`` per-pass lines, or the popcorn CLI's job-status
+    polling) no longer looks hung, and return a CompletedProcess so existing
+    diagnostics keep working. stderr is folded into stdout; the returned
+    ``stderr`` field is empty."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+        cwd=str(cwd) if cwd is not None else None,
+    )
+    chunks: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        chunks.append(line)
+        sys.stdout.write(f"{echo_prefix}{line}")
+        sys.stdout.flush()
+    returncode = process.wait()
+    return subprocess.CompletedProcess(
+        command, returncode, stdout="".join(chunks), stderr=""
+    )
+
+
 @app.function(
     image=ncu_image,
     gpu="B200",
     timeout=3600,
     volumes={"/cache": cache_volume},
 )
-def ncu_remote(variant: int, run_name: str) -> list[str]:
+def ncu_remote(variant: int, run_name: str, sections: str = "full") -> list[str]:
+    selected_sections = NCU_SECTION_SETS[sections]
     output_dir = Path("/cache/ncu") / run_name / (
         f"v{variant}_{VARIANT_NAMES[variant]}"
     )
     output_dir.mkdir(parents=True, exist_ok=False)
     Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+    # Preflight compiles the extension (cold: minutes of nvcc, 0% GPU) and warms
+    # it for the NCU worker; time it separately so a slow run is attributable.
+    preflight_start = time.monotonic()
     _write_preflight(output_dir, variant)
+    preflight_seconds = time.monotonic() - preflight_start
+    print(f"[ncu v{variant}] preflight/compile {preflight_seconds:.1f}s", flush=True)
 
     version = subprocess.run(["ncu", "--version"], capture_output=True, text=True)
     (output_dir / "ncu-version.txt").write_text(
@@ -707,7 +787,7 @@ def ncu_remote(variant: int, run_name: str) -> list[str]:
         "--export",
         str(report_base),
     ]
-    for section in NCU_SECTIONS:
+    for section in selected_sections:
         command.extend(("--section", section))
     command.extend((sys.executable, REMOTE_SCRIPT, "_worker_ncu", str(variant)))
     (output_dir / "ncu-command.json").write_text(
@@ -720,11 +800,31 @@ def ncu_remote(variant: int, run_name: str) -> list[str]:
     profiler_scratch.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["TMPDIR"] = str(profiler_scratch)
-    completed = subprocess.run(
-        command, capture_output=True, text=True, env=environment
+    ncu_start = time.monotonic()
+    completed = _run_streaming(command, environment, f"[ncu v{variant}] ")
+    ncu_seconds = time.monotonic() - ncu_start
+    print(
+        f"[ncu v{variant}] phases: preflight/compile {preflight_seconds:.1f}s, "
+        f"ncu profiling {ncu_seconds:.1f}s",
+        flush=True,
     )
     (output_dir / "ncu.stdout.txt").write_text(completed.stdout)
     (output_dir / "ncu.stderr.txt").write_text(completed.stderr)
+    (output_dir / "timing.json").write_text(
+        json.dumps(
+            {
+                "variant": variant,
+                "name": VARIANT_NAMES[variant],
+                "preflight_seconds": round(preflight_seconds, 3),
+                "ncu_seconds": round(ncu_seconds, 3),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    # Persist diagnostics before any failure raise so ncu.stdout/stderr
+    # (e.g. "no kernels were profiled") survive on the /cache volume.
+    cache_volume.commit()
     if completed.returncode != 0:
         raise RuntimeError(
             "Nsight Compute failed; requested sections are not replaced by "
@@ -735,7 +835,12 @@ def ncu_remote(variant: int, run_name: str) -> list[str]:
 
     report_path = report_base.with_suffix(".ncu-rep")
     if not report_path.is_file() or report_path.stat().st_size == 0:
-        raise RuntimeError(f"missing or empty Nsight artifact: {report_path}")
+        raise RuntimeError(
+            f"missing or empty Nsight artifact: {report_path}\n"
+            f"ncu exited 0 but profiled no kernel matching "
+            f"--kernel-name {_ncu_kernel_name(variant)!r}; verify it matches "
+            f"the kernel launch_variant() dispatches for variant {variant}."
+        )
 
     detail_outputs = (
         (output_dir / "ncu-details.txt", ()),
@@ -796,6 +901,7 @@ def _download_artifacts(
     variants: list[int],
     output_root: Path,
     calls: int = 0,
+    sections: str = "full",
 ) -> None:
     run_name = f"b256_n128_{_timestamp()}"
     destination = output_root / run_name
@@ -803,7 +909,7 @@ def _download_artifacts(
         if kind == "nsys":
             remote_paths = nsys_remote.remote(variant, calls, run_name)
         elif kind == "ncu":
-            remote_paths = ncu_remote.remote(variant, run_name)
+            remote_paths = ncu_remote.remote(variant, run_name, sections)
         else:
             raise ValueError(f"unknown artifact kind: {kind}")
         variant_dir = destination / f"v{variant}_{VARIANT_NAMES[variant]}"
@@ -969,6 +1075,143 @@ def _run_popcorn_sweep(
     print(f"Popcorn summary: {summary_path}")
 
 
+def _resolve_brev_profiler_url() -> str:
+    """Prefer the caller's exported profiler URL, else the documented default."""
+    for name in ("POPCORN_BREV_PROFILER_URL", "BREV_PROFILER_URL"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return POPCORN_BREV_PROFILER_URL_DEFAULT
+
+
+def _summarize_brev_artifacts(
+    result_path: Path, variant_dir: Path
+) -> dict[str, list[str]]:
+    """Parse the popcorn --output JSON and resolve the extracted NCU artifacts
+    (``ncu-details.txt``/``.csv`` and the ``.ncu-rep`` report) to absolute local
+    paths. Artifact paths in the JSON are relative to the CLI's working
+    directory, which we pin to ``variant_dir``."""
+    details: list[str] = []
+    reports: list[str] = []
+    try:
+        payload = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"details": details, "reports": reports}
+    for artifact in payload.get("downloaded_artifacts", []) or []:
+        for detail in artifact.get("details", []) or []:
+            path = detail.get("path")
+            if path:
+                details.append(str((variant_dir / path).resolve()))
+        for report in artifact.get("reports", []) or []:
+            path = report.get("path")
+            if path:
+                reports.append(str((variant_dir / path).resolve()))
+    return {"details": details, "reports": reports}
+
+
+def _run_ncu_brev(
+    output_root: Path, variants: list[int], benchmark_index: int
+) -> None:
+    """Profile each variant on the hosted GPU Mode Brev B200 Nsight Compute
+    service. Runs entirely on the user's machine via the ``popcorn`` CLI (no
+    Modal GPU); each variant is baked into a temporary submission through the
+    ``# POPCORN_VARIANT`` marker, submitted with ``--profile-brev``, and its
+    NCU artifacts are downloaded under ``output_root/<run>/v<id>_<name>/``."""
+    profiler_url = _resolve_brev_profiler_url()
+    source = (_repo_root() / LOCAL_SOLUTION).read_text()
+    run_dir = output_root / f"b256_n128_{_timestamp()}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    environment = os.environ.copy()
+    environment["POPCORN_BREV_PROFILER_URL"] = profiler_url
+
+    rows: list[dict[str, Any]] = []
+    for variant in variants:
+        variant_dir = run_dir / f"v{variant}_{VARIANT_NAMES[variant]}"
+        variant_dir.mkdir(parents=True, exist_ok=False)
+        submission_path = variant_dir / f"cholesky_b256n128_v{variant}.py"
+        submission_path.write_text(_variant_source(source, variant))
+        result_path = variant_dir / "brev_result.json"
+
+        command = [
+            "popcorn",
+            "submit",
+            str(submission_path),
+            "--leaderboard",
+            POPCORN_LEADERBOARD,
+            "--profile-brev",
+            "--benchmark-index",
+            str(benchmark_index),
+            "--no-tui",
+            "--output",
+            str(result_path),
+        ]
+        (variant_dir / "popcorn-command.json").write_text(
+            json.dumps(command, indent=2) + "\n"
+        )
+        print(
+            f"[ncu-brev v{variant}] {VARIANT_NAMES[variant]}: submitting to "
+            f"{profiler_url} (leaderboard={POPCORN_LEADERBOARD}, "
+            f"benchmark_index={benchmark_index})",
+            flush=True,
+        )
+        # The popcorn CLI writes artifact zips into its working directory, so run
+        # it inside variant_dir to keep every variant's captures separated.
+        completed = _run_streaming(
+            command, environment, f"[ncu-brev v{variant}] ", cwd=variant_dir
+        )
+        (variant_dir / "popcorn.log.txt").write_text(completed.stdout)
+
+        artifacts = _summarize_brev_artifacts(result_path, variant_dir)
+        passed = completed.returncode == 0 and bool(artifacts["details"])
+        rows.append(
+            {
+                "variant": variant,
+                "name": VARIANT_NAMES[variant],
+                "returncode": completed.returncode,
+                "details": artifacts["details"],
+                "reports": artifacts["reports"],
+                "result_file": (
+                    str(result_path) if result_path.is_file() else None
+                ),
+                "passed": passed,
+            }
+        )
+        if passed:
+            for detail_path in artifacts["details"]:
+                print(f"[ncu-brev v{variant}] details: {detail_path}", flush=True)
+            for report_path in artifacts["reports"]:
+                print(f"[ncu-brev v{variant}] report:  {report_path}", flush=True)
+        else:
+            print(
+                f"[ncu-brev v{variant}] FAILED (returncode="
+                f"{completed.returncode}); see {variant_dir / 'popcorn.log.txt'}",
+                flush=True,
+            )
+
+    summary_path = run_dir / "summary.json"
+    _write_json(
+        summary_path,
+        {
+            "timestamp_utc": _timestamp(),
+            "profiler": "popcorn-brev-b200-ncu",
+            "profiler_url": profiler_url,
+            "leaderboard": POPCORN_LEADERBOARD,
+            "benchmark_index": benchmark_index,
+            "requested_variants": variants,
+            "results": rows,
+        },
+    )
+    print(f"NCU (Brev) summary: {summary_path}")
+
+    failed = [row["variant"] for row in rows if not row["passed"]]
+    if failed:
+        raise RuntimeError(
+            f"Brev NCU profiling failed for variants {failed}; inspect the "
+            f"per-variant popcorn.log.txt under {run_dir}"
+        )
+
+
 @app.local_entrypoint()
 def main(
     action: str = "tune",
@@ -978,6 +1221,8 @@ def main(
     repeats: int = 5,
     profile_calls: int = 64,
     rounds: int = 1,
+    sections: str = "full",
+    benchmark_index: int = BREV_BENCHMARK_INDEX,
 ) -> None:
     selected = _parse_variants(variants)
     root = _repo_root()
@@ -1026,8 +1271,25 @@ def main(
     if action == "ncu":
         if not variants.strip():
             raise ValueError("--action ncu requires an explicit --variants list")
+        if benchmark_index < 0:
+            raise ValueError("--benchmark-index must be non-negative")
         output_root = Path(output) if output else default_artifacts / "ncu"
-        _download_artifacts("ncu", selected, output_root)
+        _run_ncu_brev(output_root, selected, benchmark_index)
+        return
+
+    if action == "ncu-modal":
+        if not variants.strip():
+            raise ValueError(
+                "--action ncu-modal requires an explicit --variants list"
+            )
+        if sections not in NCU_SECTION_SETS:
+            raise ValueError(
+                f"--sections must be one of {sorted(NCU_SECTION_SETS)}"
+            )
+        output_root = (
+            Path(output) if output else default_artifacts / "ncu_modal"
+        )
+        _download_artifacts("ncu", selected, output_root, sections=sections)
         return
 
     if action == "popcorn":
@@ -1037,7 +1299,9 @@ def main(
         _run_popcorn_sweep(output_root, selected, rounds)
         return
 
-    raise ValueError("action must be one of: tune, nsys, ncu, popcorn")
+    raise ValueError(
+        "action must be one of: tune, nsys, ncu, ncu-modal, popcorn"
+    )
 
 
 def _worker_cli() -> None:

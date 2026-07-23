@@ -9,7 +9,7 @@ from torch.utils.cpp_extension import load_inline
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
 _DEFAULT_VARIANT = 23  # POPCORN_VARIANT
-_VARIANT_COUNT = 26
+_VARIANT_COUNT = 28
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
 
 _CPP_SOURCE = r"""
@@ -51,7 +51,7 @@ constexpr int kThreads = 128;
 constexpr int kSmemFloats = kN * kLd;
 constexpr int kSmemBytes = kSmemFloats * static_cast<int>(sizeof(float));
 constexpr int kAsyncBase = 8320;
-constexpr int kVariantCount = 26;
+constexpr int kVariantCount = 28;
 constexpr int kMetadataColumns = 18;
 constexpr unsigned kFullMask = 0xffffffffu;
 
@@ -434,6 +434,21 @@ __device__ __forceinline__ void finish_l11_warp(float* __restrict__ trailing,
     for (int j = 32; j < kHalf; ++j) {
       if (j <= row) {
         tile[(kHalf + row) * kLd + kHalf + j] = trailing[j];
+      }
+    }
+  }
+}
+
+// Seed the register trailing rows from the shared S11 written by a tiled
+// SIMT/TF32 update, so the CTA-cooperative L11 factors (which expect the
+// trailing block in registers) can run after a shared-memory trailing update.
+__device__ __forceinline__ void reload_trailing_from_shared(
+    float* __restrict__ local, const float* __restrict__ tile, int row) {
+  if (row >= 0) {
+#pragma unroll
+    for (int j = 0; j < kHalf; ++j) {
+      if (j <= row) {
+        local[kHalf + j] = tile[(kHalf + row) * kLd + kHalf + j];
       }
     }
   }
@@ -986,8 +1001,18 @@ void blocked_128_kernel(const float* __restrict__ input,
   }
 
   if constexpr (LastFactor == kL11Rows) {
+    if constexpr (UpdateMode == kSimtUpdate ||
+                  UpdateMode == kSimtBalancedUpdate ||
+                  UpdateMode == kTf32Update) {
+      reload_trailing_from_shared(local, tile, row);
+    }
     factor_l11_rows<kRawRoot, kHalf>(local + kHalf, tile, row);
   } else if constexpr (LastFactor == kL11WarpTail) {
+    if constexpr (UpdateMode == kSimtUpdate ||
+                  UpdateMode == kSimtBalancedUpdate ||
+                  UpdateMode == kTf32Update) {
+      reload_trailing_from_shared(local, tile, row);
+    }
     factor_l11_rows<kRawRoot, 32>(local + kHalf, tile, row);
     if (warp == 2) finish_l11_warp(local + kHalf, tile, row);
     __syncthreads();
@@ -1128,6 +1153,12 @@ void configure_all() {
   configure_kernel(blocked_128_kernel<kCrout64, kRawRoot, false,
                                       kSimtBalancedUpdate, kL11Crout,
                                       false, true>);
+  configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
+                                      kSimtBalancedUpdate, kL11WarpTail,
+                                      false, false>);
+  configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
+                                      kSimtBalancedUpdate, kL11Rows,
+                                      false, false>);
 }
 
 void launch_variant(const float* input, float* output, int variant) {
@@ -1260,8 +1291,18 @@ void launch_variant(const float* input, float* output, int variant) {
                          kSimtBalancedUpdate, kL11Crout, false, true>
           <<<kBatch, kThreads, kSmemBytes>>>(input, output);
       break;
+    case 26:
+      blocked_128_kernel<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11WarpTail, false, false>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
+    case 27:
+      blocked_128_kernel<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Rows, false, false>
+          <<<kBatch, kThreads, kSmemBytes>>>(input, output);
+      break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 25]");
+      TORCH_CHECK(false, "native variant must be in [0, 27]");
   }
 }
 
@@ -1358,7 +1399,7 @@ void cholesky_256x128_out(const at::Tensor& data,
   check_input(data);
   check_output(data, out);
   TORCH_CHECK(variant >= 0 && variant < kVariantCount,
-              "native variant must be in [0, 25]");
+              "native variant must be in [0, 27]");
   launch_variant(data.data_ptr<float>(), out.data_ptr<float>(),
                  static_cast<int>(variant));
   const auto status = cudaPeekAtLastError();
@@ -1430,6 +1471,12 @@ at::Tensor cholesky_256x128_metadata() {
   write_blocked_metadata<kCrout64, kRawRoot, false,
                          kSimtBalancedUpdate, kL11Crout,
                          false, true>(rows, 25);
+  write_blocked_metadata<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11WarpTail,
+                         false, false>(rows, 26);
+  write_blocked_metadata<kRight64, kRawRoot, false,
+                         kSimtBalancedUpdate, kL11Rows,
+                         false, false>(rows, 27);
   return result;
 }
 """

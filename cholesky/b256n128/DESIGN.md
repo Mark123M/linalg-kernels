@@ -2,11 +2,12 @@
 
 ## Status
 
-- Implemented: self-contained raw CUDA extension with twenty-four blocked 64+64
+- Implemented: self-contained raw CUDA extension with twenty-six blocked 64+64
   variants and two unblocked controls, plus a Modal B200 tuning/profiling and
-  Popcorn sweep harness. IDs 13--19 are append-only spill-remediation variants
-  and IDs 20--25 are barrier-focused descendants of v9; the meanings of IDs
-  0--19 are unchanged.
+  Popcorn sweep harness. IDs 13--19 are append-only spill-remediation variants,
+  IDs 20--25 are barrier-focused descendants of v9, and IDs 26--27 are
+  cooperative-L11 (shared-reloaded) descendants of v22; the meanings of IDs
+  0--25 are unchanged.
 - Tracked default: variant 1 (`phase_v6_refined_u8`). It is correct, but v9 is
   the current target-shape winner and should be the leading Popcorn candidate.
 - First B200 tune (2026-07-21): all 13 variants passed all six numerical
@@ -132,6 +133,8 @@ TRSM and SYRK.
 | 23 | `simt_balanced_v13_raw_overlap` | combines 20's output schedule with 22's balanced SYRK |
 | 24 | `simt_tile_v6_raw_overlap` | combines output overlap with v6 factors and the original v9 SYRK |
 | 25 | `simt_balanced_v6_raw_overlap` | combines output overlap, v6 factors, and balanced packed-diagonal SYRK |
+| 26 | `simt_balanced_v13_warptail` | v22 balanced SYRK; cooperative L11 (CTA cols 0--31 + warp-2 32x32 tail) reloaded from shared; no overlap |
+| 27 | `simt_balanced_v13_rows` | v22 balanced SYRK; full CTA-cooperative rows L11 reloaded from shared; no overlap |
 
 Variant IDs are stable and append-only. The Popcorn action changes only the exact
 `_DEFAULT_VARIANT` marker in temporary files and never edits the tracked
@@ -183,13 +186,33 @@ are then submitted for three focused rounds. The tracked default is updated
 only after reviewing those results.
 
 Nsight Systems retains the `.nsys-rep`, command, preflight resource/validation
-record, stdout/stderr, and text statistics. Nsight Compute captures one warmed
-kernel with cache-controlled replay and downloads the `.ncu-rep`, command,
-version, preflight data, and text/CSV detail exports. Requested NCU sections
-cover compute, memory, launch, occupancy, scheduler, warp-state, instruction,
-source, and hierarchical FP32 roofline data. If a profiler version lacks a
-requested section or metric, the endpoint fails and records the mismatch; no
-equivalent metric is silently substituted.
+record, stdout/stderr, and text statistics.
+
+`--action ncu` profiles through the hosted GPU Mode Brev B200 Nsight Compute
+service (popcorn-cli `--profile-brev`), because Modal does not reliably expose
+hardware performance counters. It runs entirely on the local machine through the
+`popcorn` CLI (no Modal GPU): each selected variant is baked into a temporary
+submission via the `# POPCORN_VARIANT` marker and submitted for the b256n128
+benchmark (`--benchmark-index 2`). `custom_kernel` only runs the tuned kernel at
+the `(256, 128, 128)` shape, so a wrong index silently profiles the torch
+fallback instead — confirm the index against the live leaderboard. The CLI
+downloads `ncu-details.txt`, `ncu-details.csv`, and the `.ncu-rep` per variant
+into `artifacts/ncu/<run>/v<id>_<name>/`, alongside the submitted `.py`, the
+`popcorn-command.json`, the streamed `popcorn.log.txt`, and a run-level
+`summary.json`. The Brev service controls the NCU version, section list, and
+launch window server-side, so its metric names, units, and available sections
+are not guaranteed to match the Modal pin; flag any such difference before
+interpreting counters (AGENTS.md profiling policy).
+
+`--action ncu-modal` keeps the older self-hosted Modal path: it captures one
+warmed kernel with cache-controlled replay and downloads the `.ncu-rep`,
+command, version, preflight data, and text/CSV detail exports into
+`artifacts/ncu_modal/`. Its requested NCU sections cover compute, memory, launch,
+occupancy, scheduler, warp-state, instruction, source, and hierarchical FP32
+roofline data (`--sections fast` collects the launch/occupancy/SpeedOfLight
+smoke set). If a profiler version lacks a requested section or metric, that
+endpoint fails and records the mismatch; no equivalent metric is silently
+substituted.
 
 ### Toolchain image pin — 2026-07-22
 
@@ -296,6 +319,92 @@ the post-SYRK rendezvous. IDs 21, 24, and 25 separately test whether shortening
 the warp-0-only factor phases with lower register pressure outweighs v6's
 slower standalone arithmetic.
 
+## Variant 23 NCU analysis — 2026-07-22
+
+Capture:
+`artifacts/ncu/b256_n128_20260722T105901Z/v23_simt_balanced_v13_raw_overlap`
+(`simt_balanced_v13_raw_overlap`, benchmark index 2). The report was collected
+by the hosted Brev service with NCU **2026.2.0**; kernel-replay duration is
+168.6 us / 194,392 elapsed cycles and is diagnostic only (not compared with the
+warm tune median).
+
+Tooling note: the VeloQ `ncu` path could not build its sidecar here — the
+report is NCU 2026.2.0 but the only local `ncu_report` module is 2025.4.1, which
+lacks the `timed_warp_samples` API VeloQ calls. No workaround was applied; the
+figures below come from the local `ncu` 2025.4.1 binary + Python module
+(`source_info`/`correlation_ids`, which read the newer report cleanly) and the
+server-exported `ncu-details.txt`.
+
+The kernel is **barrier-latency bound**, not compute- or DRAM-bound, and the
+overlap schedule did not remove the dominant stall:
+
+- Compute (SM) throughput 16.5%, Memory 26.6%, **DRAM 1.15%**, FP32 4% of peak.
+  Issue Slots Busy 9.64% (one instruction issued every ~10 cycles); eligible
+  warps/scheduler 0.11 of 16; No Eligible 90.0%.
+- `barrier` is **55.4%** of the 120,181 warp-sampling stall samples (next:
+  no_instructions 13.4%). Warp State attributes **61.8%** of the 17.4-cycle
+  average issue interval (10.7 cycles) to CTA barriers.
+- Source-correlated `pcsamp` barrier samples land on exactly three CTA
+  `__syncthreads()` sites (cuda.cu line -> this repo's `.py` line): **post-L11
+  factor** 819/`.py:851` = 2002 (**47.8%**), **post-L00 factor** 869/`.py:901`
+  = 1390 (**33.2%**), **post-TRSM** 920/`.py:952` = 682 (**16.3%**). Top three =
+  97.3%. The two warp-0-only diagonal factors alone are 81% of barrier stalls.
+  This matches the v9 executed-SASS localization (after-L11 2052, after-L00
+  1449, after-TRSM 635) almost exactly.
+- The output overlap barely moved the largest barrier (v9 2052 -> v23 2002): the
+  overlappable left-half output (2,048 `float4` across 96 threads, ~21 each)
+  drains long before warp 0 finishes the 64x64 L11 factor, so warps 1--3 idle
+  at the post-L11 barrier for the rest of that phase.
+
+Two deliberate non-leads:
+
+- **Occupancy is a false lead here.** NCU's scheduler/occupancy rules quote
+  "Est. Speedup ~73%", but **Waves/SM = 0.86**: with only 256 matrices over 148
+  SMs the grid cannot fill even one wave at the 2-block/SM limit (needs 296).
+  Cutting registers (255) or shared memory (66 KB) to lift the per-SM block
+  limit *lowers* waves further; resident-warp count is capped by the fixed
+  256-block grid, not by resources. The only wall-clock lever is per-matrix
+  critical-path latency.
+- **Local memory is secondary.** The `float local[128]` state spills (255
+  regs) and is 90.6% of L1TEX sectors, uncoalesced (1 of 32 bytes/sector; rule
+  Est. ~25% each on local ld/st), but it is well-cached (L1 hit 87%) and only
+  ~7% of stall cycles (long+short scoreboard). It cannot touch the 55--62%
+  barrier, and moving rows to shared already regressed 20% (v18).
+
+Prioritized experiments:
+
+1. **Fuse the L11 factorization into the trailing update (left-looking).** As
+   each balanced-SYRK column-block completes, factor the ready leftmost S11
+   columns instead of hitting a barrier and idling through a separate warp-0
+   factor. This is the natural extension of the interleaved TRSM/rank-1 pattern
+   (v6) across the SYRK->L11 boundary and directly attacks the 47.8% post-L11
+   barrier. Larger change; deferred.
+2. **Cooperative L11 factor after the balanced SYRK (IDs 26--27, below).** Cheap
+   test of spreading the L11 factor across warps 1--2 instead of warp 0 alone.
+3. **Two matrices per CTA with decoupled per-matrix barriers.** Cross-matrix ILP
+   to keep the scheduler fed during warp-0 factors; 2x shared drops to 1
+   block/SM, so it must be measured. Bigger swing; deferred.
+
+### Cooperative-L11 experiment (IDs 26--27)
+
+IDs 26--27 implement experiment 2. Both keep v22's balanced packed-diagonal
+SYRK but replace the sync-free warp-0-only `kL11Right` factor with a
+CTA-cooperative rows factor over the 64 trailing rows (threads 32--95): ID 26
+uses the warp-tail split (`kL11WarpTail`: CTA columns 0--31, then warp 2 owns
+the 32x32 shuffle tail), ID 27 uses the full CTA rows factor (`kL11Rows`).
+Because the balanced SYRK leaves S11 in **shared** memory while these factors
+expect the trailing block in **registers**, a guarded `reload_trailing_from_shared`
+seeds `local[kHalf..]` from the shared tile before the factor; the reload is
+protected by the factor's first internal barrier and only compiles for the
+tiled-update modes. Output overlap is intentionally off: a cooperative factor
+keeps warps 1--2 busy, so no warp is free to overlap output — the two strategies
+are mutually exclusive, which is also why `OverlapOutput` `static_assert`s
+against these factors. Against v22 (`kL11Right`, no overlap) this isolates the
+L11-parallelism axis. Expectation is guarded: the cooperative factor replaces
+one large post-L11 barrier with per-column barriers (kL11Rows adds ~192, the
+warp-tail ~96), which prior shared-route results suggest may regress; the value
+is a measured point on that axis, and warm tuning is the authority.
+
 ## Results
 
 | Date | Stage | Result |
@@ -306,6 +415,8 @@ slower standalone arithmetic.
 | 2026-07-21 | Second Modal tune | All 20 variants pass all numerical cases. Raw ranking: v9 0.0834 ms, v18 0.1008, v10 0.1026, v19 0.1193, v17 0.1726. v15 is the fastest zero-local route at 0.1743 ms, but resource usage no longer gates selection. Artifact: `artifacts/tuning_20260721T114143Z.json`. |
 | 2026-07-21 | Selection-policy correction | Eligibility now means numerical correctness only; performance chooses among correct variants. Local-memory and register metrics are diagnostic. |
 | 2026-07-22 | Barrier-focused variants | Appended IDs 20--25 for overlapped output, v6 factors, balanced packed-diagonal SYRK, and their combinations. Awaiting B200 validation/timing. |
+| 2026-07-22 | v23 NCU analysis | Brev NCU 2026.2.0. v23 is barrier-bound: `barrier` 55.4% of stall samples; post-L11/L00/TRSM syncs = 97.3% of barrier samples; overlap barely moved the post-L11 wait (2052->2002). Occupancy is a false lead (0.86 waves, 256-block grid). See **Variant 23 NCU analysis**. |
+| 2026-07-22 | Cooperative-L11 variants | Appended IDs 26--27 (balanced SYRK + shared-reloaded CTA-cooperative L11, warp-tail and full-rows). Read-only checks only; awaiting B200 validation/timing. |
 | pending | Popcorn full sweep | Awaiting all-variant public geomeans |
 | pending | Focused top-three sweep | Awaiting three-round median and production ID |
 
@@ -336,9 +447,15 @@ rg -n 'stream' cholesky/b256n128/cholesky_b256n128.py
 .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
   --action nsys --variants 9,20,21,22,23,24,25
 
-# Capture detailed counters for the same representative set.
+# Capture detailed counters on the hosted Brev B200 NCU service (b256n128 is
+# benchmark index 2). Needs the popcorn CLI; export POPCORN_BREV_PROFILER_URL or
+# rely on the built-in default. Runs locally, not on a Modal GPU.
 .venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
   --action ncu --variants 9,20,21,22,23,24,25
+
+# Fallback: the older self-hosted Modal NCU path.
+.venv/bin/modal run cholesky/b256n128/cholesky_b256n128_modal.py \
+  --action ncu-modal --variants 9,20,21
 
 # Verify the provisional tracked submission through the official checker.
 popcorn submit --leaderboard cholesky --gpu B200 --mode test --no-tui \
