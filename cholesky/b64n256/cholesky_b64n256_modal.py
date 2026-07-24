@@ -29,7 +29,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 18
+VARIANT_COUNT = 22
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "cta256_rec32_scalar_simt_precise",
@@ -50,6 +50,10 @@ VARIANT_NAMES = (
     "cluster128_rec32_scalar_tc_all_refined",
     "cluster256_rec32_scalar_tc_all_refined",
     "cluster256_rec32_scalar_tc_all_raw",
+    "cta512_rec32_scalar_tc_all_refined_pad129",
+    "cta512_rec32_outer_sub8_tc_all_refined",
+    "cta512_rec32_scalar_tc_all_refined_potf2_128",
+    "cta512_rec32_scalar_tc_all_refined_tc_batch",
 )
 METADATA_COLUMNS = (
     "variant",
@@ -68,6 +72,10 @@ METADATA_COLUMNS = (
     "update_mode",
     "root_mode",
     "launch_bounds",
+    "a10_ld",
+    "outer_trsm_mode",
+    "potf2_threads",
+    "tc_slice_batching",
 )
 CASES = (
     "dense",

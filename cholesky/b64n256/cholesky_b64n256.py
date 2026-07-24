@@ -8,8 +8,8 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
-_DEFAULT_VARIANT = 8  # POPCORN_VARIANT
-_VARIANT_COUNT = 18
+_DEFAULT_VARIANT = 18  # POPCORN_VARIANT
+_VARIANT_COUNT = 22
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
 
 _VARIANT_NAMES = (
@@ -31,6 +31,10 @@ _VARIANT_NAMES = (
     "cluster128_rec32_scalar_tc_all_refined",
     "cluster256_rec32_scalar_tc_all_refined",
     "cluster256_rec32_scalar_tc_all_raw",
+    "cta512_rec32_scalar_tc_all_refined_pad129",
+    "cta512_rec32_outer_sub8_tc_all_refined",
+    "cta512_rec32_scalar_tc_all_refined_potf2_128",
+    "cta512_rec32_scalar_tc_all_refined_tc_batch",
 )
 
 _METADATA_COLUMNS = (
@@ -50,6 +54,10 @@ _METADATA_COLUMNS = (
     "update_mode",
     "root_mode",
     "launch_bounds",
+    "a10_ld",
+    "outer_trsm_mode",
+    "potf2_threads",
+    "tc_slice_batching",
 )
 
 _CPP_SOURCE = r"""
@@ -96,11 +104,18 @@ constexpr int kA00 = 0;
 constexpr int kA10 = kTile * kLd;
 constexpr int kA11 = kA10 + kTile * kTile;
 constexpr int kSingleFloats = kA11 + kTile * kLd;
+constexpr int kPaddedA11 = kA10 + kTile * kLd;
+constexpr int kPaddedSingleFloats = kPaddedA11 + kTile * kLd;
 constexpr int kSingleBytes = kSingleFloats * static_cast<int>(sizeof(float));
+constexpr int kPaddedSingleBytes =
+    kPaddedSingleFloats * static_cast<int>(sizeof(float));
 constexpr int kTcScratchFloats = kHalf * kHalf;
 constexpr int kTcBarrierFloats = 4;
 constexpr int kSingleTcBytes =
     (kSingleFloats + kTcScratchFloats + kTcBarrierFloats) *
+    static_cast<int>(sizeof(float));
+constexpr int kPaddedSingleTcBytes =
+    (kPaddedSingleFloats + kTcScratchFloats + kTcBarrierFloats) *
     static_cast<int>(sizeof(float));
 
 constexpr int kClusterA00 = 0;
@@ -116,8 +131,8 @@ constexpr int kClusterBytes =
 constexpr int kClusterTcBytes =
     kClusterTcFloats * static_cast<int>(sizeof(float));
 
-constexpr int kVariantCount = 18;
-constexpr int kMetadataColumns = 16;
+constexpr int kVariantCount = 22;
+constexpr int kMetadataColumns = 20;
 constexpr int kPreciseRoot = 0;
 constexpr int kRefinedRoot = 1;
 constexpr int kRawRoot = 2;
@@ -145,6 +160,10 @@ struct Variant;
     static constexpr int update = UPDATE;                            \
     static constexpr bool cluster = CLUSTER;                         \
     static constexpr bool tensor = UPDATE != kSimtUpdate;            \
+    static constexpr bool pad_a10 = false;                            \
+    static constexpr int outer_trsm = TRSM;                           \
+    static constexpr int potf2_threads = THREADS;                     \
+    static constexpr bool batch_tc_slices = false;                    \
   }
 
 SPEC(0, 256, kPreciseRoot, 32, kRecursive32, kScalarTrsm, kSimtUpdate, false);
@@ -167,6 +186,22 @@ SPEC(16, 256, kRefinedRoot, 32, kRecursive32, kScalarTrsm, kTcAllUpdate, true);
 SPEC(17, 256, kRawRoot, 32, kRecursive32, kScalarTrsm, kTcAllUpdate, true);
 
 #undef SPEC
+
+template <> struct Variant<18> : Variant<11> {
+  static constexpr bool pad_a10 = true;
+};
+
+template <> struct Variant<19> : Variant<11> {
+  static constexpr int outer_trsm = kSub8Trsm;
+};
+
+template <> struct Variant<20> : Variant<11> {
+  static constexpr int potf2_threads = 128;
+};
+
+template <> struct Variant<21> : Variant<11> {
+  static constexpr bool batch_tc_slices = true;
+};
 
 void check_input(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda(), "input must be a CUDA tensor");
@@ -202,25 +237,31 @@ __device__ __forceinline__ void root_pair(float value,
   }
 }
 
+template <bool PadA10>
 __device__ __forceinline__ float& single_at(float* s, int row, int col) {
   if (row < kTile) {
     return s[kA00 + row * kLd + col];
   }
   if (col < kTile) {
-    return s[kA10 + (row - kTile) * kTile + col];
+    constexpr int a10_ld = PadA10 ? kLd : kTile;
+    return s[kA10 + (row - kTile) * a10_ld + col];
   }
-  return s[kA11 + (row - kTile) * kLd + col - kTile];
+  constexpr int a11 = PadA10 ? kPaddedA11 : kA11;
+  return s[a11 + (row - kTile) * kLd + col - kTile];
 }
 
+template <bool PadA10>
 __device__ __forceinline__ const float& single_at(
     const float* s, int row, int col) {
   if (row < kTile) {
     return s[kA00 + row * kLd + col];
   }
   if (col < kTile) {
-    return s[kA10 + (row - kTile) * kTile + col];
+    constexpr int a10_ld = PadA10 ? kLd : kTile;
+    return s[kA10 + (row - kTile) * a10_ld + col];
   }
-  return s[kA11 + (row - kTile) * kLd + col - kTile];
+  constexpr int a11 = PadA10 ? kPaddedA11 : kA11;
+  return s[a11 + (row - kTile) * kLd + col - kTile];
 }
 
 __device__ __forceinline__ uint32_t shared_address(const void* pointer) {
@@ -406,23 +447,26 @@ __device__ __forceinline__ float tmem_load_one(uint32_t address) {
   return __uint_as_float(value);
 }
 
-template <int RootMode, int FactorMode>
+template <int RootMode, int FactorMode, bool PadA10>
 __device__ __forceinline__ void potf2_single(
     float* s, int begin, int size) {
+  constexpr int storage_floats =
+      PadA10 ? kPaddedSingleFloats : kSingleFloats;
   for (int column = 0; column < size; ++column) {
     const int j = begin + column;
     if (threadIdx.x == 0) {
       float diagonal;
       float inverse;
-      root_pair<RootMode>(single_at(s, j, j), diagonal, inverse);
-      single_at(s, j, j) = diagonal;
-      s[kSingleFloats - 1] = inverse;
+      root_pair<RootMode>(
+          single_at<PadA10>(s, j, j), diagonal, inverse);
+      single_at<PadA10>(s, j, j) = diagonal;
+      s[storage_floats - 1] = inverse;
     }
     __syncthreads();
-    const float inverse = s[kSingleFloats - 1];
+    const float inverse = s[storage_floats - 1];
     for (int row = column + 1 + static_cast<int>(threadIdx.x);
          row < size; row += static_cast<int>(blockDim.x)) {
-      single_at(s, begin + row, j) *= inverse;
+      single_at<PadA10>(s, begin + row, j) *= inverse;
     }
     __syncthreads();
 
@@ -455,16 +499,100 @@ __device__ __forceinline__ void potf2_single(
       }
       const int row = j + 1 + local_row;
       const int col = j + 1 + local_col;
-      single_at(s, row, col) =
-          fmaf(-single_at(s, row, j),
-               single_at(s, col, j),
-               single_at(s, row, col));
+      single_at<PadA10>(s, row, col) =
+          fmaf(-single_at<PadA10>(s, row, j),
+               single_at<PadA10>(s, col, j),
+               single_at<PadA10>(s, row, col));
     }
     __syncthreads();
   }
 }
 
-template <int TrsmMode>
+template <int Participants>
+__device__ __forceinline__ void counted_potf2_barrier() {
+  static_assert(Participants > 0 && Participants % 32 == 0);
+  asm volatile("bar.sync 1, %0;" :: "n"(Participants) : "memory");
+}
+
+template <int RootMode, int FactorMode, bool PadA10, int Participants>
+__device__ __forceinline__ void potf2_single_counted(
+    float* s, int begin, int size) {
+  static_assert(Participants <= 512);
+  constexpr int storage_floats =
+      PadA10 ? kPaddedSingleFloats : kSingleFloats;
+  const int tid = static_cast<int>(threadIdx.x);
+  if (tid < Participants) {
+    for (int column = 0; column < size; ++column) {
+      const int j = begin + column;
+      if (tid == 0) {
+        float diagonal;
+        float inverse;
+        root_pair<RootMode>(
+            single_at<PadA10>(s, j, j), diagonal, inverse);
+        single_at<PadA10>(s, j, j) = diagonal;
+        s[storage_floats - 1] = inverse;
+      }
+      counted_potf2_barrier<Participants>();
+      const float inverse = s[storage_floats - 1];
+      for (int row = column + 1 + tid;
+           row < size; row += Participants) {
+        single_at<PadA10>(s, begin + row, j) *= inverse;
+      }
+      counted_potf2_barrier<Participants>();
+
+      const int trailing = size - column - 1;
+      const int pairs = trailing * (trailing + 1) / 2;
+      for (int linear = tid; linear < pairs; linear += Participants) {
+        int local_row = 0;
+        int local_col = 0;
+        int remainder = linear;
+        if constexpr (FactorMode == kRank164) {
+          local_row = static_cast<int>(
+              (sqrtf(8.0f * static_cast<float>(linear) + 1.0f) - 1.0f) *
+              0.5f);
+          int first = local_row * (local_row + 1) / 2;
+          while (first > linear) {
+            --local_row;
+            first = local_row * (local_row + 1) / 2;
+          }
+          while ((local_row + 1) * (local_row + 2) / 2 <= linear) {
+            ++local_row;
+          }
+          local_col = linear - local_row * (local_row + 1) / 2;
+        } else {
+          for (int width = 1; remainder >= width; ++width) {
+            remainder -= width;
+            ++local_row;
+          }
+          local_col = remainder;
+        }
+        const int row = j + 1 + local_row;
+        const int col = j + 1 + local_col;
+        single_at<PadA10>(s, row, col) =
+            fmaf(-single_at<PadA10>(s, row, j),
+                 single_at<PadA10>(s, col, j),
+                 single_at<PadA10>(s, row, col));
+      }
+      counted_potf2_barrier<Participants>();
+    }
+  }
+  __syncthreads();
+}
+
+template <int RootMode, int FactorMode, bool PadA10,
+          int Potf2Threads, int CtaThreads>
+__device__ __forceinline__ void factor_base_single(
+    float* s, int begin, int size) {
+  if constexpr (Potf2Threads == CtaThreads) {
+    potf2_single<RootMode, FactorMode, PadA10>(s, begin, size);
+  } else {
+    static_assert(Potf2Threads < CtaThreads);
+    potf2_single_counted<
+        RootMode, FactorMode, PadA10, Potf2Threads>(s, begin, size);
+  }
+}
+
+template <int TrsmMode, bool PadA10>
 __device__ __forceinline__ void trsm_single(
     float* s, int row_begin, int rows, int col_begin, int cols) {
   if constexpr (TrsmMode == kScalarTrsm) {
@@ -473,12 +601,13 @@ __device__ __forceinline__ void trsm_single(
       const int row = row_begin + local_row;
       for (int local_col = 0; local_col < cols; ++local_col) {
         const int col = col_begin + local_col;
-        float value = single_at(s, row, col);
+        float value = single_at<PadA10>(s, row, col);
         for (int k = 0; k < local_col; ++k) {
-          value = fmaf(-single_at(s, row, col_begin + k),
-                       single_at(s, col, col_begin + k), value);
+          value = fmaf(-single_at<PadA10>(s, row, col_begin + k),
+                       single_at<PadA10>(s, col, col_begin + k), value);
         }
-        single_at(s, row, col) = value / single_at(s, col, col);
+        single_at<PadA10>(s, row, col) =
+            value / single_at<PadA10>(s, col, col);
       }
     }
   } else {
@@ -488,20 +617,25 @@ __device__ __forceinline__ void trsm_single(
     for (int local_row = group; local_row < rows; local_row += groups) {
       const int row = row_begin + local_row;
       for (int local_col = 0; local_col < cols; ++local_col) {
-        float partial = lane == 0 ? single_at(s, row, col_begin + local_col)
-                                  : 0.0f;
+        float partial =
+            lane == 0
+                ? single_at<PadA10>(
+                      s, row, col_begin + local_col)
+                : 0.0f;
         for (int k = lane; k < local_col; k += 8) {
-          partial = fmaf(-single_at(s, row, col_begin + k),
-                         single_at(s, col_begin + local_col, col_begin + k),
+          partial = fmaf(-single_at<PadA10>(s, row, col_begin + k),
+                         single_at<PadA10>(
+                             s, col_begin + local_col, col_begin + k),
                          partial);
         }
         partial += __shfl_down_sync(0xffffffffu, partial, 4, 8);
         partial += __shfl_down_sync(0xffffffffu, partial, 2, 8);
         partial += __shfl_down_sync(0xffffffffu, partial, 1, 8);
         if (lane == 0) {
-          single_at(s, row, col_begin + local_col) =
+          single_at<PadA10>(s, row, col_begin + local_col) =
               partial /
-              single_at(s, col_begin + local_col, col_begin + local_col);
+              single_at<PadA10>(
+                  s, col_begin + local_col, col_begin + local_col);
         }
         __syncwarp();
       }
@@ -510,6 +644,7 @@ __device__ __forceinline__ void trsm_single(
   __syncthreads();
 }
 
+template <bool PadA10>
 __device__ __forceinline__ void simt_update_single(
     float* s, int target, int size, int panel, int panel_cols) {
   constexpr int kMicro = 16;
@@ -529,44 +664,86 @@ __device__ __forceinline__ void simt_update_single(
       const int local_col = tile_col * kMicro + element % kMicro;
       if (local_row < size && local_col < size &&
           local_col <= local_row) {
-        float value = single_at(s, target + local_row, target + local_col);
+        float value = single_at<PadA10>(
+            s, target + local_row, target + local_col);
 #pragma unroll 4
         for (int k = 0; k < panel_cols; ++k) {
-          value = fmaf(-single_at(s, target + local_row, panel + k),
-                       single_at(s, target + local_col, panel + k), value);
+          value = fmaf(
+              -single_at<PadA10>(s, target + local_row, panel + k),
+              single_at<PadA10>(s, target + local_col, panel + k),
+              value);
         }
-        single_at(s, target + local_row, target + local_col) = value;
+        single_at<PadA10>(
+            s, target + local_row, target + local_col) = value;
       }
     }
   }
   __syncthreads();
 }
 
-template <int M>
+template <int M, bool PadA10, bool BatchSlices>
 __device__ __forceinline__ void tc_update_single(
     float* s, int target, int panel, float* scratch,
     uint32_t* tmem_slot, uint64_t* barrier, int& phase) {
   tmem_allocate<false>(tmem_slot, kTile);
   const uint32_t tmem_base = *tmem_slot;
-  for (int k = 0; k < M; k += 8) {
-    for (int linear = static_cast<int>(threadIdx.x);
-         linear < M * 8; linear += static_cast<int>(blockDim.x)) {
-      const int row = linear >> 3;
-      const int column = linear & 7;
-      const int packed = kmajor_offset(row, column, M);
-      reinterpret_cast<uint32_t*>(scratch)[packed] =
-          to_tf32(single_at(s, target + row, panel + k + column));
+  if constexpr (BatchSlices) {
+    static_assert(M == kHalf || M == kTile);
+    constexpr int slices_per_group = M == kHalf ? 8 : 4;
+    constexpr int slice_values = M * 8;
+    constexpr int group_values = slices_per_group * slice_values;
+    for (int group_k = 0; group_k < M;
+         group_k += slices_per_group * 8) {
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < group_values;
+           linear += static_cast<int>(blockDim.x)) {
+        const int slice = linear / slice_values;
+        const int within = linear - slice * slice_values;
+        const int row = within >> 3;
+        const int column = within & 7;
+        const int packed =
+            slice * slice_values + kmajor_offset(row, column, M);
+        reinterpret_cast<uint32_t*>(scratch)[packed] =
+            to_tf32(single_at<PadA10>(
+                s, target + row,
+                panel + group_k + slice * 8 + column));
+      }
+      __syncthreads();
+      proxy_fence();
+      __syncthreads();
+      for (int slice = 0; slice < slices_per_group; ++slice) {
+        const uint64_t descriptor = make_kmajor_descriptor(
+            scratch + slice * slice_values, M);
+        issue_tf32_mma<M, M, false>(
+            tmem_base, descriptor, descriptor,
+            group_k != 0 || slice != 0);
+      }
+      tensor_commit<false>(barrier);
+      barrier_wait(barrier, phase);
+      phase ^= 1;
     }
-    __syncthreads();
-    proxy_fence();
-    __syncthreads();
-    const uint64_t descriptor =
-        make_kmajor_descriptor(scratch, M);
-    issue_tf32_mma<M, M, false>(
-        tmem_base, descriptor, descriptor, k != 0);
-    tensor_commit<false>(barrier);
-    barrier_wait(barrier, phase);
-    phase ^= 1;
+  } else {
+    for (int k = 0; k < M; k += 8) {
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < M * 8; linear += static_cast<int>(blockDim.x)) {
+        const int row = linear >> 3;
+        const int column = linear & 7;
+        const int packed = kmajor_offset(row, column, M);
+        reinterpret_cast<uint32_t*>(scratch)[packed] =
+            to_tf32(single_at<PadA10>(
+                s, target + row, panel + k + column));
+      }
+      __syncthreads();
+      proxy_fence();
+      __syncthreads();
+      const uint64_t descriptor =
+          make_kmajor_descriptor(scratch, M);
+      issue_tf32_mma<M, M, false>(
+          tmem_base, descriptor, descriptor, k != 0);
+      tensor_commit<false>(barrier);
+      barrier_wait(barrier, phase);
+      phase ^= 1;
+    }
   }
 
   const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -580,7 +757,8 @@ __device__ __forceinline__ void tc_update_single(
             static_cast<uint32_t>(col);
         const float product = tmem_load_one(address);
         if (col <= row) {
-          single_at(s, target + row, target + col) -= product;
+          single_at<PadA10>(
+              s, target + row, target + col) -= product;
         }
       }
     }
@@ -593,7 +771,8 @@ __device__ __forceinline__ void tc_update_single(
             static_cast<uint32_t>(col);
         const float product = tmem_load_one(address);
         if (lane < 16 && col <= row) {
-          single_at(s, target + row, target + col) -= product;
+          single_at<PadA10>(
+              s, target + row, target + col) -= product;
         }
       }
     }
@@ -602,33 +781,54 @@ __device__ __forceinline__ void tc_update_single(
   tmem_deallocate<false>(tmem_base, kTile);
 }
 
-template <int RootMode, int FactorMode, int TrsmMode, int UpdateMode>
+template <int RootMode, int FactorMode, int TrsmMode, int UpdateMode,
+          bool PadA10, bool BatchTcSlices,
+          int Potf2Threads, int CtaThreads>
 __device__ __forceinline__ void potrf128_single(
     float* s, int begin, float* scratch, uint32_t* tmem_slot,
     uint64_t* barrier, int& phase) {
   if constexpr (FactorMode == kRecursive32) {
-    potf2_single<RootMode, FactorMode>(s, begin, 32);
-    trsm_single<TrsmMode>(s, begin + 32, 32, begin, 32);
-    simt_update_single(s, begin + 32, 32, begin, 32);
-    potf2_single<RootMode, FactorMode>(s, begin + 32, 32);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin, 32);
+    trsm_single<TrsmMode, PadA10>(
+        s, begin + 32, 32, begin, 32);
+    simt_update_single<PadA10>(s, begin + 32, 32, begin, 32);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin + 32, 32);
 
-    trsm_single<TrsmMode>(s, begin + 64, 64, begin, 64);
+    trsm_single<TrsmMode, PadA10>(
+        s, begin + 64, 64, begin, 64);
     if constexpr (UpdateMode == kTcAllUpdate) {
-      tc_update_single<64>(
+      tc_update_single<64, PadA10, BatchTcSlices>(
           s, begin + 64, begin, scratch, tmem_slot, barrier, phase);
     } else {
-      simt_update_single(s, begin + 64, 64, begin, 64);
+      simt_update_single<PadA10>(
+          s, begin + 64, 64, begin, 64);
     }
 
-    potf2_single<RootMode, FactorMode>(s, begin + 64, 32);
-    trsm_single<TrsmMode>(s, begin + 96, 32, begin + 64, 32);
-    simt_update_single(s, begin + 96, 32, begin + 64, 32);
-    potf2_single<RootMode, FactorMode>(s, begin + 96, 32);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin + 64, 32);
+    trsm_single<TrsmMode, PadA10>(
+        s, begin + 96, 32, begin + 64, 32);
+    simt_update_single<PadA10>(
+        s, begin + 96, 32, begin + 64, 32);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin + 96, 32);
   } else {
-    potf2_single<RootMode, FactorMode>(s, begin, 64);
-    trsm_single<TrsmMode>(s, begin + 64, 64, begin, 64);
-    simt_update_single(s, begin + 64, 64, begin, 64);
-    potf2_single<RootMode, FactorMode>(s, begin + 64, 64);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin, 64);
+    trsm_single<TrsmMode, PadA10>(
+        s, begin + 64, 64, begin, 64);
+    simt_update_single<PadA10>(
+        s, begin + 64, 64, begin, 64);
+    factor_base_single<
+        RootMode, FactorMode, PadA10, Potf2Threads, CtaThreads>(
+            s, begin + 64, 64);
   }
 }
 
@@ -638,7 +838,9 @@ void single_kernel(const float* __restrict__ input,
                    float* __restrict__ output) {
   using V = Variant<VariantId>;
   extern __shared__ __align__(16) float storage[];
-  float* scratch = storage + kSingleFloats;
+  constexpr int storage_floats =
+      V::pad_a10 ? kPaddedSingleFloats : kSingleFloats;
+  float* scratch = storage + storage_floats;
   uint32_t* tmem_slot =
       reinterpret_cast<uint32_t*>(scratch + kTcScratchFloats);
   uint64_t* barrier =
@@ -660,12 +862,13 @@ void single_kernel(const float* __restrict__ input,
     const int row = linear / kTile;
     const int col = linear % kTile;
     if (col <= row) {
-      storage[kA00 + row * kLd + col] =
+      single_at<V::pad_a10>(storage, row, col) =
           matrix_input[row * kN + col];
-      storage[kA11 + row * kLd + col] =
+      single_at<V::pad_a10>(
+          storage, row + kTile, col + kTile) =
           matrix_input[(row + kTile) * kN + col + kTile];
     }
-    storage[kA10 + linear] =
+    single_at<V::pad_a10>(storage, row + kTile, col) =
         matrix_input[(row + kTile) * kN + col];
   }
   __syncthreads();
@@ -673,37 +876,45 @@ void single_kernel(const float* __restrict__ input,
     barrier_init(barrier);
   }
 
-  potrf128_single<V::root, V::factor, V::trsm, V::update>(
-      storage, 0, scratch, tmem_slot, barrier, phase);
+  potrf128_single<
+      V::root, V::factor, V::trsm, V::update,
+      V::pad_a10, V::batch_tc_slices,
+      V::potf2_threads, V::threads>(
+          storage, 0, scratch, tmem_slot, barrier, phase);
   for (int linear = static_cast<int>(threadIdx.x);
        linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
     const int row = linear / kTile;
     const int col = linear % kTile;
     if (col <= row) {
       matrix_output[row * kN + col] =
-          storage[kA00 + row * kLd + col];
+          single_at<V::pad_a10>(storage, row, col);
     }
   }
   __syncthreads();
 
-  trsm_single<V::trsm>(storage, kTile, kTile, 0, kTile);
+  trsm_single<V::outer_trsm, V::pad_a10>(
+      storage, kTile, kTile, 0, kTile);
   for (int linear = static_cast<int>(threadIdx.x);
        linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
     const int row = linear / kTile;
     const int col = linear % kTile;
     matrix_output[(row + kTile) * kN + col] =
-        storage[kA10 + linear];
+        single_at<V::pad_a10>(storage, row + kTile, col);
   }
   __syncthreads();
 
   if constexpr (V::update == kSimtUpdate) {
-    simt_update_single(storage, kTile, kTile, 0, kTile);
+    simt_update_single<V::pad_a10>(
+        storage, kTile, kTile, 0, kTile);
   } else {
-    tc_update_single<128>(
+    tc_update_single<128, V::pad_a10, V::batch_tc_slices>(
         storage, kTile, 0, scratch, tmem_slot, barrier, phase);
   }
-  potrf128_single<V::root, V::factor, V::trsm, V::update>(
-      storage, kTile, scratch, tmem_slot, barrier, phase);
+  potrf128_single<
+      V::root, V::factor, V::trsm, V::update,
+      V::pad_a10, V::batch_tc_slices,
+      V::potf2_threads, V::threads>(
+          storage, kTile, scratch, tmem_slot, barrier, phase);
 
   for (int linear = static_cast<int>(threadIdx.x);
        linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
@@ -711,7 +922,8 @@ void single_kernel(const float* __restrict__ input,
     const int col = linear % kTile;
     if (col <= row) {
       matrix_output[(row + kTile) * kN + col + kTile] =
-          storage[kA11 + row * kLd + col];
+          single_at<V::pad_a10>(
+              storage, row + kTile, col + kTile);
     }
   }
   __syncthreads();
@@ -1250,7 +1462,9 @@ void configure_one() {
   using V = Variant<Id>;
   const int bytes = V::cluster
       ? (V::tensor ? kClusterTcBytes : kClusterBytes)
-      : (V::tensor ? kSingleTcBytes : kSingleBytes);
+      : (V::pad_a10
+             ? (V::tensor ? kPaddedSingleTcBytes : kPaddedSingleBytes)
+             : (V::tensor ? kSingleTcBytes : kSingleBytes));
   if constexpr (V::cluster) {
     configure_kernel(
         cluster_kernel<V::threads, V::root,
@@ -1269,6 +1483,8 @@ void configure_all() {
   configure_one<9>(); configure_one<10>(); configure_one<11>();
   configure_one<12>(); configure_one<13>(); configure_one<14>();
   configure_one<15>(); configure_one<16>(); configure_one<17>();
+  configure_one<18>(); configure_one<19>(); configure_one<20>();
+  configure_one<21>();
 }
 
 template <int Id>
@@ -1276,7 +1492,9 @@ void launch_one(const float* input, float* output) {
   using V = Variant<Id>;
   const int bytes = V::cluster
       ? (V::tensor ? kClusterTcBytes : kClusterBytes)
-      : (V::tensor ? kSingleTcBytes : kSingleBytes);
+      : (V::pad_a10
+             ? (V::tensor ? kPaddedSingleTcBytes : kPaddedSingleBytes)
+             : (V::tensor ? kSingleTcBytes : kSingleBytes));
   if constexpr (V::cluster) {
     cudaLaunchAttribute attribute{};
     attribute.id = cudaLaunchAttributeClusterDimension;
@@ -1320,8 +1538,12 @@ void launch_variant(const float* input, float* output, int variant) {
     case 15: launch_one<15>(input, output); break;
     case 16: launch_one<16>(input, output); break;
     case 17: launch_one<17>(input, output); break;
+    case 18: launch_one<18>(input, output); break;
+    case 19: launch_one<19>(input, output); break;
+    case 20: launch_one<20>(input, output); break;
+    case 21: launch_one<21>(input, output); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 17]");
+      TORCH_CHECK(false, "native variant must be in [0, 21]");
   }
 }
 
@@ -1332,7 +1554,9 @@ void write_metadata(int64_t* rows) {
   int active = 0;
   const int bytes = V::cluster
       ? (V::tensor ? kClusterTcBytes : kClusterBytes)
-      : (V::tensor ? kSingleTcBytes : kSingleBytes);
+      : (V::pad_a10
+             ? (V::tensor ? kPaddedSingleTcBytes : kPaddedSingleBytes)
+             : (V::tensor ? kSingleTcBytes : kSingleBytes));
   cudaError_t status;
   if constexpr (V::cluster) {
     auto kernel = cluster_kernel<
@@ -1372,6 +1596,11 @@ void write_metadata(int64_t* rows) {
   row[13] = V::update;
   row[14] = V::root;
   row[15] = V::threads;
+  row[16] = V::pad_a10 ? kLd : kTile;
+  row[17] =
+      V::cluster && V::tensor ? kTensorBlockTrsm : V::outer_trsm;
+  row[18] = V::potf2_threads;
+  row[19] = V::batch_tc_slices ? 1 : 0;
 }
 
 }  // namespace
@@ -1386,7 +1615,7 @@ void cholesky_b64n256_out(const at::Tensor& data,
   check_input(data);
   check_output(data, out);
   TORCH_CHECK(variant >= 0 && variant < kVariantCount,
-              "native variant must be in [0, 17]");
+              "native variant must be in [0, 21]");
   launch_variant(
       data.data_ptr<float>(), out.data_ptr<float>(),
       static_cast<int>(variant));
@@ -1415,6 +1644,8 @@ at::Tensor cholesky_b64n256_metadata() {
   write_metadata<12>(rows); write_metadata<13>(rows);
   write_metadata<14>(rows); write_metadata<15>(rows);
   write_metadata<16>(rows); write_metadata<17>(rows);
+  write_metadata<18>(rows); write_metadata<19>(rows);
+  write_metadata<20>(rows); write_metadata<21>(rows);
   return result;
 }
 """

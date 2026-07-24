@@ -11,6 +11,11 @@ The production ID is variant 8. Variant IDs are append-only. The Popcorn
 sweep may change only the integer on the tracked `# POPCORN_VARIANT` line
 after its promotion gates pass.
 
+Variants 18--21 are isolated, append-only descendants of the profiled
+512-thread variant 11. Each changes exactly one mechanism so correctness,
+resources, and timing can be attributed to that optimization. They have not
+yet passed B200 compilation or numerical validation.
+
 ## Matrix layout
 
 The single-CTA implementation retains only the lower 2-by-2 block layout:
@@ -28,6 +33,11 @@ The single-CTA implementation retains only the lower 2-by-2 block layout:
 floats, or 197,632 bytes. Tensor variants add a 64-by-64 conversion area and
 barrier/allocation words for 214,032 dynamic bytes. Both are below B200's
 227-KiB per-CTA opt-in limit.
+
+Variant 18 changes only `A10` to `ld=129` and moves `A11` by 128 floats. Its
+tensor specialization therefore uses 214,544 dynamic bytes. All `A10`
+staging, solve, output, and indirect factor/update accesses use the selected
+compile-time layout; variants 0--17 retain `ld=128`.
 
 The cluster implementation splits the rows of each 128-row tile between its
 two CTAs. Each rank owns 64 rows of `A00`, `A10`, and `A11`. Its base storage
@@ -63,6 +73,17 @@ right, so no CTA-wide synchronization is required within that row. The
 8-lane TRSV alternative assigns one subwarp to a row and reduces each dot
 product with width-8 shuffles.
 
+Variant 19 keeps scalar TRSM for every recursive 32- and 64-row panel, but
+uses the existing 8-lane mapping for only the outer 128-by-128 `A10` solve.
+Its 64 subgroups give all 512 threads useful outer-solve work while avoiding
+subgroup overhead in the smaller recursive panels.
+
+Variant 20 keeps all v11 arithmetic and layouts, but limits each `POTF2-32`
+column phase to threads 0--127. Those four warps use named CTA barrier 1 with
+an explicit 128-thread participant count. Threads 128--511 wait only at the
+single full-CTA barrier at factor exit. The original full-CTA POTF2 path is
+unchanged for variants 0--19 and 21.
+
 Cluster tensor variants block the 128-column outer TRSM at 64 columns. They
 solve the first half in FP32, convert copies of that panel and the off-diagonal
 factor block in scratch, use a group-2 128-by-64 TF32 MMA for the cross-panel
@@ -96,6 +117,14 @@ TF32 operands use the PTX canonical K-major byte layout. The descriptor
 leading dimension is the operand row count, its stride dimension is eight,
 and neither matrix-major bit is set. Reusing a conversion tile waits for the
 preceding MMA to finish before overwriting its bytes.
+
+Variant 21 packs several K=8 operand slices into the existing 4,096-float
+conversion area before issuing tensor operations. A 64-by-64 update packs all
+eight slices and uses one commit/wait group. A 128-by-128 update packs four
+slices at a time and uses four groups. Across both recursive 64 updates and
+the outer 128 update this reduces 32 commit/wait groups to six, without
+changing shared-memory size. Variants 0--20 retain one commit/wait per K=8
+slice.
 
 One-SM update shapes are 64-by-64 and 128-by-128. The 64-row TMEM epilogue
 uses the four 16-row subpartition groups; every lane executes each synchronous
@@ -153,7 +182,7 @@ official two-CTA GEMM tutorial established the accumulator mapping; isolated
 `1.7e-4` through `3.0e-4` relative Frobenius error. The probe writes were
 removed after the block decomposition passed normal validation.
 
-## Stable variants
+## Variants
 
 | ID | Threads/CTA | Placement | Factor | TRSM | Update | Root |
 |---:|---:|---|---|---|---|---|
@@ -175,10 +204,16 @@ removed after the block decomposition passed normal validation.
 | 15 | 128 | 2-CTA cluster | recursive 32 | tensor block-panel | TCGen all eligible | refined |
 | 16 | 256 | 2-CTA cluster | recursive 32 | tensor block-panel | TCGen all eligible | refined |
 | 17 | 256 | 2-CTA cluster | recursive 32 | tensor block-panel | TCGen all eligible | raw |
+| 18 | 512 | 1 CTA | recursive 32 | scalar row | TCGen all eligible, padded A10 | refined |
+| 19 | 512 | 1 CTA | recursive 32 | scalar recursive, 8-lane outer | TCGen all eligible | refined |
+| 20 | 512 | 1 CTA | recursive 32, 128 participants | scalar row | TCGen all eligible | refined |
+| 21 | 512 | 1 CTA | recursive 32 | scalar row | TCGen all eligible, batched K slices | refined |
 
 `_variant_metadata()` returns one row per ID with registers, local bytes,
 static and dynamic shared bytes, occupancy, cluster size, tensor use,
 recursive base, factor/TRSM/update modes, root mode, and launch-bound threads.
+It also records the A10 leading dimension, outer TRSM mode, POTF2 participant
+count, and whether TC slices are batched.
 
 ## Autotuning and promotion
 
@@ -294,11 +329,23 @@ contains the held-constant fallback shapes and normal remote timing noise.
 
 ## Verification commands
 
-The Python compilation, diff check, forbidden-token search, Modal tuning,
-Popcorn test, and three-round Popcorn sweep commands have been run during
-this revision. NCU profiling remains for a subsequent profiling pass.
+Before this append-only pass, the Python compilation, diff check,
+forbidden-token search, Modal tuning, Popcorn test, and three-round Popcorn
+sweep commands had been run. NCU profiling remains for a subsequent
+profiling pass.
+
+For the append-only variants 18--21 pass, Python compilation, `git
+diff --check`, the forbidden-token search, and a CUDA 13.1 SM100a
+translation-unit compilation completed without errors. The CUDA compile
+reported only the existing PyTorch BFloat16 host/device constexpr warnings.
+GPU access is blocked in the assistant environment, so this pass did not run
+the extension or validate numerical results. The first required B200 command
+is:
 
 ```bash
+.venv/bin/modal run cholesky/b64n256/cholesky_b64n256_modal.py \
+  --action tune --variants 11,18,19,20,21
+
 python3 -m py_compile \
   cholesky/b64n256/cholesky_b64n256.py \
   cholesky/b64n256/cholesky_b64n256_modal.py
@@ -331,8 +378,10 @@ primary custom-path correctness gate.
 
 ## Current status
 
-The extension compiles on B200 and all 18 variants pass the six target-sized
-Modal cases without tensor-specific tolerance relaxation. Variant 11 is the
-isolated Modal winner; variant 8 won the three-round whole-grid sweep and is
-the promoted default. Popcorn integration passed. NCU profiling has not yet
-been run.
+The extension revision before variants 18--21 compiled on B200 and all 18
+stable variants passed the six target-sized Modal cases without
+tensor-specific tolerance relaxation. Variant 11 was the isolated Modal
+winner; variant 8 won the three-round whole-grid sweep and remains the
+promoted default. Popcorn integration passed. Variants 18--21 require B200
+compilation, six-case validation, target timing, and follow-up NCU captures
+before any promotion decision.
