@@ -28,7 +28,7 @@ TARGET_BENCHMARK_INDEX = 5
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
-VARIANT_COUNT = 6
+VARIANT_COUNT = 8
 VARIANT_NAMES = (
     "p64_raw_scalar_m4x4_t256",
     "p64_nr_scalar_m4x4_t256",
@@ -36,6 +36,8 @@ VARIANT_NAMES = (
     "p64_raw_sub4_m4x4_t256",
     "p32_raw_scalar_m2x4_t128",
     "p32_nr_scalar_m2x4_t128",
+    "p64_raw_scalar_m4x4_t256_occ5",
+    "p64_raw_tcgen05_tf32_t128_occ6",
 )
 DEFAULT_MARKER = re.compile(
     r"^_DEFAULT_VARIANT = \d+  # POPCORN_VARIANT$", re.MULTILINE

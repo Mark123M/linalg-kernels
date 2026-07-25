@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The autotuner may replace this exact line in retained candidate copies.
-_DEFAULT_VARIANT = 0  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 6  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "p64_raw_scalar_m4x4_t256",
     "p64_nr_scalar_m4x4_t256",
@@ -16,6 +16,8 @@ _VARIANT_NAMES = (
     "p64_raw_sub4_m4x4_t256",
     "p32_raw_scalar_m2x4_t128",
     "p32_nr_scalar_m2x4_t128",
+    "p64_raw_scalar_m4x4_t256_occ5",
+    "p64_raw_tcgen05_tf32_t128_occ6",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -31,6 +33,9 @@ _METADATA_COLUMNS = (
     "local_bytes",
     "batch",
     "launch_count",
+    "update_mode",
+    "minimum_blocks",
+    "tmem_columns",
 )
 
 _CPP_SOURCE = r"""
@@ -67,32 +72,40 @@ namespace {
 
 constexpr int kBatch = 640;
 constexpr int kN = 512;
-constexpr int kVariantCount = 6;
-constexpr int kMetadataColumns = 10;
+constexpr int kVariantCount = 8;
+constexpr int kMetadataColumns = 13;
+constexpr int kTmemDp = 1 << 16;
 
 constexpr int kPreciseRoot = 0;
 constexpr int kNewtonRoot = 1;
 constexpr int kRawRoot = 2;
 constexpr int kScalarSolve = 0;
 constexpr int kSub4Solve = 1;
+constexpr int kFp32Update = 0;
+constexpr int kTensorUpdate = 1;
 
 template <int Id>
 struct Variant;
 
-#define SPEC(ID, TILE, THREADS, ROOT, SOLVE) \
-  template <> struct Variant<ID> {           \
-    static constexpr int tile = TILE;        \
-    static constexpr int threads = THREADS;  \
-    static constexpr int root = ROOT;        \
-    static constexpr int solve = SOLVE;      \
+#define SPEC(ID, TILE, THREADS, ROOT, SOLVE, UPDATE, MIN_BLOCKS, TMEM) \
+  template <> struct Variant<ID> {                                    \
+    static constexpr int tile = TILE;                                 \
+    static constexpr int threads = THREADS;                           \
+    static constexpr int root = ROOT;                                 \
+    static constexpr int solve = SOLVE;                               \
+    static constexpr int update = UPDATE;                             \
+    static constexpr int minimum_blocks = MIN_BLOCKS;                 \
+    static constexpr int tmem_columns = TMEM;                         \
   }
 
-SPEC(0, 64, 256, kRawRoot, kScalarSolve);
-SPEC(1, 64, 256, kNewtonRoot, kScalarSolve);
-SPEC(2, 64, 256, kPreciseRoot, kScalarSolve);
-SPEC(3, 64, 256, kRawRoot, kSub4Solve);
-SPEC(4, 32, 128, kRawRoot, kScalarSolve);
-SPEC(5, 32, 128, kNewtonRoot, kScalarSolve);
+SPEC(0, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 1, 0);
+SPEC(1, 64, 256, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0);
+SPEC(2, 64, 256, kPreciseRoot, kScalarSolve, kFp32Update, 1, 0);
+SPEC(3, 64, 256, kRawRoot, kSub4Solve, kFp32Update, 1, 0);
+SPEC(4, 32, 128, kRawRoot, kScalarSolve, kFp32Update, 1, 0);
+SPEC(5, 32, 128, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0);
+SPEC(6, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 5, 0);
+SPEC(7, 64, 128, kRawRoot, kScalarSolve, kTensorUpdate, 6, 64);
 
 #undef SPEC
 
@@ -104,6 +117,158 @@ __device__ __forceinline__ float load_global(
 __device__ __forceinline__ void store_global(
     float* pointer, float value) {
   __stcg(pointer, value);
+}
+
+__device__ __forceinline__ uint32_t shared_address(
+    const void* pointer) {
+  return static_cast<uint32_t>(
+      __cvta_generic_to_shared(const_cast<void*>(pointer)));
+}
+
+__device__ __forceinline__ uint32_t to_tf32(float value) {
+  uint32_t result;
+  asm volatile(
+      "cvt.rna.tf32.f32 %0, %1;"
+      : "=r"(result) : "f"(value));
+  return result;
+}
+
+__device__ __forceinline__ int kmajor_offset(
+    int row, int column) {
+  return (row & 7) * 4 + (row >> 3) * 32 +
+         (column & 3) + (column >> 2) * (64 * 4);
+}
+
+__device__ __forceinline__ uint64_t
+make_kmajor_descriptor(const void* pointer) {
+  const uint64_t start =
+      static_cast<uint64_t>(shared_address(pointer) >> 4) &
+      0x3fffull;
+  const uint64_t leading = 64ull;
+  const uint64_t stride = 8ull;
+  return start | (leading << 16) | (stride << 32) |
+         (1ull << 46);
+}
+
+__device__ __forceinline__ constexpr uint32_t
+tf32_mma_descriptor() {
+  return (1u << 4) | (2u << 7) | (2u << 10) |
+         (8u << 17) | (4u << 24);
+}
+
+__device__ __forceinline__ void proxy_fence() {
+  asm volatile(
+      "fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+__device__ __forceinline__ void tensor_after_sync_fence() {
+  asm volatile(
+      "tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
+__device__ __forceinline__ void tensor_barrier_init(
+    uint64_t* barrier) {
+  if (threadIdx.x == 0) {
+    const uint32_t address = shared_address(barrier);
+    asm volatile(
+        "mbarrier.init.shared::cta.b64 [%0], 1;" ::
+        "r"(address) : "memory");
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void tmem_allocate(
+    uint32_t* destination, int columns) {
+  if (static_cast<int>(threadIdx.x) < 32) {
+    const uint32_t address = shared_address(destination);
+    asm volatile(
+        "tcgen05.alloc.cta_group::1.sync.aligned."
+        "shared::cta.b32 [%0], %1;" ::
+        "r"(address), "r"(columns) : "memory");
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void tmem_deallocate(
+    uint32_t base, int columns) {
+  __syncthreads();
+  if (static_cast<int>(threadIdx.x) < 32) {
+    asm volatile(
+        "tcgen05.dealloc.cta_group::1.sync.aligned.b32 "
+        "%0, %1;" :: "r"(base), "r"(columns));
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void tmem_relinquish() {
+  if (static_cast<int>(threadIdx.x) < 32) {
+    asm volatile(
+        "tcgen05.relinquish_alloc_permit."
+        "cta_group::1.sync.aligned;");
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void issue_tf32_mma(
+    uint32_t tmem_base, uint64_t a_descriptor,
+    uint64_t b_descriptor, bool accumulate) {
+  if (threadIdx.x == 0) {
+    const uint32_t instruction = tf32_mma_descriptor();
+    const uint32_t scale = accumulate ? 1u : 0u;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::tf32 "
+        "[%0], %1, %2, %3, {%5,%6,%7,%8}, p;\n\t"
+        "}\n" ::
+        "r"(tmem_base), "l"(a_descriptor),
+        "l"(b_descriptor), "r"(instruction), "r"(scale),
+        "r"(0u), "r"(0u), "r"(0u), "r"(0u));
+  }
+}
+
+__device__ __forceinline__ void tensor_commit(
+    uint64_t* barrier) {
+  if (threadIdx.x == 0) {
+    const uint32_t address = shared_address(barrier);
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+        "shared::cluster.b64 [%0];" ::
+        "r"(address) : "memory");
+  }
+}
+
+__device__ __forceinline__ void tensor_wait_warp(
+    uint64_t* barrier, int phase) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (lane == 0) {
+    const uint32_t address = shared_address(barrier);
+    const uint32_t ticks = 0x989680u;
+    uint32_t complete;
+    do {
+      asm volatile(
+          "{\n\t"
+          ".reg .pred done;\n\t"
+          "mbarrier.try_wait.parity.shared::cta.b64 done, "
+          "[%1], %2, %3;\n\t"
+          "selp.b32 %0, 1, 0, done;\n\t"
+          "}\n"
+          : "=r"(complete)
+          : "r"(address), "r"(phase), "r"(ticks)
+          : "memory");
+    } while (complete == 0);
+  }
+  __syncwarp();
+}
+
+__device__ __forceinline__ float tmem_load_one(
+    uint32_t address) {
+  uint32_t value;
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x1.b32 "
+      "{%0}, [%1];" : "=r"(value) : "r"(address));
+  return __uint_as_float(value);
 }
 
 template <int RootMode>
@@ -605,9 +770,68 @@ __device__ __forceinline__ void update_global(
   }
 }
 
+template <int Threads>
+__device__ __forceinline__ void pack_panel_tf32(
+    uint32_t* packed, const float* matrix,
+    int row_begin, int panel_begin) {
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < 64 * 64; linear += Threads) {
+    const int row = linear >> 6;
+    const int column = linear & 63;
+    packed[kmajor_offset(row, column)] = to_tf32(
+        load_global(
+            matrix + (row_begin + row) * kN +
+            panel_begin + column));
+  }
+}
+
+__device__ __forceinline__ int tensor_update_global(
+    const uint32_t* left, const uint32_t* right,
+    float* matrix, int row_begin, int column_begin,
+    bool diagonal, uint32_t tmem_base,
+    uint64_t* barrier, int phase) {
+  proxy_fence();
+  __syncthreads();
+
+#pragma unroll
+  for (int k = 0; k < 64; k += 8) {
+    issue_tf32_mma(
+        tmem_base,
+        make_kmajor_descriptor(left + k * 64),
+        make_kmajor_descriptor(right + k * 64),
+        k != 0);
+  }
+  tensor_commit(barrier);
+  tensor_wait_warp(barrier, phase);
+
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int output_row = warp * 16 + lane;
+#pragma unroll 1
+  for (int column = 0; column < 64; ++column) {
+    const uint32_t address =
+        tmem_base + static_cast<uint32_t>(warp * 32) *
+                        kTmemDp +
+        static_cast<uint32_t>(column);
+    const float product = tmem_load_one(address);
+    if (lane < 16 &&
+        (!diagonal || column <= output_row)) {
+      float* destination =
+          matrix + (row_begin + output_row) * kN +
+          column_begin + column;
+      store_global(
+          destination,
+          load_global(destination) - product);
+    }
+  }
+  __syncthreads();
+  return phase ^ 1;
+}
+
 template <
-    int Tile, int Threads, int RootMode, int SolveMode>
-__global__ __launch_bounds__(Threads)
+    int Tile, int Threads, int RootMode, int SolveMode,
+    int UpdateMode, int MinimumBlocks>
+__global__ __launch_bounds__(Threads, MinimumBlocks)
 void fused_potrf_kernel(
     const float* __restrict__ input,
     float* __restrict__ output) {
@@ -616,12 +840,25 @@ void fused_potrf_kernel(
   __shared__ __align__(128) float tile_a[Tile * kLd];
   __shared__ __align__(128) float tile_b[Tile * kLd];
   __shared__ float inverse_diagonal[Tile];
+  __shared__ __align__(8) uint64_t tensor_barrier;
+  __shared__ uint32_t tmem_base_word;
 
   const int matrix_index = static_cast<int>(blockIdx.x);
   const int64_t matrix_offset =
       static_cast<int64_t>(matrix_index) * kN * kN;
   const float* input_matrix = input + matrix_offset;
   float* matrix = output + matrix_offset;
+
+  uint32_t tmem_base = 0;
+  int tensor_phase = 0;
+  if constexpr (UpdateMode == kTensorUpdate) {
+    static_assert(Tile == 64);
+    static_assert(Threads == 128);
+    tensor_barrier_init(&tensor_barrier);
+    tmem_allocate(&tmem_base_word, 64);
+    tmem_base = tmem_base_word;
+    tensor_after_sync_fence();
+  }
 
   copy_lower<Threads>(input_matrix, matrix);
 
@@ -649,33 +886,68 @@ void fused_potrf_kernel(
       store_tile<Tile, Threads>(
           tile_b, matrix, row_begin, panel_begin);
     }
-    __syncthreads();
 
-    for (int row_tile = panel + 1;
-         row_tile < kTileCount; ++row_tile) {
-      const int row_begin = row_tile * Tile;
-      load_tile<Tile, Threads>(
-          matrix, tile_a, row_begin, panel_begin);
-      __syncthreads();
-
-      for (int column_tile = panel + 1;
-           column_tile <= row_tile; ++column_tile) {
-        const int column_begin = column_tile * Tile;
-        const bool is_diagonal =
-            column_tile == row_tile;
-        const float* right = tile_a;
-        if (!is_diagonal) {
-          load_tile<Tile, Threads>(
-              matrix, tile_b, column_begin, panel_begin);
-          __syncthreads();
-          right = tile_b;
-        }
-        update_global<Tile>(
-            tile_a, right, matrix,
-            row_begin, column_begin, is_diagonal);
+    if constexpr (UpdateMode == kFp32Update) {
+      for (int row_tile = panel + 1;
+           row_tile < kTileCount; ++row_tile) {
+        const int row_begin = row_tile * Tile;
+        load_tile<Tile, Threads>(
+            matrix, tile_a, row_begin, panel_begin);
         __syncthreads();
+
+        for (int column_tile = panel + 1;
+             column_tile <= row_tile; ++column_tile) {
+          const int column_begin = column_tile * Tile;
+          const bool is_diagonal =
+              column_tile == row_tile;
+          const float* right = tile_a;
+          if (!is_diagonal) {
+            load_tile<Tile, Threads>(
+                matrix, tile_b, column_begin, panel_begin);
+            __syncthreads();
+            right = tile_b;
+          }
+          update_global<Tile>(
+              tile_a, right, matrix,
+              row_begin, column_begin, is_diagonal);
+          __syncthreads();
+        }
+      }
+    } else {
+      uint32_t* left =
+          reinterpret_cast<uint32_t*>(tile_a);
+      uint32_t* right =
+          reinterpret_cast<uint32_t*>(tile_b);
+      for (int row_tile = panel + 1;
+           row_tile < kTileCount; ++row_tile) {
+        const int row_begin = row_tile * Tile;
+        pack_panel_tf32<Threads>(
+            left, matrix, row_begin, panel_begin);
+
+        for (int column_tile = panel + 1;
+             column_tile <= row_tile; ++column_tile) {
+          const int column_begin = column_tile * Tile;
+          const bool is_diagonal =
+              column_tile == row_tile;
+          const uint32_t* right_operand = left;
+          if (!is_diagonal) {
+            pack_panel_tf32<Threads>(
+                right, matrix, column_begin, panel_begin);
+            right_operand = right;
+          }
+          __syncthreads();
+          tensor_phase = tensor_update_global(
+              left, right_operand, matrix,
+              row_begin, column_begin, is_diagonal,
+              tmem_base, &tensor_barrier, tensor_phase);
+        }
       }
     }
+  }
+
+  if constexpr (UpdateMode == kTensorUpdate) {
+    tmem_deallocate(tmem_base, 64);
+    tmem_relinquish();
   }
 }
 
@@ -735,7 +1007,8 @@ template <int Id>
 void configure_one() {
   using V = Variant<Id>;
   auto kernel = fused_potrf_kernel<
-      V::tile, V::threads, V::root, V::solve>;
+      V::tile, V::threads, V::root, V::solve,
+      V::update, V::minimum_blocks>;
   prefer_shared(kernel);
   const cudaFuncAttributes attributes =
       attributes_for(kernel);
@@ -755,7 +1028,8 @@ void launch_one(const float* input, float* output) {
   cudaLaunchKernelEx(
       &config,
       fused_potrf_kernel<
-          V::tile, V::threads, V::root, V::solve>,
+          V::tile, V::threads, V::root, V::solve,
+          V::update, V::minimum_blocks>,
       input, output);
 }
 
@@ -767,8 +1041,10 @@ void configure_variant(int variant) {
     case 3: configure_one<3>(); break;
     case 4: configure_one<4>(); break;
     case 5: configure_one<5>(); break;
+    case 6: configure_one<6>(); break;
+    case 7: configure_one<7>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 5]");
+      TORCH_CHECK(false, "native variant must be in [0, 7]");
   }
 }
 
@@ -781,8 +1057,10 @@ void launch_variant(
     case 3: launch_one<3>(input, output); break;
     case 4: launch_one<4>(input, output); break;
     case 5: launch_one<5>(input, output); break;
+    case 6: launch_one<6>(input, output); break;
+    case 7: launch_one<7>(input, output); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 5]");
+      TORCH_CHECK(false, "native variant must be in [0, 7]");
   }
 }
 
@@ -791,7 +1069,8 @@ void write_metadata(int64_t* rows) {
   using V = Variant<Id>;
   const cudaFuncAttributes attributes = attributes_for(
       fused_potrf_kernel<
-          V::tile, V::threads, V::root, V::solve>);
+          V::tile, V::threads, V::root, V::solve,
+          V::update, V::minimum_blocks>);
   int64_t* row =
       rows + static_cast<int64_t>(Id) * kMetadataColumns;
   row[0] = Id;
@@ -804,6 +1083,9 @@ void write_metadata(int64_t* rows) {
   row[7] = attributes.localSizeBytes;
   row[8] = kBatch;
   row[9] = 1;
+  row[10] = V::update;
+  row[11] = V::minimum_blocks;
+  row[12] = V::tmem_columns;
 }
 
 }  // namespace
@@ -811,7 +1093,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b640n512_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 5]");
+      "native variant must be in [0, 7]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -823,7 +1105,7 @@ void cholesky_b640n512_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 5]");
+      "native variant must be in [0, 7]");
   c10::cuda::CUDAGuard device_guard(data.device());
   launch_variant(
       data.data_ptr<float>(),
@@ -856,6 +1138,8 @@ at::Tensor cholesky_b640n512_metadata() {
   write_metadata<3>(rows);
   write_metadata<4>(rows);
   write_metadata<5>(rows);
+  write_metadata<6>(rows);
+  write_metadata<7>(rows);
   return result;
 }
 """
