@@ -128,8 +128,8 @@ __device__ __forceinline__ void factor64_crout(
     float value0;
     float value1;
     if constexpr (GlobalInput) {
-      value0 = input[j * kN + row0];
-      value1 = input[j * kN + row1];
+      value0 = __ldg(input + j * kN + row0);
+      value1 = __ldg(input + j * kN + row1);
     } else {
       value0 = row0 >= j ? tile[(Base + row0) * kLd + Base + j] : 0.0f;
       value1 = row1 >= j ? tile[(Base + row1) * kLd + Base + j] : 0.0f;
@@ -191,7 +191,7 @@ __device__ __forceinline__ void factor64_right(
   for (int j = 0; j < kHalf; ++j) {
     if constexpr (GlobalInput) {
       const float2 loaded =
-          reinterpret_cast<const float2*>(input + j * kN)[lane];
+          __ldg(reinterpret_cast<const float2*>(input + j * kN) + lane);
       state[0][j] = loaded.x;
       state[1][j] = loaded.y;
     } else {
@@ -280,6 +280,11 @@ __device__ __forceinline__ void copy_async_commit() {
 
 __device__ __forceinline__ void copy_async_wait() {
   asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+__device__ __forceinline__ void store_float4_cg(float* addr, float4 val) {
+  asm volatile("st.global.cg.v4.f32 [%0], {%1, %2, %3, %4};"
+               :: "l"(addr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
 }
 
 template <bool FullUnroll>
@@ -727,7 +732,7 @@ __device__ __forceinline__ void output_tile(const float* tile, float* output) {
     values.y = column + 1 <= row ? tile[row * kLd + column + 1] : 0.0f;
     values.z = column + 2 <= row ? tile[row * kLd + column + 2] : 0.0f;
     values.w = column + 3 <= row ? tile[row * kLd + column + 3] : 0.0f;
-    reinterpret_cast<float4*>(output)[vector_index] = values;
+    store_float4_cg(output + row * kN + column, values);
   }
 }
 
@@ -738,7 +743,7 @@ __device__ __forceinline__ void store_output_vector(
   values.y = column + 1 <= row ? tile[row * kLd + column + 1] : 0.0f;
   values.z = column + 2 <= row ? tile[row * kLd + column + 2] : 0.0f;
   values.w = column + 3 <= row ? tile[row * kLd + column + 3] : 0.0f;
-  reinterpret_cast<float4*>(output)[row * (kN / 4) + column / 4] = values;
+  store_float4_cg(output + row * kN + column, values);
 }
 
 __device__ __forceinline__ void output_upper_right_zeros(float* output) {
@@ -748,7 +753,7 @@ __device__ __forceinline__ void output_upper_right_zeros(float* output) {
   for (int vector = lane; vector < kHalf * kHalf / 4; vector += 32) {
     const int row = vector >> 4;
     const int column = kHalf + (vector & 15) * 4;
-    reinterpret_cast<float4*>(output)[row * (kN / 4) + column / 4] = zeros;
+    store_float4_cg(output + row * kN + column, zeros);
   }
 }
 
@@ -891,8 +896,8 @@ void blocked_128_kernel(const float* __restrict__ input,
   } else if (row >= 0) {
 #pragma unroll
     for (int k = 0; k < kHalf; ++k) {
-      local[k] = a[k * kN + kHalf + row];
-      local[kHalf + k] = a[(kHalf + k) * kN + kHalf + row];
+      local[k] = __ldg(a + k * kN + kHalf + row);
+      local[kHalf + k] = __ldg(a + (kHalf + k) * kN + kHalf + row);
     }
   }
 
@@ -1157,8 +1162,8 @@ void configure_all() {
                                       kSimtBalancedUpdate, kL11WarpTail,
                                       false, false>);
   configure_kernel(blocked_128_kernel<kRight64, kRawRoot, false,
-                                      kSimtBalancedUpdate, kL11Rows,
-                                      false, false>);
+                                       kSimtBalancedUpdate, kL11Rows,
+                                       false, false>);
 }
 
 void launch_variant(const float* input, float* output, int variant) {
@@ -1399,7 +1404,7 @@ void cholesky_256x128_out(const at::Tensor& data,
   check_input(data);
   check_output(data, out);
   TORCH_CHECK(variant >= 0 && variant < kVariantCount,
-              "native variant must be in [0, 27]");
+               "native variant must be in [0, 27]");
   launch_variant(data.data_ptr<float>(), out.data_ptr<float>(),
                  static_cast<int>(variant));
   const auto status = cudaPeekAtLastError();
