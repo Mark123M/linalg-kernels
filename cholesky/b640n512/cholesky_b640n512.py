@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The autotuner may replace this exact line in retained candidate copies.
-_DEFAULT_VARIANT = 6  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 8  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "p64_raw_scalar_m4x4_t256",
     "p64_nr_scalar_m4x4_t256",
@@ -18,6 +18,17 @@ _VARIANT_NAMES = (
     "p32_nr_scalar_m2x4_t128",
     "p64_raw_scalar_m4x4_t256_occ5",
     "p64_raw_tcgen05_tf32_t128_occ6",
+    "p64_raw_scalar_preload_m4x4_t256_occ5",
+    "p64_raw_scalar_left_m4x4_t256_occ5",
+    "p64_raw_scalar_left_warp2_m4x4_t256_occ5",
+    "p64_raw_block16_left_warp2_m4x4_t256_occ4",
+    "p64_raw_block16_left_warp2_m4x4_t256_occ5",
+    "p64_raw_scalar_left_product_m2x4_t256_occ4",
+    "p64_raw_scalar_left_product_warp2_m2x4_t256_occ4",
+    "p64_raw_block8_left_product_warp2_m2x4_t256_occ4",
+    "p64_precise_scalar_left_product_warp2_m2x4_t256_occ4",
+    "p64_raw_scalar_left_shared_warp2_m4x4_t256_occ4",
+    "p64_raw_scalar_preload_warp2_m4x4_t256_occ5",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -36,6 +47,8 @@ _METADATA_COLUMNS = (
     "update_mode",
     "minimum_blocks",
     "tmem_columns",
+    "schedule_mode",
+    "factor_mode",
 )
 
 _CPP_SOURCE = r"""
@@ -72,8 +85,8 @@ namespace {
 
 constexpr int kBatch = 640;
 constexpr int kN = 512;
-constexpr int kVariantCount = 8;
-constexpr int kMetadataColumns = 13;
+constexpr int kVariantCount = 19;
+constexpr int kMetadataColumns = 15;
 constexpr int kTmemDp = 1 << 16;
 
 constexpr int kPreciseRoot = 0;
@@ -81,31 +94,74 @@ constexpr int kNewtonRoot = 1;
 constexpr int kRawRoot = 2;
 constexpr int kScalarSolve = 0;
 constexpr int kSub4Solve = 1;
+constexpr int kBlock16Solve = 2;
+constexpr int kBlock8Solve = 3;
 constexpr int kFp32Update = 0;
 constexpr int kTensorUpdate = 1;
+constexpr int kFp32PreloadUpdate = 2;
+constexpr int kRightSchedule = 0;
+constexpr int kLeftSchedule = 1;
+constexpr int kProductLeftSchedule = 2;
+constexpr int kSharedLeftSchedule = 3;
+constexpr int kRecursiveFactor = 0;
+constexpr int kWarp2Factor = 1;
 
 template <int Id>
 struct Variant;
 
-#define SPEC(ID, TILE, THREADS, ROOT, SOLVE, UPDATE, MIN_BLOCKS, TMEM) \
-  template <> struct Variant<ID> {                                    \
-    static constexpr int tile = TILE;                                 \
-    static constexpr int threads = THREADS;                           \
-    static constexpr int root = ROOT;                                 \
-    static constexpr int solve = SOLVE;                               \
-    static constexpr int update = UPDATE;                             \
-    static constexpr int minimum_blocks = MIN_BLOCKS;                 \
-    static constexpr int tmem_columns = TMEM;                         \
+#define SPEC(                                                           \
+    ID, TILE, THREADS, ROOT, SOLVE, UPDATE, MIN_BLOCKS, TMEM,           \
+    SCHEDULE, FACTOR)                                                   \
+  template <> struct Variant<ID> {                                     \
+    static constexpr int tile = TILE;                                  \
+    static constexpr int threads = THREADS;                            \
+    static constexpr int root = ROOT;                                  \
+    static constexpr int solve = SOLVE;                                \
+    static constexpr int update = UPDATE;                              \
+    static constexpr int minimum_blocks = MIN_BLOCKS;                  \
+    static constexpr int tmem_columns = TMEM;                          \
+    static constexpr int schedule = SCHEDULE;                          \
+    static constexpr int factor = FACTOR;                              \
   }
 
-SPEC(0, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 1, 0);
-SPEC(1, 64, 256, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0);
-SPEC(2, 64, 256, kPreciseRoot, kScalarSolve, kFp32Update, 1, 0);
-SPEC(3, 64, 256, kRawRoot, kSub4Solve, kFp32Update, 1, 0);
-SPEC(4, 32, 128, kRawRoot, kScalarSolve, kFp32Update, 1, 0);
-SPEC(5, 32, 128, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0);
-SPEC(6, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 5, 0);
-SPEC(7, 64, 128, kRawRoot, kScalarSolve, kTensorUpdate, 6, 64);
+SPEC(0, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(1, 64, 256, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(2, 64, 256, kPreciseRoot, kScalarSolve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(3, 64, 256, kRawRoot, kSub4Solve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(4, 32, 128, kRawRoot, kScalarSolve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(5, 32, 128, kNewtonRoot, kScalarSolve, kFp32Update, 1, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(6, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 5, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(7, 64, 128, kRawRoot, kScalarSolve, kTensorUpdate, 6, 64,
+     kRightSchedule, kRecursiveFactor);
+SPEC(8, 64, 256, kRawRoot, kScalarSolve, kFp32PreloadUpdate, 5, 0,
+     kRightSchedule, kRecursiveFactor);
+SPEC(9, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 5, 0,
+     kLeftSchedule, kRecursiveFactor);
+SPEC(10, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 5, 0,
+     kLeftSchedule, kWarp2Factor);
+SPEC(11, 64, 256, kRawRoot, kBlock16Solve, kFp32Update, 4, 0,
+     kLeftSchedule, kWarp2Factor);
+SPEC(12, 64, 256, kRawRoot, kBlock16Solve, kFp32Update, 5, 0,
+     kLeftSchedule, kWarp2Factor);
+SPEC(13, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 4, 0,
+     kProductLeftSchedule, kRecursiveFactor);
+SPEC(14, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 4, 0,
+     kProductLeftSchedule, kWarp2Factor);
+SPEC(15, 64, 256, kRawRoot, kBlock8Solve, kFp32Update, 4, 0,
+     kProductLeftSchedule, kWarp2Factor);
+SPEC(16, 64, 256, kPreciseRoot, kScalarSolve, kFp32Update, 4, 0,
+     kProductLeftSchedule, kWarp2Factor);
+SPEC(17, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 4, 0,
+     kSharedLeftSchedule, kWarp2Factor);
+SPEC(18, 64, 256, kRawRoot, kScalarSolve, kFp32PreloadUpdate, 5, 0,
+     kRightSchedule, kWarp2Factor);
 
 #undef SPEC
 
@@ -508,6 +564,62 @@ __device__ __forceinline__ void factor_tile(
   }
 }
 
+template <int RootMode>
+__device__ __forceinline__ void factor_tile_warp2(
+    float* tile, float* inverse_diagonal) {
+  constexpr int kTile = 64;
+  constexpr int kLd = kTile + 1;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  if (warp != 0) {
+    return;
+  }
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int row0 = lane * 2;
+  const int row1 = row0 + 1;
+
+#pragma unroll 1
+  for (int column = 0; column < kTile; ++column) {
+    const int owner = column >> 1;
+    float inverse = 0.0f;
+    if (lane == owner) {
+      float diagonal;
+      root_pair<RootMode>(
+          tile[column * kLd + column], diagonal, inverse);
+      tile[column * kLd + column] = diagonal;
+      inverse_diagonal[column] = inverse;
+    }
+    inverse = __shfl_sync(0xffffffffu, inverse, owner);
+
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    if (row0 > column) {
+      value0 = tile[row0 * kLd + column] * inverse;
+      tile[row0 * kLd + column] = value0;
+    }
+    if (row1 > column) {
+      value1 = tile[row1 * kLd + column] * inverse;
+      tile[row1 * kLd + column] = value1;
+    }
+
+#pragma unroll 4
+    for (int target = column + 1; target < kTile; ++target) {
+      const int source = target >> 1;
+      const float pivot = (target & 1)
+          ? __shfl_sync(0xffffffffu, value1, source)
+          : __shfl_sync(0xffffffffu, value0, source);
+      if (row0 >= target) {
+        tile[row0 * kLd + target] = fmaf(
+            -value0, pivot, tile[row0 * kLd + target]);
+      }
+      if (row1 >= target) {
+        tile[row1 * kLd + target] = fmaf(
+            -value1, pivot, tile[row1 * kLd + target]);
+      }
+    }
+    __syncwarp();
+  }
+}
+
 template <int Threads>
 __device__ __forceinline__ void copy_lower(
     const float* input, float* output) {
@@ -607,6 +719,45 @@ __device__ __forceinline__ void store_diagonal(
   }
 }
 
+template <int Tile, int Threads>
+__device__ __forceinline__ void store_factor_tile(
+    const float* tile, float* matrix, int begin) {
+  constexpr int kLd = Tile + 1;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Tile * Tile; linear += Threads) {
+    const int row = linear / Tile;
+    const int column = linear % Tile;
+    store_global(
+        matrix + (begin + row) * kN + begin + column,
+        column <= row ? tile[row * kLd + column] : 0.0f);
+  }
+}
+
+template <int Tile, int Threads>
+__device__ __forceinline__ void zero_outer_upper(
+    float* matrix) {
+  constexpr int kTileCount = kN / Tile;
+  constexpr int kVectorsPerTileRow = Tile / 4;
+  const float4 zeros =
+      make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  for (int row_tile = 0; row_tile < kTileCount; ++row_tile) {
+    for (int column_tile = row_tile + 1;
+         column_tile < kTileCount; ++column_tile) {
+      for (int vector = static_cast<int>(threadIdx.x);
+           vector < Tile * kVectorsPerTileRow;
+           vector += Threads) {
+        const int row = vector / kVectorsPerTileRow;
+        const int vector_column =
+            vector % kVectorsPerTileRow;
+        float* destination =
+            matrix + (row_tile * Tile + row) * kN +
+            column_tile * Tile + vector_column * 4;
+        *reinterpret_cast<float4*>(destination) = zeros;
+      }
+    }
+  }
+}
+
 template <int Tile, int SolveMode>
 __device__ __forceinline__ void solve_panel(
     float* rhs, const float* diagonal,
@@ -629,7 +780,7 @@ __device__ __forceinline__ void solve_panel(
             value * inverse_diagonal[column];
       }
     }
-  } else {
+  } else if constexpr (SolveMode == kSub4Solve) {
     const int lane = static_cast<int>(threadIdx.x) & 3;
     const int row = static_cast<int>(threadIdx.x) >> 2;
     if (row < Tile) {
@@ -655,10 +806,59 @@ __device__ __forceinline__ void solve_panel(
         __syncwarp();
       }
     }
+  } else {
+    static_assert(
+        SolveMode == kBlock16Solve ||
+        SolveMode == kBlock8Solve);
+    static_assert(Tile == 64);
+    constexpr int kSolveBlock =
+        SolveMode == kBlock16Solve ? 16 : 8;
+    const int row = static_cast<int>(threadIdx.x);
+    if (row < Tile) {
+#pragma unroll
+      for (int block = 0;
+           block < Tile; block += kSolveBlock) {
+        float values[kSolveBlock];
+#pragma unroll
+        for (int item = 0; item < kSolveBlock; ++item) {
+          values[item] =
+              rhs[row * kLd + block + item];
+        }
+
+#pragma unroll 4
+        for (int k = 0; k < block; ++k) {
+          const float solved = rhs[row * kLd + k];
+#pragma unroll
+          for (int item = 0; item < kSolveBlock; ++item) {
+            values[item] = fmaf(
+                -solved,
+                diagonal[(block + item) * kLd + k],
+                values[item]);
+          }
+        }
+
+#pragma unroll
+        for (int item = 0; item < kSolveBlock; ++item) {
+          const int column = block + item;
+          const float solved =
+              values[item] * inverse_diagonal[column];
+          values[item] = solved;
+          rhs[row * kLd + column] = solved;
+#pragma unroll
+          for (int target = item + 1;
+               target < kSolveBlock; ++target) {
+            values[target] = fmaf(
+                -solved,
+                diagonal[(block + target) * kLd + column],
+                values[target]);
+          }
+        }
+      }
+    }
   }
 }
 
-template <int Tile>
+template <int Tile, bool PreloadDestination>
 __device__ __forceinline__ void update_global(
     const float* left, const float* right,
     float* matrix, int row_begin, int column_begin,
@@ -671,7 +871,27 @@ __device__ __forceinline__ void update_global(
     const int column_base = (warp & 1) * 32;
     const int lane_row = lane >> 3;
     const int lane_column = lane & 7;
-    float product[4][4] = {};
+    float product[4][4];
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+      const int output_row =
+          row_base + lane_row + row * 4;
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        const int output_column =
+            column_base + lane_column + column * 8;
+        if constexpr (PreloadDestination) {
+          product[row][column] =
+              !diagonal || output_column <= output_row
+                  ? load_global(
+                        matrix + (row_begin + output_row) * kN +
+                        column_begin + output_column)
+                  : 0.0f;
+        } else {
+          product[row][column] = 0.0f;
+        }
+      }
+    }
 #pragma unroll 1
     for (int k = 0; k < Tile; ++k) {
       float left_values[4];
@@ -693,7 +913,8 @@ __device__ __forceinline__ void update_global(
 #pragma unroll
         for (int column = 0; column < 4; ++column) {
           product[row][column] = fmaf(
-              left_values[row],
+              PreloadDestination
+                  ? -left_values[row] : left_values[row],
               right_values[column],
               product[row][column]);
         }
@@ -713,8 +934,10 @@ __device__ __forceinline__ void update_global(
               column_begin + output_column;
           store_global(
               destination,
-              load_global(destination) -
-                  product[row][column]);
+              PreloadDestination
+                  ? product[row][column]
+                  : load_global(destination) -
+                        product[row][column]);
         }
       }
     }
@@ -723,7 +946,27 @@ __device__ __forceinline__ void update_global(
     const int column_base = (warp & 1) * 16;
     const int lane_row = lane >> 2;
     const int lane_column = lane & 3;
-    float product[2][4] = {};
+    float product[2][4];
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      const int output_row =
+          row_base + lane_row + row * 8;
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        const int output_column =
+            column_base + lane_column + column * 4;
+        if constexpr (PreloadDestination) {
+          product[row][column] =
+              !diagonal || output_column <= output_row
+                  ? load_global(
+                        matrix + (row_begin + output_row) * kN +
+                        column_begin + output_column)
+                  : 0.0f;
+        } else {
+          product[row][column] = 0.0f;
+        }
+      }
+    }
 #pragma unroll 1
     for (int k = 0; k < Tile; ++k) {
       const float left0 =
@@ -741,10 +984,12 @@ __device__ __forceinline__ void update_global(
 #pragma unroll
       for (int column = 0; column < 4; ++column) {
         product[0][column] = fmaf(
-            left0, right_values[column],
+            PreloadDestination ? -left0 : left0,
+            right_values[column],
             product[0][column]);
         product[1][column] = fmaf(
-            left1, right_values[column],
+            PreloadDestination ? -left1 : left1,
+            right_values[column],
             product[1][column]);
       }
     }
@@ -762,12 +1007,294 @@ __device__ __forceinline__ void update_global(
               column_begin + output_column;
           store_global(
               destination,
-              load_global(destination) -
-                  product[row][column]);
+              PreloadDestination
+                  ? product[row][column]
+                  : load_global(destination) -
+                        product[row][column]);
         }
       }
     }
   }
+}
+
+template <bool Diagonal, int Threads>
+__device__ __forceinline__ void left_current_tile(
+    const float* input, const float* matrix,
+    float* current, float* operand,
+    int row_begin, int column_begin, int column_tile) {
+  constexpr int kTile = 64;
+  constexpr int kLd = kTile + 1;
+  static_assert(Threads == 256);
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int row_base = (warp >> 1) * 16;
+  const int column_base = (warp & 1) * 32;
+  const int lane_row = lane >> 3;
+  const int lane_column = lane & 7;
+  float accumulator[4][4];
+
+#pragma unroll
+  for (int row = 0; row < 4; ++row) {
+    const int output_row =
+        row_base + lane_row + row * 4;
+#pragma unroll
+    for (int column = 0; column < 4; ++column) {
+      const int output_column =
+          column_base + lane_column + column * 8;
+      accumulator[row][column] = load_global(
+          input + (row_begin + output_row) * kN +
+          column_begin + output_column);
+    }
+  }
+
+#pragma unroll 1
+  for (int previous_tile = 0;
+       previous_tile < column_tile; ++previous_tile) {
+    const int previous_begin = previous_tile * kTile;
+    load_tile<kTile, Threads>(
+        matrix, current, row_begin, previous_begin);
+    if constexpr (!Diagonal) {
+      load_tile<kTile, Threads>(
+          matrix, operand, column_begin, previous_begin);
+    }
+    __syncthreads();
+    const float* right = Diagonal ? current : operand;
+
+#pragma unroll 1
+    for (int k = 0; k < kTile; ++k) {
+      float left_values[4];
+      float right_values[4];
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+        left_values[row] = current[
+            (row_base + lane_row + row * 4) * kLd + k];
+      }
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        right_values[column] = right[
+            (column_base + lane_column + column * 8) *
+                kLd +
+            k];
+      }
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+#pragma unroll
+        for (int column = 0; column < 4; ++column) {
+          accumulator[row][column] = fmaf(
+              -left_values[row], right_values[column],
+              accumulator[row][column]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int row = 0; row < 4; ++row) {
+    const int output_row =
+        row_base + lane_row + row * 4;
+#pragma unroll
+    for (int column = 0; column < 4; ++column) {
+      const int output_column =
+          column_base + lane_column + column * 8;
+      current[output_row * kLd + output_column] =
+          accumulator[row][column];
+    }
+  }
+  if constexpr (!Diagonal) {
+    load_tile<kTile, Threads>(
+        matrix, operand, column_begin, column_begin);
+  }
+  __syncthreads();
+}
+
+template <bool Diagonal, int Threads>
+__device__ __forceinline__ void left_product_current_tile(
+    const float* input, const float* matrix,
+    float* left, float* right, float* result,
+    int row_begin, int column_begin, int column_tile) {
+  constexpr int kTile = 64;
+  constexpr int kLd = kTile + 1;
+  static_assert(Threads == 256);
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int row_base = (warp >> 1) * 16;
+  const int column_base = (warp & 1) * 32;
+  const int lane_row = lane >> 3;
+  const int lane_column = lane & 7;
+
+#pragma unroll
+  for (int row_phase = 0; row_phase < 2; ++row_phase) {
+    float accumulator[2][4];
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      const int output_row =
+          row_base + lane_row + row_phase * 8 + row * 4;
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        const int output_column =
+            column_base + lane_column + column * 8;
+        accumulator[row][column] = load_global(
+            input + (row_begin + output_row) * kN +
+            column_begin + output_column);
+      }
+    }
+
+#pragma unroll 1
+    for (int previous_tile = 0;
+         previous_tile < column_tile; ++previous_tile) {
+      const int previous_begin = previous_tile * kTile;
+      load_tile<kTile, Threads>(
+          matrix, left, row_begin, previous_begin);
+      if constexpr (!Diagonal) {
+        load_tile<kTile, Threads>(
+            matrix, right, column_begin, previous_begin);
+      }
+      __syncthreads();
+      const float* right_values_tile =
+          Diagonal ? left : right;
+      float product[2][4] = {};
+
+#pragma unroll 1
+      for (int k = 0; k < kTile; ++k) {
+        float left_values[2];
+        float right_values[4];
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+          left_values[row] = left[
+              (row_base + lane_row +
+               row_phase * 8 + row * 4) *
+                  kLd +
+              k];
+        }
+#pragma unroll
+        for (int column = 0; column < 4; ++column) {
+          right_values[column] = right_values_tile[
+              (column_base + lane_column + column * 8) *
+                  kLd +
+              k];
+        }
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+#pragma unroll
+          for (int column = 0; column < 4; ++column) {
+            product[row][column] = fmaf(
+                left_values[row], right_values[column],
+                product[row][column]);
+          }
+        }
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int column = 0; column < 4; ++column) {
+          accumulator[row][column] -= product[row][column];
+        }
+      }
+    }
+
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      const int output_row =
+          row_base + lane_row + row_phase * 8 + row * 4;
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        const int output_column =
+            column_base + lane_column + column * 8;
+        result[output_row * kLd + output_column] =
+            accumulator[row][column];
+      }
+    }
+  }
+  if constexpr (!Diagonal) {
+    load_tile<kTile, Threads>(
+        matrix, right, column_begin, column_begin);
+  }
+  __syncthreads();
+}
+
+template <bool Diagonal, int Threads>
+__device__ __forceinline__ void left_shared_current_tile(
+    const float* input, const float* matrix,
+    float* left, float* right, float* result,
+    int row_begin, int column_begin, int column_tile) {
+  constexpr int kTile = 64;
+  constexpr int kLd = kTile + 1;
+  static_assert(Threads == 256);
+  load_tile<kTile, Threads>(
+      input, result, row_begin, column_begin);
+  __syncthreads();
+
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int row_base = (warp >> 1) * 16;
+  const int column_base = (warp & 1) * 32;
+  const int lane_row = lane >> 3;
+  const int lane_column = lane & 7;
+
+#pragma unroll 1
+  for (int previous_tile = 0;
+       previous_tile < column_tile; ++previous_tile) {
+    const int previous_begin = previous_tile * kTile;
+    load_tile<kTile, Threads>(
+        matrix, left, row_begin, previous_begin);
+    if constexpr (!Diagonal) {
+      load_tile<kTile, Threads>(
+          matrix, right, column_begin, previous_begin);
+    }
+    __syncthreads();
+    const float* right_values_tile =
+        Diagonal ? left : right;
+    float product[4][4] = {};
+
+#pragma unroll 1
+    for (int k = 0; k < kTile; ++k) {
+      float left_values[4];
+      float right_values[4];
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+        left_values[row] = left[
+            (row_base + lane_row + row * 4) * kLd + k];
+      }
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        right_values[column] = right_values_tile[
+            (column_base + lane_column + column * 8) *
+                kLd +
+            k];
+      }
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+#pragma unroll
+        for (int column = 0; column < 4; ++column) {
+          product[row][column] = fmaf(
+              left_values[row], right_values[column],
+              product[row][column]);
+        }
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+      const int output_row =
+          row_base + lane_row + row * 4;
+#pragma unroll
+      for (int column = 0; column < 4; ++column) {
+        const int output_column =
+            column_base + lane_column + column * 8;
+        result[output_row * kLd + output_column] -=
+            product[row][column];
+      }
+    }
+  }
+  if constexpr (!Diagonal) {
+    load_tile<kTile, Threads>(
+        matrix, right, column_begin, column_begin);
+  }
+  __syncthreads();
 }
 
 template <int Threads>
@@ -830,7 +1357,8 @@ __device__ __forceinline__ int tensor_update_global(
 
 template <
     int Tile, int Threads, int RootMode, int SolveMode,
-    int UpdateMode, int MinimumBlocks>
+    int UpdateMode, int MinimumBlocks, int ScheduleMode,
+    int FactorMode>
 __global__ __launch_bounds__(Threads, MinimumBlocks)
 void fused_potrf_kernel(
     const float* __restrict__ input,
@@ -839,6 +1367,10 @@ void fused_potrf_kernel(
   constexpr int kTileCount = kN / Tile;
   __shared__ __align__(128) float tile_a[Tile * kLd];
   __shared__ __align__(128) float tile_b[Tile * kLd];
+  extern __shared__ __align__(128)
+      unsigned char dynamic_shared[];
+  float* tile_c =
+      reinterpret_cast<float*>(dynamic_shared);
   __shared__ float inverse_diagonal[Tile];
   __shared__ __align__(8) uint64_t tensor_barrier;
   __shared__ uint32_t tmem_base_word;
@@ -860,89 +1392,196 @@ void fused_potrf_kernel(
     tensor_after_sync_fence();
   }
 
-  copy_lower<Threads>(input_matrix, matrix);
+  if constexpr (ScheduleMode == kRightSchedule) {
+    copy_lower<Threads>(input_matrix, matrix);
 
-  for (int panel = 0; panel < kTileCount; ++panel) {
-    const int panel_begin = panel * Tile;
-    load_diagonal<Tile, Threads>(
-        matrix, tile_a, panel_begin);
-    __syncthreads();
-
-    factor_tile<Tile, RootMode>(
-        tile_a, inverse_diagonal);
-    __syncthreads();
-    store_diagonal<Tile, Threads>(
-        tile_a, matrix, panel_begin);
-
-    for (int row_tile = panel + 1;
-         row_tile < kTileCount; ++row_tile) {
-      const int row_begin = row_tile * Tile;
-      load_tile<Tile, Threads>(
-          matrix, tile_b, row_begin, panel_begin);
+    for (int panel = 0; panel < kTileCount; ++panel) {
+      const int panel_begin = panel * Tile;
+      load_diagonal<Tile, Threads>(
+          matrix, tile_a, panel_begin);
       __syncthreads();
-      solve_panel<Tile, SolveMode>(
-          tile_b, tile_a, inverse_diagonal);
-      __syncthreads();
-      store_tile<Tile, Threads>(
-          tile_b, matrix, row_begin, panel_begin);
-    }
 
-    if constexpr (UpdateMode == kFp32Update) {
+      if constexpr (FactorMode == kWarp2Factor) {
+        static_assert(Tile == 64);
+        factor_tile_warp2<RootMode>(
+            tile_a, inverse_diagonal);
+      } else {
+        static_assert(FactorMode == kRecursiveFactor);
+        factor_tile<Tile, RootMode>(
+            tile_a, inverse_diagonal);
+      }
+      __syncthreads();
+      store_diagonal<Tile, Threads>(
+          tile_a, matrix, panel_begin);
+
       for (int row_tile = panel + 1;
            row_tile < kTileCount; ++row_tile) {
         const int row_begin = row_tile * Tile;
         load_tile<Tile, Threads>(
-            matrix, tile_a, row_begin, panel_begin);
+            matrix, tile_b, row_begin, panel_begin);
         __syncthreads();
-
-        for (int column_tile = panel + 1;
-             column_tile <= row_tile; ++column_tile) {
-          const int column_begin = column_tile * Tile;
-          const bool is_diagonal =
-              column_tile == row_tile;
-          const float* right = tile_a;
-          if (!is_diagonal) {
-            load_tile<Tile, Threads>(
-                matrix, tile_b, column_begin, panel_begin);
-            __syncthreads();
-            right = tile_b;
-          }
-          update_global<Tile>(
-              tile_a, right, matrix,
-              row_begin, column_begin, is_diagonal);
-          __syncthreads();
-        }
+        solve_panel<Tile, SolveMode>(
+            tile_b, tile_a, inverse_diagonal);
+        __syncthreads();
+        store_tile<Tile, Threads>(
+            tile_b, matrix, row_begin, panel_begin);
       }
-    } else {
-      uint32_t* left =
-          reinterpret_cast<uint32_t*>(tile_a);
-      uint32_t* right =
-          reinterpret_cast<uint32_t*>(tile_b);
-      for (int row_tile = panel + 1;
-           row_tile < kTileCount; ++row_tile) {
-        const int row_begin = row_tile * Tile;
-        pack_panel_tf32<Threads>(
-            left, matrix, row_begin, panel_begin);
 
-        for (int column_tile = panel + 1;
-             column_tile <= row_tile; ++column_tile) {
-          const int column_begin = column_tile * Tile;
-          const bool is_diagonal =
-              column_tile == row_tile;
-          const uint32_t* right_operand = left;
-          if (!is_diagonal) {
-            pack_panel_tf32<Threads>(
-                right, matrix, column_begin, panel_begin);
-            right_operand = right;
-          }
+      if constexpr (
+          UpdateMode == kFp32Update ||
+          UpdateMode == kFp32PreloadUpdate) {
+        constexpr bool kPreload =
+            UpdateMode == kFp32PreloadUpdate;
+        for (int row_tile = panel + 1;
+             row_tile < kTileCount; ++row_tile) {
+          const int row_begin = row_tile * Tile;
+          load_tile<Tile, Threads>(
+              matrix, tile_a, row_begin, panel_begin);
           __syncthreads();
-          tensor_phase = tensor_update_global(
-              left, right_operand, matrix,
-              row_begin, column_begin, is_diagonal,
-              tmem_base, &tensor_barrier, tensor_phase);
+
+          for (int column_tile = panel + 1;
+               column_tile <= row_tile; ++column_tile) {
+            const int column_begin = column_tile * Tile;
+            const bool is_diagonal =
+                column_tile == row_tile;
+            const float* right = tile_a;
+            if (!is_diagonal) {
+              load_tile<Tile, Threads>(
+                  matrix, tile_b, column_begin, panel_begin);
+              __syncthreads();
+              right = tile_b;
+            }
+            update_global<Tile, kPreload>(
+                tile_a, right, matrix,
+                row_begin, column_begin, is_diagonal);
+            __syncthreads();
+          }
+        }
+      } else {
+        static_assert(UpdateMode == kTensorUpdate);
+        uint32_t* left =
+            reinterpret_cast<uint32_t*>(tile_a);
+        uint32_t* right =
+            reinterpret_cast<uint32_t*>(tile_b);
+        for (int row_tile = panel + 1;
+             row_tile < kTileCount; ++row_tile) {
+          const int row_begin = row_tile * Tile;
+          pack_panel_tf32<Threads>(
+              left, matrix, row_begin, panel_begin);
+
+          for (int column_tile = panel + 1;
+               column_tile <= row_tile; ++column_tile) {
+            const int column_begin = column_tile * Tile;
+            const bool is_diagonal =
+                column_tile == row_tile;
+            const uint32_t* right_operand = left;
+            if (!is_diagonal) {
+              pack_panel_tf32<Threads>(
+                  right, matrix, column_begin, panel_begin);
+              right_operand = right;
+            }
+            __syncthreads();
+            tensor_phase = tensor_update_global(
+                left, right_operand, matrix,
+                row_begin, column_begin, is_diagonal,
+                tmem_base, &tensor_barrier, tensor_phase);
+          }
         }
       }
     }
+  } else if constexpr (
+      ScheduleMode == kProductLeftSchedule ||
+      ScheduleMode == kSharedLeftSchedule) {
+    static_assert(Tile == 64);
+    static_assert(Threads == 256);
+    static_assert(UpdateMode == kFp32Update);
+
+    for (int panel = 0; panel < kTileCount; ++panel) {
+      const int panel_begin = panel * Tile;
+      if constexpr (
+          ScheduleMode == kSharedLeftSchedule) {
+        left_shared_current_tile<true, Threads>(
+            input_matrix, matrix, tile_a, tile_b, tile_c,
+            panel_begin, panel_begin, panel);
+      } else {
+        left_product_current_tile<true, Threads>(
+            input_matrix, matrix, tile_a, tile_b, tile_c,
+            panel_begin, panel_begin, panel);
+      }
+
+      if constexpr (FactorMode == kWarp2Factor) {
+        factor_tile_warp2<RootMode>(
+            tile_c, inverse_diagonal);
+      } else {
+        static_assert(FactorMode == kRecursiveFactor);
+        factor_tile<Tile, RootMode>(
+            tile_c, inverse_diagonal);
+      }
+      __syncthreads();
+      store_factor_tile<Tile, Threads>(
+          tile_c, matrix, panel_begin);
+      __syncthreads();
+
+      for (int row_tile = panel + 1;
+           row_tile < kTileCount; ++row_tile) {
+        const int row_begin = row_tile * Tile;
+        if constexpr (
+            ScheduleMode == kSharedLeftSchedule) {
+          left_shared_current_tile<false, Threads>(
+              input_matrix, matrix, tile_a, tile_b, tile_c,
+              row_begin, panel_begin, panel);
+        } else {
+          left_product_current_tile<false, Threads>(
+              input_matrix, matrix, tile_a, tile_b, tile_c,
+              row_begin, panel_begin, panel);
+        }
+        solve_panel<Tile, SolveMode>(
+            tile_c, tile_b, inverse_diagonal);
+        __syncthreads();
+        store_tile<Tile, Threads>(
+            tile_c, matrix, row_begin, panel_begin);
+      }
+      __syncthreads();
+    }
+    zero_outer_upper<Tile, Threads>(matrix);
+  } else {
+    static_assert(ScheduleMode == kLeftSchedule);
+    static_assert(Tile == 64);
+    static_assert(Threads == 256);
+    static_assert(UpdateMode == kFp32Update);
+
+    for (int panel = 0; panel < kTileCount; ++panel) {
+      const int panel_begin = panel * Tile;
+      left_current_tile<true, Threads>(
+          input_matrix, matrix, tile_a, tile_b,
+          panel_begin, panel_begin, panel);
+
+      if constexpr (FactorMode == kWarp2Factor) {
+        factor_tile_warp2<RootMode>(
+            tile_a, inverse_diagonal);
+      } else {
+        static_assert(FactorMode == kRecursiveFactor);
+        factor_tile<Tile, RootMode>(
+            tile_a, inverse_diagonal);
+      }
+      __syncthreads();
+      store_factor_tile<Tile, Threads>(
+          tile_a, matrix, panel_begin);
+
+      for (int row_tile = panel + 1;
+           row_tile < kTileCount; ++row_tile) {
+        const int row_begin = row_tile * Tile;
+        left_current_tile<false, Threads>(
+            input_matrix, matrix, tile_a, tile_b,
+            row_begin, panel_begin, panel);
+        solve_panel<Tile, SolveMode>(
+            tile_a, tile_b, inverse_diagonal);
+        __syncthreads();
+        store_tile<Tile, Threads>(
+            tile_a, matrix, row_begin, panel_begin);
+      }
+    }
+    zero_outer_upper<Tile, Threads>(matrix);
   }
 
   if constexpr (UpdateMode == kTensorUpdate) {
@@ -991,6 +1630,18 @@ void prefer_shared(Kernel kernel) {
       cudaGetErrorString(status));
 }
 
+template <int Id>
+constexpr int dynamic_shared_bytes() {
+  using V = Variant<Id>;
+  if constexpr (
+      V::schedule == kProductLeftSchedule ||
+      V::schedule == kSharedLeftSchedule) {
+    return V::tile * (V::tile + 1) *
+        static_cast<int>(sizeof(float));
+  }
+  return 0;
+}
+
 template <typename Kernel>
 cudaFuncAttributes attributes_for(Kernel kernel) {
   cudaFuncAttributes attributes{};
@@ -1008,8 +1659,20 @@ void configure_one() {
   using V = Variant<Id>;
   auto kernel = fused_potrf_kernel<
       V::tile, V::threads, V::root, V::solve,
-      V::update, V::minimum_blocks>;
+      V::update, V::minimum_blocks, V::schedule, V::factor>;
   prefer_shared(kernel);
+  constexpr int kDynamicSharedBytes =
+      dynamic_shared_bytes<Id>();
+  if constexpr (kDynamicSharedBytes != 0) {
+    const cudaError_t status = cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kDynamicSharedBytes);
+    TORCH_CHECK(
+        status == cudaSuccess,
+        "dynamic shared-memory opt-in failed for variant ",
+        Id, ": ", cudaGetErrorString(status));
+  }
   const cudaFuncAttributes attributes =
       attributes_for(kernel);
   TORCH_CHECK(
@@ -1025,11 +1688,12 @@ void launch_one(const float* input, float* output) {
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(kBatch, 1, 1);
   config.blockDim = dim3(V::threads, 1, 1);
+  config.dynamicSmemBytes = dynamic_shared_bytes<Id>();
   cudaLaunchKernelEx(
       &config,
       fused_potrf_kernel<
           V::tile, V::threads, V::root, V::solve,
-          V::update, V::minimum_blocks>,
+          V::update, V::minimum_blocks, V::schedule, V::factor>,
       input, output);
 }
 
@@ -1043,8 +1707,19 @@ void configure_variant(int variant) {
     case 5: configure_one<5>(); break;
     case 6: configure_one<6>(); break;
     case 7: configure_one<7>(); break;
+    case 8: configure_one<8>(); break;
+    case 9: configure_one<9>(); break;
+    case 10: configure_one<10>(); break;
+    case 11: configure_one<11>(); break;
+    case 12: configure_one<12>(); break;
+    case 13: configure_one<13>(); break;
+    case 14: configure_one<14>(); break;
+    case 15: configure_one<15>(); break;
+    case 16: configure_one<16>(); break;
+    case 17: configure_one<17>(); break;
+    case 18: configure_one<18>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 7]");
+      TORCH_CHECK(false, "native variant must be in [0, 18]");
   }
 }
 
@@ -1059,8 +1734,19 @@ void launch_variant(
     case 5: launch_one<5>(input, output); break;
     case 6: launch_one<6>(input, output); break;
     case 7: launch_one<7>(input, output); break;
+    case 8: launch_one<8>(input, output); break;
+    case 9: launch_one<9>(input, output); break;
+    case 10: launch_one<10>(input, output); break;
+    case 11: launch_one<11>(input, output); break;
+    case 12: launch_one<12>(input, output); break;
+    case 13: launch_one<13>(input, output); break;
+    case 14: launch_one<14>(input, output); break;
+    case 15: launch_one<15>(input, output); break;
+    case 16: launch_one<16>(input, output); break;
+    case 17: launch_one<17>(input, output); break;
+    case 18: launch_one<18>(input, output); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 7]");
+      TORCH_CHECK(false, "native variant must be in [0, 18]");
   }
 }
 
@@ -1070,7 +1756,7 @@ void write_metadata(int64_t* rows) {
   const cudaFuncAttributes attributes = attributes_for(
       fused_potrf_kernel<
           V::tile, V::threads, V::root, V::solve,
-          V::update, V::minimum_blocks>);
+          V::update, V::minimum_blocks, V::schedule, V::factor>);
   int64_t* row =
       rows + static_cast<int64_t>(Id) * kMetadataColumns;
   row[0] = Id;
@@ -1079,13 +1765,16 @@ void write_metadata(int64_t* rows) {
   row[3] = V::root;
   row[4] = V::solve;
   row[5] = attributes.numRegs;
-  row[6] = attributes.sharedSizeBytes;
+  row[6] = attributes.sharedSizeBytes +
+      dynamic_shared_bytes<Id>();
   row[7] = attributes.localSizeBytes;
   row[8] = kBatch;
   row[9] = 1;
   row[10] = V::update;
   row[11] = V::minimum_blocks;
   row[12] = V::tmem_columns;
+  row[13] = V::schedule;
+  row[14] = V::factor;
 }
 
 }  // namespace
@@ -1093,7 +1782,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b640n512_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 7]");
+      "native variant must be in [0, 18]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -1105,7 +1794,7 @@ void cholesky_b640n512_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 7]");
+      "native variant must be in [0, 18]");
   c10::cuda::CUDAGuard device_guard(data.device());
   launch_variant(
       data.data_ptr<float>(),
@@ -1140,6 +1829,17 @@ at::Tensor cholesky_b640n512_metadata() {
   write_metadata<5>(rows);
   write_metadata<6>(rows);
   write_metadata<7>(rows);
+  write_metadata<8>(rows);
+  write_metadata<9>(rows);
+  write_metadata<10>(rows);
+  write_metadata<11>(rows);
+  write_metadata<12>(rows);
+  write_metadata<13>(rows);
+  write_metadata<14>(rows);
+  write_metadata<15>(rows);
+  write_metadata<16>(rows);
+  write_metadata<17>(rows);
+  write_metadata<18>(rows);
   return result;
 }
 """

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Popcorn/Brev driver for the B200 (640, 512, 512) specialization."""
+"""Popcorn/Brev driver for the B200 (60, 1024, 1024) specialization."""
 
 from __future__ import annotations
 
@@ -24,46 +24,31 @@ import urllib.request
 
 LEADERBOARD = "cholesky"
 GPU = "B200"
-TARGET_BENCHMARK_INDEX = 5
+TARGET_BENCHMARK_INDEX = 7
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
-VARIANT_COUNT = 19
 VARIANT_NAMES = (
-    "p64_raw_scalar_m4x4_t256",
-    "p64_nr_scalar_m4x4_t256",
-    "p64_precise_scalar_m4x4_t256",
-    "p64_raw_sub4_m4x4_t256",
-    "p32_raw_scalar_m2x4_t128",
-    "p32_nr_scalar_m2x4_t128",
-    "p64_raw_scalar_m4x4_t256_occ5",
-    "p64_raw_tcgen05_tf32_t128_occ6",
-    "p64_raw_scalar_preload_m4x4_t256_occ5",
-    "p64_raw_scalar_left_m4x4_t256_occ5",
-    "p64_raw_scalar_left_warp2_m4x4_t256_occ5",
-    "p64_raw_block16_left_warp2_m4x4_t256_occ4",
-    "p64_raw_block16_left_warp2_m4x4_t256_occ5",
-    "p64_raw_scalar_left_product_m2x4_t256_occ4",
-    "p64_raw_scalar_left_product_warp2_m2x4_t256_occ4",
-    "p64_raw_block8_left_product_warp2_m2x4_t256_occ4",
-    "p64_precise_scalar_left_product_warp2_m2x4_t256_occ4",
-    "p64_raw_scalar_left_shared_warp2_m4x4_t256_occ4",
-    "p64_raw_scalar_preload_warp2_m4x4_t256_occ5",
+    "staged_precise_sub4_fp32_t256",
+    "staged_refined_sub8_fp32_t512",
+    "staged_precise_sub4_tc_outer_t256",
+    "staged_precise_sub4_tc_all_t256",
+    "staged_refined_sub8_tc_all_t512",
+    "staged_precise_sub4_cublas_fp32_t256",
+    "staged_precise_sub4_cublas_tf32_t256",
+    "cluster_dag_refined_sub8_tc_all_t512",
 )
+VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
-    r"^_DEFAULT_VARIANT = \d+  # POPCORN_VARIANT$", re.MULTILINE
+    r"^_DEFAULT_VARIANT = (\d+)  # POPCORN_VARIANT$", re.MULTILINE
 )
 RAW_NUMBER = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"
 )
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def _source_path() -> Path:
-    return Path(__file__).with_name("cholesky_b640n512.py").resolve()
+    return Path(__file__).with_name("cholesky_b60n1024.py").resolve()
 
 
 def _default_artifact_root() -> Path:
@@ -84,6 +69,17 @@ def _write_json(path: Path, payload: Any) -> None:
     )
 
 
+def _tracked_default() -> int:
+    source = _source_path().read_text()
+    match = DEFAULT_MARKER.search(source)
+    if match is None:
+        raise RuntimeError("tracked source has no unique default marker")
+    variant = int(match.group(1))
+    if not 0 <= variant < VARIANT_COUNT:
+        raise RuntimeError(f"tracked default {variant} is out of range")
+    return variant
+
+
 def _parse_variants(text: str) -> list[int]:
     if text.strip().lower() == "all":
         return list(range(VARIANT_COUNT))
@@ -92,12 +88,13 @@ def _parse_variants(text: str) -> list[int]:
         item = item.strip()
         if not item:
             continue
-        try:
-            variant = int(item)
-        except ValueError as error:
-            raise ValueError(
-                f"invalid variant {item!r}"
-            ) from error
+        if item.upper() == "WINNER":
+            variant = _tracked_default()
+        else:
+            try:
+                variant = int(item)
+            except ValueError as error:
+                raise ValueError(f"invalid variant {item!r}") from error
         if not 0 <= variant < VARIANT_COUNT:
             raise ValueError(
                 f"variant must be in [0, {VARIANT_COUNT - 1}]"
@@ -142,19 +139,25 @@ def _preflight_output(popcorn: str) -> str:
 
 
 def _summary_json(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    try:
+        direct = json.loads(stripped)
+    except json.JSONDecodeError:
+        direct = None
+    if isinstance(direct, dict):
+        return direct
     lines = text.splitlines()
     for index in range(len(lines) - 1, -1, -1):
         if lines[index].rstrip() != "{":
             continue
-        candidate = "\n".join(lines[index:])
         try:
-            payload = json.loads(candidate)
+            payload = json.loads("\n".join(lines[index:]))
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
             return payload
     raise ValueError(
-        "Popcorn output did not contain a trailing submission summary"
+        "Popcorn output did not contain a submission summary object"
     )
 
 
@@ -218,7 +221,6 @@ def _fetch_submission(submission_id: int) -> dict[str, Any]:
 def _result_maps(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict) and "benchmark-count" in payload:
         return [payload]
-
     results: list[dict[str, Any]] = []
     if isinstance(payload, dict):
         runs = payload.get("runs")
@@ -238,18 +240,11 @@ def _result_maps(payload: Any) -> list[dict[str, Any]]:
                     results.append(result)
             if results:
                 return results
-
         direct = payload.get("result")
-        if (
-            isinstance(direct, dict)
-            and "benchmark-count" in direct
-        ):
+        if isinstance(direct, dict) and "benchmark-count" in direct:
             return [direct]
-
         for value in payload.values():
-            nested = _result_maps(value)
-            if nested:
-                results.extend(nested)
+            results.extend(_result_maps(value))
     elif isinstance(payload, list):
         for value in payload:
             results.extend(_result_maps(value))
@@ -275,8 +270,8 @@ def _nanoseconds(value: Any, label: str) -> decimal.Decimal:
         text = value.strip()
     else:
         raise ValueError(
-            f"{label} must be a raw numeric nanosecond value without units; "
-            f"got {value!r}"
+            f"{label} must be a raw numeric nanosecond value without "
+            f"units; got {value!r}"
         )
     result = decimal.Decimal(text)
     if not result.is_finite() or result < 0:
@@ -293,7 +288,6 @@ def _extract_timings(payload: Any) -> dict[str, decimal.Decimal]:
             "JSON contains neither a raw benchmark result nor a public "
             "benchmark run containing result"
         )
-
     target_rows: list[dict[str, decimal.Decimal]] = []
     for result_index, result in enumerate(results):
         count = _integer(
@@ -310,14 +304,12 @@ def _extract_timings(payload: Any) -> dict[str, decimal.Decimal]:
             status = result.get(f"{base}.status")
             mean = result.get(f"{base}.mean")
             if status == "fail" or mean is None:
-                spec = result.get(f"benchmark.{row_index}.spec", "")
-                error = result.get(f"benchmark.{row_index}.error", "")
+                spec = result.get(f"{base}.spec", "")
+                error = result.get(f"{base}.error", "")
                 if status is None and mean is None and not spec and not error:
                     raise ValueError(
                         f"public benchmark stopped before row {row_index}; "
-                        "the evaluator emitted no status, spec, or error. "
-                        "This normally means the target path raised an "
-                        "exception or its worker terminated."
+                        "no status, spec, or error was emitted"
                     )
                 raise ValueError(
                     f"public row {row_index} did not pass: "
@@ -325,15 +317,13 @@ def _extract_timings(payload: Any) -> dict[str, decimal.Decimal]:
                     f"overall_check={result.get('check')!r}"
                 )
             _nanoseconds(
-                mean,
-                f"result[{result_index}].{base}.mean",
+                mean, f"result[{result_index}].{base}.mean"
             )
         if result.get("check") != "pass":
             raise ValueError(
-                f"public benchmark check did not pass: "
+                "public benchmark check did not pass: "
                 f"{result.get('check')!r}"
             )
-
         base = f"benchmark.{TARGET_BENCHMARK_INDEX}"
         target_rows.append(
             {
@@ -344,17 +334,12 @@ def _extract_timings(payload: Any) -> dict[str, decimal.Decimal]:
                 for name in ("mean", "err", "best", "worst")
             }
         )
-
     if len(target_rows) != 1:
         raise ValueError(
-            "expected exactly one public benchmark result containing the "
-            f"target row, found {len(target_rows)}"
+            "expected exactly one public benchmark result containing "
+            f"target row {TARGET_BENCHMARK_INDEX}, found {len(target_rows)}"
         )
     return target_rows[0]
-
-
-def _decimal_text(value: decimal.Decimal) -> str:
-    return str(value)
 
 
 def _median(values: list[decimal.Decimal]) -> decimal.Decimal:
@@ -374,7 +359,7 @@ def _submit_benchmark(
     variant: int,
 ) -> dict[str, Any]:
     prefix = run_dir / f"round_{round_index:02d}_variant_{variant:02d}"
-    output_path = prefix.with_suffix(".result.txt")
+    output_path = prefix.with_suffix(".result.json")
     command = [
         popcorn,
         "submit",
@@ -393,7 +378,6 @@ def _submit_benchmark(
     completed = subprocess.run(command, capture_output=True, text=True)
     prefix.with_suffix(".stdout.txt").write_text(completed.stdout)
     prefix.with_suffix(".stderr.txt").write_text(completed.stderr)
-
     row: dict[str, Any] = {
         "round": round_index,
         "variant": variant,
@@ -418,7 +402,6 @@ def _submit_benchmark(
         row["submission_id"] = submission_id
         payload = _fetch_submission(submission_id)
         _write_json(prefix.with_suffix(".api.json"), payload)
-        row["result_source"] = "authenticated-api"
         timings = _extract_timings(payload)
     except (
         RuntimeError,
@@ -427,9 +410,9 @@ def _submit_benchmark(
     ) as error:
         row["error"] = str(error)
         return row
-
+    row["result_source"] = "authenticated-api"
     row["timings_ns"] = {
-        name: _decimal_text(value) for name, value in timings.items()
+        name: str(value) for name, value in timings.items()
     }
     row["passed"] = True
     return row
@@ -468,7 +451,6 @@ def _autotune(args: argparse.Namespace) -> Path:
         raise ValueError("--rounds must be positive")
     if args.max_workers <= 0:
         raise ValueError("--max-workers must be positive")
-
     help_text = _preflight_output(args.popcorn)
     _cli_id()
     source_path = _source_path()
@@ -476,27 +458,28 @@ def _autotune(args: argparse.Namespace) -> Path:
     source_hash = _sha256(source)
     run_dir = (
         args.artifact_root / "autotune" /
-        f"b640n512_{_timestamp()}"
+        f"b60n1024_{_timestamp()}"
     ).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "popcorn-submit-help.txt").write_text(help_text)
     submission_dir = run_dir / "submissions"
     submission_dir.mkdir()
-
     submissions: dict[int, Path] = {}
     for variant in variants:
         path = submission_dir / (
-            f"cholesky_b640n512_v{variant:02d}.py"
+            f"cholesky_b60n1024_v{variant:02d}.py"
         )
         path.write_text(_variant_source(source, variant))
         submissions[variant] = path.resolve()
 
     rows: list[dict[str, Any]] = []
     for round_index in range(args.rounds):
-        order = variants if round_index % 2 == 0 else list(reversed(variants))
-        worker_count = min(args.max_workers, len(order))
+        order = (
+            variants if round_index % 2 == 0
+            else list(reversed(variants))
+        )
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count
+            max_workers=min(args.max_workers, len(order))
         ) as executor:
             futures = {
                 executor.submit(
@@ -544,10 +527,7 @@ def _autotune(args: argparse.Namespace) -> Path:
                     flush=True,
                 )
                 if not row["passed"] and row.get("error"):
-                    print(
-                        f"  {row['error']}",
-                        flush=True,
-                    )
+                    print(f"  {row['error']}", flush=True)
 
     ranking: list[dict[str, Any]] = []
     for variant in variants:
@@ -571,8 +551,8 @@ def _autotune(args: argparse.Namespace) -> Path:
             {
                 "variant": variant,
                 "name": VARIANT_NAMES[variant],
-                "median_mean_ns": _decimal_text(_median(means)),
-                "median_best_ns": _decimal_text(_median(bests)),
+                "median_mean_ns": str(_median(means)),
+                "median_best_ns": str(_median(bests)),
             }
         )
     ranking.sort(
@@ -582,8 +562,8 @@ def _autotune(args: argparse.Namespace) -> Path:
             item["variant"],
         )
     )
+    summary_path = run_dir / "summary.json"
     if not ranking:
-        summary_path = run_dir / "summary.json"
         _write_json(
             summary_path,
             {
@@ -599,7 +579,6 @@ def _autotune(args: argparse.Namespace) -> Path:
             "no variant passed every public benchmark row in every round; "
             f"inspect {summary_path}"
         )
-
     winner = ranking[0]["variant"]
     winner_source = run_dir / (
         f"winner_v{winner:02d}_{VARIANT_NAMES[winner]}.py"
@@ -608,7 +587,6 @@ def _autotune(args: argparse.Namespace) -> Path:
     promotion = _atomic_promote(
         source_path, source, source_hash, winner
     )
-    summary_path = run_dir / "summary.json"
     _write_json(
         summary_path,
         {
@@ -620,7 +598,7 @@ def _autotune(args: argparse.Namespace) -> Path:
             "target_benchmark_index": TARGET_BENCHMARK_INDEX,
             "variants": variants,
             "rounds": args.rounds,
-            "order_policy": "forward then reverse on alternating rounds",
+            "order_policy": "forward/reverse alternating rounds",
             "max_workers": args.max_workers,
             "results": sorted(
                 rows,
@@ -651,8 +629,7 @@ def _profiler_url() -> str:
             ):
                 raise RuntimeError(
                     f"{name} must be an absolute HTTP(S) URL, not "
-                    f"{value!r}; replace the URL placeholder with the "
-                    "approved Brev profiler endpoint"
+                    f"{value!r}"
                 )
             return value
     raise RuntimeError(
@@ -669,6 +646,9 @@ def _collect_ncu_artifacts(
         "details": [],
         "archives": [],
         "raw": [],
+        "sources": [],
+        "logs": [],
+        "commands": [],
     }
     for path in variant_dir.rglob("*"):
         if not path.is_file():
@@ -677,12 +657,18 @@ def _collect_ncu_artifacts(
         lower = path.name.lower()
         if path.suffix == ".ncu-rep":
             categories["reports"].append(resolved)
-        elif path.suffix.lower() == ".zip":
+        elif path.suffix.lower() in {".zip", ".tar", ".gz"}:
             categories["archives"].append(resolved)
         elif path.suffix.lower() in {".txt", ".csv"} and (
             "ncu" in lower or "detail" in lower
         ):
             categories["details"].append(resolved)
+        elif path.suffix == ".py":
+            categories["sources"].append(resolved)
+        elif "command" in lower:
+            categories["commands"].append(resolved)
+        elif path.suffix == ".txt":
+            categories["logs"].append(resolved)
     if result_path.is_file():
         categories["raw"].append(str(result_path.resolve()))
         try:
@@ -711,12 +697,11 @@ def _ncu(args: argparse.Namespace) -> Path:
     source = _source_path().read_text()
     run_dir = (
         args.artifact_root / "ncu" /
-        f"b640n512_{_timestamp()}"
+        f"b60n1024_{_timestamp()}"
     ).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     environment = os.environ.copy()
     environment["POPCORN_BREV_PROFILER_URL"] = profiler_url
-
     rows: list[dict[str, Any]] = []
     for variant in variants:
         variant_dir = run_dir / (
@@ -724,7 +709,7 @@ def _ncu(args: argparse.Namespace) -> Path:
         )
         variant_dir.mkdir()
         submission = (
-            variant_dir / f"cholesky_b640n512_v{variant:02d}.py"
+            variant_dir / f"cholesky_b60n1024_v{variant:02d}.py"
         ).resolve()
         submission.write_text(_variant_source(source, variant))
         result_path = (variant_dir / "brev-result.json").resolve()
@@ -754,7 +739,9 @@ def _ncu(args: argparse.Namespace) -> Path:
         artifacts = _collect_ncu_artifacts(variant_dir, result_path)
         diagnostic_lines = [
             line.strip()
-            for line in (completed.stderr + "\n" + completed.stdout).splitlines()
+            for line in (
+                completed.stderr + "\n" + completed.stdout
+            ).splitlines()
             if line.strip()
         ]
         diagnostic = diagnostic_lines[-1] if diagnostic_lines else ""
@@ -781,7 +768,6 @@ def _ncu(args: argparse.Namespace) -> Path:
             + (f" diagnostic={diagnostic}" if diagnostic else ""),
             flush=True,
         )
-
     summary_path = run_dir / "summary.json"
     _write_json(
         summary_path,
@@ -795,10 +781,9 @@ def _ncu(args: argparse.Namespace) -> Path:
             "variants": variants,
             "results": rows,
             "metric_policy": (
-                "Do not substitute missing or renamed B200 metrics during "
-                "analysis without recording expected and actual names, "
-                "units, normalization, and whether the conclusion is an "
-                "inference."
+                "Never silently substitute missing or renamed B200 "
+                "metrics. Record expected and actual names, units, "
+                "normalization, and whether a conclusion is inferred."
             ),
         },
     )
@@ -832,8 +817,8 @@ def _submit(args: argparse.Namespace) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Autotune, profile, or submit the B200 (640,512,512) "
-            "Cholesky specialization"
+            "Autotune, profile, or submit the B200 "
+            "(60,1024,1024) Cholesky specialization"
         )
     )
     parser.add_argument(
@@ -848,21 +833,18 @@ def _parser() -> argparse.ArgumentParser:
         help="root directory for retained run artifacts",
     )
     actions = parser.add_subparsers(dest="action", required=True)
-
     autotune = actions.add_parser(
         "autotune",
-        help="benchmark every selected variant and promote the winner",
+        help="benchmark selected variants and promote the winner",
     )
     autotune.add_argument("--variants", default="all")
     autotune.add_argument("--rounds", type=int, default=3)
     autotune.add_argument("--max-workers", type=int, default=4)
-
     ncu = actions.add_parser(
         "ncu",
-        help="capture Brev B200 Nsight Compute reports",
+        help="capture hosted Brev B200 Nsight Compute reports",
     )
     ncu.add_argument("--variants", required=True)
-
     submit = actions.add_parser(
         "submit",
         help="submit the tracked production source",
@@ -880,11 +862,9 @@ def main() -> None:
     args = parser.parse_args()
     args.artifact_root = args.artifact_root.resolve()
     if args.action == "autotune":
-        summary = _autotune(args)
-        print(summary)
+        print(_autotune(args))
     elif args.action == "ncu":
-        summary = _ncu(args)
-        print(summary)
+        print(_ncu(args))
     else:
         _submit(args)
 

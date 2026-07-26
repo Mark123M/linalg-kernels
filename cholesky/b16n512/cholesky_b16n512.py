@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The tuner replaces this exact line only in retained candidate copies.
-_DEFAULT_VARIANT = 6  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 2  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "r16_micro4x4_precise_scalar_u256",
     "r16_micro4x4_nr_scalar_u256",
