@@ -164,6 +164,8 @@ IDs are stable and append-only.
 | 10 | `ll_nb1024_rank8f_tf32` | left | 1024 | inverse apply | TF32 | TF32 | rank-8 register-blocked factor |
 | 11 | `ll_nb2048_rank8f_tf32` | left | 2048 | inverse apply | TF32 | TF32 | v10 x NB axis |
 | 12 | `ll_nb1024_rank8w_tf32` | left | 1024 | inverse apply | TF32 | TF32 | wide 512-thread redundant-corner factor |
+| 13 | `ll_nb1024_microfused_tf32` | left | 1024 | fused micro | TF32 | TF32 | one launch per micro: CTA 0 factors while consumer CTAs prefetch X tiles, release-flag handoff |
+| 14 | `ll_nb1024_invgemm_tf32` | left | 1024 | inverse GEMM | TF32 | TF32 | apply as cuBLAS TF32 GEMM (dense T, exact upper zeros) into scratch + float4 copy-back |
 
 ## Native API and resource policy
 
@@ -385,6 +387,131 @@ Actions:
   count for every inverse variant (v2/v10/v11 improve too; noted for
   cross-round comparability).
 
+### 2026-07-26 - phase 2f: wide factor round (direct measurements)
+
+`autotune --variants 10,12 --rounds 3`
+(`artifacts/autotune/b1n32768_20260726T104145Z/`), all passing:
+
+| variant | median benchmark.14 mean | vs baseline |
+|---:|---:|---:|
+| 12 `ll_nb1024_rank8w_tf32` | **48.32 ms** | **4.57x** (promoted) |
+| 10 `ll_nb1024_rank8f_tf32` | 61.33 ms | 3.60x |
+
+- The 512-thread redundant-corner factor bought 13.0 ms - the
+  occupancy/latency diagnosis held. Inferred factor kernel now
+  ~144 us NCU / ~85 us boost, chain ~21.5 ms.
+- v10 re-measured 61.33 vs 60.89 previous round (+0.7%, noise edge):
+  the shared triangular-combine bounds did not help at 8 warps
+  (variable-trip loops unroll worse); v12's 16 warps absorb them.
+- Budget model at 48.3 ms (inference, capture pending): factor chain
+  ~21.5 ms, applies ~14 ms, inner GEMMs ~4 ms, history GEMMs + launch
+  gaps ~8 ms, copy ~1 ms. Factor chain and row work are now comparable
+  sizes - the regime where fused-panel overlap (factor k+1 concurrent
+  with apply k) converts their sum into their max. Next lever: fused
+  per-micro factor+apply kernel (single launch, GMEM flag, apply CTAs
+  prefetch X tiles while the factor CTA works), then full panel fusion.
+
+### 2026-07-26 - phase 2g: v12 NCU capture and the fused per-micro kernel
+
+Leaderboard locked in first: submission 913708, public geomean
+**1.8695 ms**, secret 1.8921 ms, all runs passing (v12 tracked).
+
+`ncu --variants 12` (`artifacts/ncu/b1n32768_20260726T105623Z/`),
+direct measurements via veloq, first-panel launches:
+
+| kernel | NCU duration | boost est. (/1.7) | x count | total |
+|---|---:|---:|---:|---:|
+| `factor128_kernel<true, kFactorWide>` | 147.6 us | ~86.8 us | 256 | ~22.2 ms |
+| `trsm_apply_kernel` (255 tiles, largest) | 91.8 us | ~54 us | 255 (shrinking) | ~8 ms |
+| inner GEMM (cutlass TF32) | 31.3 us | ~18 us | 224 | ~4 ms |
+| `copy_lower_kernel` | 1.39 ms | ~0.8 ms | 1 | ~0.8 ms |
+
+Remainder of the 48.3 ms wall (~13 ms) = history GEMMs + ~768 launch
+gaps. Factor kernel internals: 78 registers, no spills, 154624 B SMEM,
+16 warps resident; stalls 38.4% barrier / 17.2% wait / 11.5%
+short_scoreboard - the serial dependency chain is the floor, not a
+scheduling defect. Two consequences: (a) in-kernel factor tuning is
+near exhausted; (b) the apply (54 us max) fits entirely inside the
+factor's 87 us shadow, so fusion converts factor+apply+2 gaps into
+~factor+tail per micro.
+
+Variant 13 `ll_nb1024_microfused_tf32` implements the fused per-micro
+kernel (`fused_micro_kernel`, 512 threads, 153600 B dynamic SMEM =
+max(factor 153.6 KB, apply 132 KB), one CTA per SM):
+
+- Grid = min(1 + tiles, co-resident capacity from
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` x SM count), latched
+  once; `prepare()` TORCH_CHECKs capacity >= 2, so the spin cannot
+  deadlock (148 SMs x 1 CTA on B200; tiles <= 255 means consumers own
+  at most 2 tiles each).
+- CTA 0 = exact v12 factor path (`factor_wide` + `build_inverse_128`),
+  stores `t_inv`, then `__syncthreads()` +
+  `st.release.gpu.global.u32` on this micro's flag slot. Consumers
+  prefetch their first X tile into SMEM before spinning
+  (`ld.global.relaxed.gpu.L1::no_allocate.u32` + `__nanosleep(64)`,
+  then `fence.acquire.gpu`) - the tile load rides under the factor's
+  critical path. Protocol per `references/qr-kernels/gaunernst.py`
+  749-763, 1173-1214.
+- Apply adapted to 512 threads: 4x4 warp grid, 32x32 per warp, 8x4
+  register microtile per thread, k clipped per 32-column stripe
+  (finer than v12's 64-column clip; ~17% fewer lane-FMAs).
+- Flag workspace: 256 int32, `at::zeros` per call (write-once slots,
+  no per-micro reset; one extra tiny fill launch counted in metadata).
+- Last micro (tiles = 0): grid 1, CTA 0 skips inverse build and
+  publish.
+- Correctness argument unchanged from v2-v12: identical operations in
+  identical order, only launch packaging differs; all consumer inputs
+  except `t_inv` were written by earlier kernels on the same queue,
+  and `t_inv` is ordered by the release/acquire flag.
+
+Expected: deletes ~8 ms of exposed apply time plus ~256 launch gaps
+(~1-2 ms) -> ~38-40 ms. Not projected as promised - measured next by
+autotune. Beyond v13: full panel fusion (v6/v7 slots) would also pull
+the 128x128 diagonal slice of the inner update in-kernel so factor k+1
+stops waiting on the full-column cuBLAS GEMM; that targets the ~22 ms
+factor-chain floor itself.
+
+### 2026-07-26 - phase 2h: fused-micro results and the inverse-GEMM apply
+
+`autotune --variants 12,13 --rounds 3`
+(`artifacts/autotune/b1n32768_20260726T111616Z/`), all passing:
+
+| variant | median benchmark.14 mean | vs baseline |
+|---:|---:|---:|
+| 13 `ll_nb1024_microfused_tf32` | **48.53 ms** | **4.55x** (promoted) |
+| 12 `ll_nb1024_rank8w_tf32` | 48.85 ms | 4.52x |
+
+v13 won every round but only by ~0.35 ms - far under the ~9 ms
+projection. `ncu --variants 13`
+(`artifacts/ncu/b1n32768_20260726T111923Z/`, direct measurements):
+`fused_micro_kernel` = 234.8 us vs 147.6 + 91.8 = 239.4 us for the
+separate pair; 65.6% barrier stalls, 61.6% of samples on the
+consumers' post-spin barrier (cuda.cu:997 = first instruction after
+it). Post-mortem: the prefetch hid only the X-tile *load*; the apply
+*compute* (~40 us/tile at 16 warps = 25% occupancy, 2 serial tiles on
+most consumers because the grid is capped at 148 CTAs) cannot start
+before the flag and runs serially after the factor. The apply was
+latency-bound all along, not load-bound - same occupancy disease NCU
+already diagnosed in the factor at phase 2e.
+
+Variant 14 `ll_nb1024_invgemm_tf32` draws the sharper conclusion:
+stop hand-rolling the thin memory-bound product. Since `t_inv` has
+exact strict-upper zeros, X := X T^T is a plain dense GEMM, so per
+micro: v12 factor kernel (unchanged), then
+`cublasGemmEx` (OP_T/OP_N, m=128, n=rows, k=128, TF32,
+A=t_inv ld 128, B=X ld kN, beta=0) into a `(kN-128) x 128` scratch
+column, then a float4 `copy_back_kernel` (256x256, ~33 MB traffic,
+est. ~9 us). cuBLAS runs this shape with tensor cores and deep
+pipelines - est. ~10-15 us vs the 87 us in-kernel tail. Accuracy:
+TF32 quantization of X and T adds ~1e-3 relative error to panel
+entries against the ~6e-2 gate at n=32768 (the history GEMMs already
+put TF32-scale error into the same entries; checker verdict rules).
+Est. ~40-42 ms if the apply GEMM lands in the cutlass fast path -
+measured next, not promised. If it holds, the follow-up folds the
+copy-back into the fused kernel's consumer CTAs (k-split GemmEx
+operands read scratch directly) to take the copy-back off the
+critical path too.
+
 ## Roofline and expectations (pre-measurement estimates)
 
 - Big GEMM flops: n^3/3 = 1.17e13. At an effective 600-900 TF (TF32,
@@ -457,11 +584,19 @@ means; every DESIGN entry labels direct measurements vs inferences.
 
 # DONE 2026-07-26: ncu --variants 10 (occupancy 12.5%, latency-bound)
 
-# 11. Wide-factor round (phase 2f):
-python3 cholesky/b1n32768/cholesky_b1n32768_runner.py autotune --variants 10,12 --rounds 3
+# DONE 2026-07-26: autotune --variants 10,12 (v12 promoted, 48.32 ms)
 
-# 12. Lock in the current best on the board (optional, any time):
-python3 cholesky/b1n32768/cholesky_b1n32768_runner.py submit --mode leaderboard
+# DONE 2026-07-26: ncu --variants 12 (factor 147.6 us / apply 91.8 us / inner 31.3 us)
+# DONE 2026-07-26: submit --mode leaderboard (public geomean 1.8695 ms, submission 913708)
+
+# DONE 2026-07-26: autotune --variants 12,13 (v13 promoted, 48.53 ms, +0.35 ms only)
+# DONE 2026-07-26: ncu --variants 13 (fused 234.8 us ~= separate sum; apply compute serializes)
+
+# 17. Inverse-GEMM apply vs the fused kernel:
+python3 cholesky/b1n32768/cholesky_b1n32768_runner.py autotune --variants 13,14 --rounds 3
+
+# 18. If v14 wins, capture its split (factor share should dominate again):
+python3 cholesky/b1n32768/cholesky_b1n32768_runner.py ncu --variants 14
 
 # Sandbox-safe checks:
 python3 -m py_compile cholesky/b1n32768/cholesky_b1n32768.py
@@ -473,7 +608,7 @@ git diff --check
 
 | Date | Selected ID | Public B200 geomean | Notes |
 |------|------------:|--------------------:|-------|
-| - | - | - | no leaderboard submission yet |
+| 2026-07-26 | 12 | 1.8695 ms | secret 1.8921 ms, submission 913708, all runs passing |
 
 Benchmark-mode history for the target row (not leaderboard geomeans):
 
@@ -489,3 +624,5 @@ Benchmark-mode history for the target row (not leaderboard geomeans):
 | 2026-07-26 | 9 | 100.59 ms (regression, recorded) |
 | 2026-07-26 | 10 | 60.89 ms (promoted, 3-round median) |
 | 2026-07-26 | 11 | 62.13 ms |
+| 2026-07-26 | 12 | 48.32 ms (promoted, 3-round median) |
+| 2026-07-26 | 13 | 48.53 ms (promoted, 3-round median; v12 48.85 ms same sweep) |

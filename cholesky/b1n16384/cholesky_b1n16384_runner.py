@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Popcorn/Brev driver for the B200 (1, 32768, 32768) specialization.
+"""Popcorn/Brev driver for the B200 (1, 16384, 16384) specialization.
 
 Benchmark row 14 is the target shape. Its timing window holds exactly
 one call (the 4 GiB input exceeds the 256 MiB batching target) and the
@@ -30,26 +30,15 @@ import urllib.request
 
 LEADERBOARD = "cholesky"
 GPU = "B200"
-TARGET_BENCHMARK_INDEX = 14
+TARGET_BENCHMARK_INDEX = 13
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
 VARIANT_NAMES = (
-    "ll_nb1024_strsm_fp32_all",
-    "ll_nb1024_strsm_tf32_big",
-    "ll_nb1024_inv_tf32_all",
-    "ll_nb2048_inv_tf32_all",
-    "ll_nb1024_inv_bf16x9_big",
-    "rl_nb1024_ssyrk_tf32",
-    "ll_nb1024_fused_tf32",
-    "ll_nb2048_fused_tf32",
-    "ll_nb1024_flatf_tf32",
-    "ll_nb1024_flatf_lightapply_tf32",
-    "ll_nb1024_rank8f_tf32",
-    "ll_nb2048_rank8f_tf32",
-    "ll_nb1024_rank8w_tf32",
-    "ll_nb1024_microfused_tf32",
     "ll_nb1024_invgemm_tf32",
+    "ll_nb2048_invgemm_tf32",
+    "ll_nb512_invgemm_tf32",
+    "ll_nb1024_inv_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -61,7 +50,7 @@ RAW_NUMBER = re.compile(
 
 
 def _source_path() -> Path:
-    return Path(__file__).with_name("cholesky_b1n32768.py").resolve()
+    return Path(__file__).with_name("cholesky_b1n16384.py").resolve()
 
 
 def _default_artifact_root() -> Path:
@@ -471,7 +460,7 @@ def _autotune(args: argparse.Namespace) -> Path:
     source_hash = _sha256(source)
     run_dir = (
         args.artifact_root / "autotune" /
-        f"b1n32768_{_timestamp()}"
+        f"b1n16384_{_timestamp()}"
     ).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "popcorn-submit-help.txt").write_text(help_text)
@@ -480,7 +469,7 @@ def _autotune(args: argparse.Namespace) -> Path:
     submissions: dict[int, Path] = {}
     for variant in variants:
         path = submission_dir / (
-            f"cholesky_b1n32768_v{variant:02d}.py"
+            f"cholesky_b1n16384_v{variant:02d}.py"
         )
         path.write_text(_variant_source(source, variant))
         submissions[variant] = path.resolve()
@@ -710,7 +699,7 @@ def _ncu(args: argparse.Namespace) -> Path:
     source = _source_path().read_text()
     run_dir = (
         args.artifact_root / "ncu" /
-        f"b1n32768_{_timestamp()}"
+        f"b1n16384_{_timestamp()}"
     ).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     environment = os.environ.copy()
@@ -722,7 +711,7 @@ def _ncu(args: argparse.Namespace) -> Path:
         )
         variant_dir.mkdir()
         submission = (
-            variant_dir / f"cholesky_b1n32768_v{variant:02d}.py"
+            variant_dir / f"cholesky_b1n16384_v{variant:02d}.py"
         ).resolve()
         submission.write_text(_variant_source(source, variant))
         result_path = (variant_dir / "brev-result.json").resolve()
@@ -831,7 +820,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Autotune, profile, or submit the B200 "
-            "(1,32768,32768) Cholesky specialization"
+            "(1,16384,16384) Cholesky specialization"
         )
     )
     parser.add_argument(

@@ -1,7 +1,1054 @@
+import hashlib
+import os
+from functools import lru_cache
+
 import torch
-import triton
 from task import input_t, output_t
+from torch.utils.cpp_extension import load_inline
+
+
+# The tuner replaces this exact line in retained candidate copies.
+_DEFAULT_VARIANT = 0  # POPCORN_VARIANT
+_VARIANT_NAMES = (
+    "ll_nb1024_invgemm_tf32",
+    "ll_nb2048_invgemm_tf32",
+    "ll_nb512_invgemm_tf32",
+    "ll_nb1024_inv_tf32",
+)
+_VARIANT_COUNT = len(_VARIANT_NAMES)
+_VARIANT_IDS = tuple(range(_VARIANT_COUNT))
+
+_METADATA_COLUMNS = (
+    "variant",
+    "schedule",
+    "outer_block",
+    "trsm_mode",
+    "math_big",
+    "math_inner",
+    "factor_threads",
+    "factor_registers",
+    "factor_shared_bytes",
+    "factor_local_bytes",
+    "factor_dynamic_bytes",
+    "apply_registers",
+    "apply_shared_bytes",
+    "apply_local_bytes",
+    "apply_dynamic_bytes",
+    "copy_registers",
+    "wedge_registers",
+    "active_factor_blocks",
+    "active_apply_blocks",
+    "launch_count",
+    "emulation_available",
+    "microtile",
+    "guard_mode",
+    "implemented",
+    "factor_mode",
+    "apply_mode",
+)
+
+_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+void cholesky_b1n16384_prepare(int64_t variant);
+at::Tensor cholesky_b1n16384(const at::Tensor& data, int64_t variant);
+void cholesky_b1n16384_out(
+    const at::Tensor& data, at::Tensor out, int64_t variant);
+at::Tensor cholesky_b1n16384_metadata();
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("prepare", &cholesky_b1n16384_prepare,
+        "Configure one B200 1x16384 Cholesky variant");
+  m.def("run", &cholesky_b1n16384, "Single 16384 Cholesky");
+  m.def("run_out", &cholesky_b1n16384_out,
+        "Single 16384 Cholesky out");
+  m.def("metadata", &cholesky_b1n16384_metadata,
+        "B200 kernel resource metadata");
+}
+"""
+
+# Port of the b1n32768 phase-2h winner (`ll_nb1024_invgemm_tf32`,
+# 42.86 ms = 5.15x there): left-looking outer panels with TF32 cuBLAS
+# history/inner GEMMs, a single-CTA 512-thread redundant-corner factor
+# kernel that also builds T = inv(L11), and the triangular apply run
+# as a dense TF32 GEMM into a scratch column plus a float4 copy-back.
+# Only the shape constant differs; every kernel is micro=128-tile
+# local and ports unchanged.
+_CUDA_SOURCE = r"""
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContextLight.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+#include <array>
+#include <cstdint>
+#include <utility>
+
+namespace {
+
+constexpr int kN = 16384;
+constexpr int kMicro = 128;
+constexpr int kTileLd = kMicro + 1;
+constexpr int kPanelLd = 9;
+constexpr int kVariantCount = 4;
+constexpr int kMetadataColumns = 26;
+
+// Shared-memory layout of the factor kernel:
+//   [tile kMicro x kTileLd][inverse_diagonal kMicro]
+//   [panel kMicro x kPanelLd][tinv kMicro x kTileLd][mid 64 x 64]
+constexpr int kFactorBytes =
+    static_cast<int>(sizeof(float)) *
+    (kMicro * kTileLd + kMicro + kMicro * kPanelLd +
+     kMicro * kTileLd + 64 * 64);
+constexpr int kApplyBytes =
+    static_cast<int>(sizeof(float)) * 2 * kMicro * kTileLd;
+
+static_assert(kFactorBytes == 153600);
+static_assert(kApplyBytes == 132096);
+
+// Numeric codes match the b1n32768 metadata conventions.
+constexpr int kLeftLook = 0;
+constexpr int kTrsmInverse = 1;
+constexpr int kTrsmGemm = 4;
+constexpr int kMathTf32 = 1;
+constexpr int kFactorWide = 3;
+
+template <int Id>
+struct Variant;
+
+#define SPEC(ID, NB, TRSM)                                           \
+  template <> struct Variant<ID> {                                   \
+    static constexpr int nb = NB;                                    \
+    static constexpr int trsm_mode = TRSM;                           \
+    static constexpr bool gemm_apply = TRSM == kTrsmGemm;            \
+  }
+
+SPEC(0, 1024, kTrsmGemm);
+SPEC(1, 2048, kTrsmGemm);
+SPEC(2, 512, kTrsmGemm);
+SPEC(3, 1024, kTrsmInverse);
+
+#undef SPEC
+
+template <int... Ids>
+constexpr std::array<bool, sizeof...(Ids)> scratch_usage_of(
+    std::integer_sequence<int, Ids...>) {
+  return {(Variant<Ids>::trsm_mode == kTrsmGemm)...};
+}
+
+// Which variants apply through the out-of-place cuBLAS GEMM and need
+// the scratch column workspace.
+constexpr auto kVariantUsesScratch =
+    scratch_usage_of(std::make_integer_sequence<int, kVariantCount>{});
+
+__device__ __forceinline__ int64_t matrix_index(int row, int column) {
+  return static_cast<int64_t>(row) * kN + column;
+}
+
+__device__ __forceinline__ float load_global(const float* pointer) {
+  return __ldcg(pointer);
+}
+
+__device__ __forceinline__ void store_global(
+    float* pointer, float value) {
+  __stcg(pointer, value);
+}
+
+__device__ __forceinline__ float& tile_at(
+    float* tile, int row, int column) {
+  return tile[row * kTileLd + column];
+}
+
+// Wide redundant-corner factorization, 512 threads (b1n32768 phase-2e
+// design). Every thread factors the 8x8 group corner redundantly in
+// registers - cheaper than warp-serial communication at this size -
+// four threads share each sub-panel row (redundant register solve,
+// quarter-split rank-8 update), and each group needs two CTA barriers,
+// with sixteen warps to hide latency.
+__device__ __forceinline__ void factor_wide(
+    float* __restrict__ tile,
+    float* __restrict__ inverse_diagonal,
+    float* __restrict__ panel) {
+  constexpr int kGroup = 8;
+  const int thread = static_cast<int>(threadIdx.x);
+  const int row_index = thread >> 2;
+  const int quarter = thread & 3;
+#pragma unroll 1
+  for (int base = 0; base < kMicro; base += kGroup) {
+    float corner[kGroup][kGroup];
+    float inverse[kGroup];
+#pragma unroll
+    for (int i = 0; i < kGroup; ++i) {
+#pragma unroll
+      for (int j = 0; j <= i; ++j) {
+        corner[i][j] = tile_at(tile, base + i, base + j);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      const float diagonal = __fsqrt_rn(corner[j][j]);
+      const float inv = __fdiv_rn(1.0f, diagonal);
+      corner[j][j] = diagonal;
+      inverse[j] = inv;
+#pragma unroll
+      for (int i = j + 1; i < kGroup; ++i) {
+        corner[i][j] *= inv;
+      }
+#pragma unroll
+      for (int i = j + 1; i < kGroup; ++i) {
+#pragma unroll
+        for (int target = j + 1; target <= i; ++target) {
+          corner[i][target] = fmaf(
+              -corner[i][j], corner[target][j], corner[i][target]);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      if (thread == j) {
+        inverse_diagonal[base + j] = inverse[j];
+#pragma unroll
+        for (int i = j; i < kGroup; ++i) {
+          tile_at(tile, base + i, base + j) = corner[i][j];
+        }
+      }
+    }
+    const int row = base + kGroup + row_index;
+    float solved[kGroup];
+    if (row < kMicro) {
+#pragma unroll
+      for (int k = 0; k < kGroup; ++k) {
+        solved[k] = tile_at(tile, row, base + k);
+      }
+#pragma unroll
+      for (int j = 0; j < kGroup; ++j) {
+        float value = solved[j];
+#pragma unroll
+        for (int i = 0; i < j; ++i) {
+          value = fmaf(-solved[i], corner[j][i], value);
+        }
+        solved[j] = value * inverse[j];
+      }
+      if (quarter == 0) {
+#pragma unroll
+        for (int k = 0; k < kGroup; ++k) {
+          tile_at(tile, row, base + k) = solved[k];
+          panel[row * kPanelLd + k] = solved[k];
+        }
+      }
+    }
+    __syncthreads();
+    if (row < kMicro) {
+      const int first = base + kGroup;
+      for (int target = first + quarter * 4; target <= row;
+           target += 16) {
+        if (target + 3 <= row) {
+          float value0 = tile_at(tile, row, target);
+          float value1 = tile_at(tile, row, target + 1);
+          float value2 = tile_at(tile, row, target + 2);
+          float value3 = tile_at(tile, row, target + 3);
+#pragma unroll
+          for (int k = 0; k < kGroup; ++k) {
+            const float left = solved[k];
+            value0 = fmaf(
+                -left, panel[target * kPanelLd + k], value0);
+            value1 = fmaf(
+                -left, panel[(target + 1) * kPanelLd + k], value1);
+            value2 = fmaf(
+                -left, panel[(target + 2) * kPanelLd + k], value2);
+            value3 = fmaf(
+                -left, panel[(target + 3) * kPanelLd + k], value3);
+          }
+          tile_at(tile, row, target) = value0;
+          tile_at(tile, row, target + 1) = value1;
+          tile_at(tile, row, target + 2) = value2;
+          tile_at(tile, row, target + 3) = value3;
+        } else {
+          for (int single = target; single <= row; ++single) {
+            float value = tile_at(tile, row, single);
+#pragma unroll
+            for (int k = 0; k < kGroup; ++k) {
+              value = fmaf(
+                  -solved[k], panel[single * kPanelLd + k], value);
+            }
+            tile_at(tile, row, single) = value;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Builds tinv = inverse of the lower-triangular 128x128 factor held
+// in the shared tile. Diagonal 32-blocks are inverted by forward
+// substitution (one warp per block, one lane per column), then
+// combined 32 -> 64 -> 128 through the block identity
+//   inv([[A, 0], [B, C]]) = [[inv(A), 0],
+//                            [-inv(C) B inv(A), inv(C)]].
+// The strict upper triangle of tinv is written as exact zeros, so
+// later dense products over it stay exact.
+__device__ __forceinline__ void build_inverse_128(
+    const float* tile, const float* inverse_diagonal,
+    float* tinv, float* mid) {
+  const int thread = static_cast<int>(threadIdx.x);
+  for (int linear = thread; linear < kMicro * kTileLd;
+       linear += static_cast<int>(blockDim.x)) {
+    tinv[linear] = 0.0f;
+  }
+  __syncthreads();
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  if (warp < 4) {
+    const int base = warp * 32;
+    const int column = base + lane;
+    tinv[column * kTileLd + column] = inverse_diagonal[column];
+    for (int row = lane + 1; row < 32; ++row) {
+      const int target = base + row;
+      float partial = 0.0f;
+      for (int k = lane; k < row; ++k) {
+        partial = fmaf(
+            tile[target * kTileLd + base + k],
+            tinv[(base + k) * kTileLd + column], partial);
+      }
+      tinv[target * kTileLd + column] =
+          -partial * inverse_diagonal[target];
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pair = 0; pair < 2; ++pair) {
+    const int base = pair * 64;
+    for (int linear = thread; linear < 32 * 32;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 5;
+      const int column = linear & 31;
+      float partial = 0.0f;
+#pragma unroll 4
+      for (int k = column; k < 32; ++k) {
+        partial = fmaf(
+            tile[(base + 32 + row) * kTileLd + base + k],
+            tinv[(base + k) * kTileLd + base + column], partial);
+      }
+      mid[row * 32 + column] = partial;
+    }
+    __syncthreads();
+    for (int linear = thread; linear < 32 * 32;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 5;
+      const int column = linear & 31;
+      float partial = 0.0f;
+#pragma unroll 4
+      for (int k = 0; k <= row; ++k) {
+        partial = fmaf(
+            tinv[(base + 32 + row) * kTileLd + base + 32 + k],
+            mid[k * 32 + column], partial);
+      }
+      tinv[(base + 32 + row) * kTileLd + base + column] = -partial;
+    }
+    __syncthreads();
+  }
+  for (int linear = thread; linear < 64 * 64;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear >> 6;
+    const int column = linear & 63;
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int k = column; k < 64; ++k) {
+      partial = fmaf(
+          tile[(64 + row) * kTileLd + k],
+          tinv[k * kTileLd + column], partial);
+    }
+    mid[row * 64 + column] = partial;
+  }
+  __syncthreads();
+  for (int linear = thread; linear < 64 * 64;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear >> 6;
+    const int column = linear & 63;
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int k = 0; k <= row; ++k) {
+      partial = fmaf(
+          tinv[(64 + row) * kTileLd + 64 + k],
+          mid[k * 64 + column], partial);
+    }
+    tinv[(64 + row) * kTileLd + column] = -partial;
+  }
+  __syncthreads();
+}
+
+// One CTA factors the 128x128 diagonal block at (begin, begin) in
+// place and writes the dense inverse of the resulting lower factor to
+// the t_inv workspace. The final micro step has no trailing rows, so
+// its inverse build is skipped.
+__global__ __launch_bounds__(512)
+void factor128_kernel(
+    float* __restrict__ output, int begin,
+    float* __restrict__ t_inv) {
+  extern __shared__ __align__(16) float dynamic_floats[];
+  float* tile = dynamic_floats;
+  float* inverse_diagonal = tile + kMicro * kTileLd;
+  float* panel = inverse_diagonal + kMicro;
+  float* tinv = panel + kMicro * kPanelLd;
+  float* mid = tinv + kMicro * kTileLd;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kMicro * kMicro;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear >> 7;
+    const int column = linear & (kMicro - 1);
+    tile_at(tile, row, column) =
+        column <= row
+            ? load_global(
+                  output + matrix_index(begin + row, begin + column))
+            : 0.0f;
+  }
+  __syncthreads();
+  factor_wide(tile, inverse_diagonal, panel);
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kMicro * kMicro;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear >> 7;
+    const int column = linear & (kMicro - 1);
+    if (column <= row) {
+      store_global(
+          output + matrix_index(begin + row, begin + column),
+          tile_at(tile, row, column));
+    }
+  }
+  if (begin + kMicro < kN) {
+    build_inverse_128(tile, inverse_diagonal, tinv, mid);
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kMicro * kMicro;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 7;
+      const int column = linear & (kMicro - 1);
+      store_global(
+          t_inv + linear, tinv[row * kTileLd + column]);
+    }
+  }
+  __syncthreads();
+}
+
+// Applies X := X * T^T for one 128x128 tile of the sub-column below
+// the diagonal block at `begin` (control variant; the production path
+// runs this product through cuBLAS). Each thread accumulates an 8x8
+// register tile; the k loop is clipped per 64-column half because
+// T[column][k] vanishes for k > column.
+__global__ __launch_bounds__(256)
+void trsm_apply_kernel(
+    float* __restrict__ output, int begin,
+    const float* __restrict__ t_inv) {
+  extern __shared__ __align__(16) float dynamic_floats[];
+  float* x_tile = dynamic_floats;
+  float* t_tile = x_tile + kMicro * kTileLd;
+  const int row_begin =
+      begin + kMicro + static_cast<int>(blockIdx.x) * kMicro;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kMicro * kMicro;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear >> 7;
+    const int column = linear & (kMicro - 1);
+    x_tile[row * kTileLd + column] = load_global(
+        output + matrix_index(row_begin + row, begin + column));
+    t_tile[row * kTileLd + column] = load_global(t_inv + linear);
+  }
+  __syncthreads();
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_row = warp >> 1;
+  const int warp_column = warp & 1;
+  const int lane_row = lane >> 3;
+  const int lane_column = lane & 7;
+  const int k_limit = warp_column * 64 + 64;
+  float value[8][8];
+#pragma unroll
+  for (int row = 0; row < 8; ++row) {
+#pragma unroll
+    for (int column = 0; column < 8; ++column) {
+      value[row][column] = 0.0f;
+    }
+  }
+#pragma unroll 1
+  for (int k = 0; k < k_limit; ++k) {
+    float left[8];
+    float right[8];
+#pragma unroll
+    for (int row = 0; row < 8; ++row) {
+      left[row] = x_tile[
+          (warp_row * 32 + lane_row + row * 4) * kTileLd + k];
+    }
+#pragma unroll
+    for (int column = 0; column < 8; ++column) {
+      const int t_row =
+          warp_column * 64 + lane_column + column * 8;
+      right[column] = t_tile[t_row * kTileLd + k];
+    }
+#pragma unroll
+    for (int row = 0; row < 8; ++row) {
+#pragma unroll
+      for (int column = 0; column < 8; ++column) {
+        value[row][column] = fmaf(
+            left[row], right[column], value[row][column]);
+      }
+    }
+  }
+#pragma unroll
+  for (int row = 0; row < 8; ++row) {
+#pragma unroll
+    for (int column = 0; column < 8; ++column) {
+      const int output_row = warp_row * 32 + lane_row + row * 4;
+      const int output_column =
+          warp_column * 64 + lane_column + column * 8;
+      store_global(
+          output +
+              matrix_index(
+                  row_begin + output_row, begin + output_column),
+          value[row][column]);
+    }
+  }
+}
+
+// Moves the out-of-place apply result (scratch, row-major ld 128)
+// back into the panel sub-column it belongs to. Both sides are
+// float4-aligned: 128 columns = 32 quads per row.
+__global__ __launch_bounds__(256)
+void copy_back_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ scratch, int begin) {
+  constexpr int quads_per_row = kMicro / 4;
+  const int rows = kN - begin - kMicro;
+  const int64_t quads =
+      static_cast<int64_t>(rows) * quads_per_row;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / quads_per_row);
+    const int column =
+        static_cast<int>(quad % quads_per_row) * 4;
+    const float4 value = __ldcg(
+        reinterpret_cast<const float4*>(
+            scratch + static_cast<int64_t>(row) * kMicro + column));
+    __stcg(
+        reinterpret_cast<float4*>(
+            output +
+            matrix_index(begin + kMicro + row, begin + column)),
+        value);
+  }
+}
+
+// Vectorized lower-triangle copy: the strict upper triangle of the
+// output is written as exact zeros and is never touched again except
+// inside NB-block diagonal wedges, which zero_wedges_kernel restores.
+__global__ __launch_bounds__(256)
+void copy_lower_kernel(
+    const float* __restrict__ input, float* __restrict__ output) {
+  constexpr int64_t quads = static_cast<int64_t>(kN) * kN / 4;
+  constexpr int quads_per_row = kN / 4;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / quads_per_row);
+    const int column =
+        static_cast<int>(quad % quads_per_row) * 4;
+    const float4* source =
+        reinterpret_cast<const float4*>(input) + quad;
+    float4 value;
+    if (column + 3 <= row) {
+      value = __ldcg(source);
+    } else if (column > row) {
+      value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+      const float4 loaded = __ldcg(source);
+      value.x = loaded.x;
+      value.y = column + 1 <= row ? loaded.y : 0.0f;
+      value.z = column + 2 <= row ? loaded.z : 0.0f;
+      value.w = 0.0f;
+    }
+    __stcg(reinterpret_cast<float4*>(output) + quad, value);
+  }
+}
+
+// Restores exact zeros in the strict upper wedge of each nb x nb
+// diagonal block (the only region library GEMMs overwrite).
+__global__ __launch_bounds__(256)
+void zero_wedges_kernel(float* __restrict__ output, int nb) {
+  constexpr int ctas_per_block = 8;
+  const int block = static_cast<int>(blockIdx.x) / ctas_per_block;
+  const int rank = static_cast<int>(blockIdx.x) % ctas_per_block;
+  const int shift = __ffs(nb) - 1;
+  const int base = block * nb;
+  const int64_t elements = static_cast<int64_t>(nb) * nb;
+  for (int64_t linear =
+           static_cast<int64_t>(rank) * blockDim.x + threadIdx.x;
+       linear < elements;
+       linear +=
+       static_cast<int64_t>(ctas_per_block) * blockDim.x) {
+    const int row = static_cast<int>(linear >> shift);
+    const int column = static_cast<int>(linear & (nb - 1));
+    if (column > row) {
+      store_global(
+          output + matrix_index(base + row, base + column), 0.0f);
+    }
+  }
+}
+
+void check_cublas(cublasStatus_t status, const char* role) {
+  TORCH_CHECK(
+      status == CUBLAS_STATUS_SUCCESS,
+      role, " failed with cuBLAS status ", static_cast<int>(status));
+}
+
+// Saves and restores handle state around the launch sequence; the
+// handle already targets the caller's execution queue, so no queue
+// is ever named here.
+class CublasStateGuard {
+ public:
+  explicit CublasStateGuard(cublasHandle_t handle)
+      : handle_(handle) {
+    check_cublas(
+        cublasGetMathMode(handle_, &math_mode_),
+        "query cuBLAS math mode");
+    check_cublas(
+        cublasGetAtomicsMode(handle_, &atomics_mode_),
+        "query cuBLAS atomics mode");
+    check_cublas(
+        cublasGetPointerMode(handle_, &pointer_mode_),
+        "query cuBLAS pointer mode");
+    check_cublas(
+        cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH),
+        "select cuBLAS math mode");
+    check_cublas(
+        cublasSetAtomicsMode(handle_, CUBLAS_ATOMICS_ALLOWED),
+        "enable cuBLAS atomic algorithms");
+    check_cublas(
+        cublasSetPointerMode(handle_, CUBLAS_POINTER_MODE_HOST),
+        "select host cuBLAS scalars");
+  }
+
+  ~CublasStateGuard() {
+    cublasSetPointerMode(handle_, pointer_mode_);
+    cublasSetAtomicsMode(handle_, atomics_mode_);
+    cublasSetMathMode(handle_, math_mode_);
+  }
+
+  CublasStateGuard(const CublasStateGuard&) = delete;
+  CublasStateGuard& operator=(const CublasStateGuard&) = delete;
+
+ private:
+  cublasHandle_t handle_;
+  cublasMath_t math_mode_{};
+  cublasAtomicsMode_t atomics_mode_{};
+  cublasPointerMode_t pointer_mode_{};
+};
+
+// Row-major storage is presented to cuBLAS as its column-major
+// transpose: OP_T on the first operand and OP_N on the second give
+// C[j + n_idx][j + m_idx] -= sum_k L[j + m_idx][k] L[j + n_idx][k],
+// which by symmetry of L L^T is the wanted history update.
+void gemm_history(
+    cublasHandle_t handle, float* output, int64_t panel_begin,
+    int nb) {
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+  const int columns = static_cast<int>(kN - panel_begin);
+  const int history = static_cast<int>(panel_begin);
+  const float* panel_rows = output + panel_begin * kN;
+  float* destination = output + panel_begin * kN + panel_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          nb, columns, history,
+          &alpha,
+          panel_rows, CUDA_R_32F, kN,
+          panel_rows, CUDA_R_32F, kN,
+          &beta,
+          destination, CUDA_R_32F, kN,
+          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+      "panel history GEMM");
+}
+
+void gemm_inner(
+    cublasHandle_t handle, float* output, int64_t panel_begin,
+    int64_t micro_begin) {
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+  const int columns = static_cast<int>(kN - micro_begin);
+  const int history = static_cast<int>(micro_begin - panel_begin);
+  const float* micro_rows = output + micro_begin * kN + panel_begin;
+  float* destination = output + micro_begin * kN + micro_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          kMicro, columns, history,
+          &alpha,
+          micro_rows, CUDA_R_32F, kN,
+          micro_rows, CUDA_R_32F, kN,
+          &beta,
+          destination, CUDA_R_32F, kN,
+          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+      "micro history GEMM");
+}
+
+// Out-of-place apply scratch = X T^T as a dense GEMM: T is the dense
+// inverse with exact strict-upper zeros, so the dense product equals
+// the triangular one while cuBLAS runs it on TF32 tensor cores with
+// deep pipelining. Col-major mapping: scratch_cm(128 x rows) =
+// Tc^T(128 x 128) * Xc(128 x rows) with Xc the transposed view of the
+// row-major sub-column (ld kN) and Tc that of t_inv (ld 128).
+void gemm_apply_column(
+    cublasHandle_t handle, float* output, const float* t_inv,
+    float* scratch, int64_t micro_begin) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const int rows = static_cast<int>(kN - micro_begin - kMicro);
+  const float* x_rows =
+      output + (micro_begin + kMicro) * kN + micro_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          kMicro, rows, kMicro,
+          &alpha,
+          t_inv, CUDA_R_32F, kMicro,
+          x_rows, CUDA_R_32F, kN,
+          &beta,
+          scratch, CUDA_R_32F, kMicro,
+          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+      "apply GEMM");
+}
+
+void launch_copy(const float* input, float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(2048, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(&config, copy_lower_kernel, input, output);
+}
+
+void launch_factor(float* output, int begin, float* t_inv) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(512, 1, 1);
+  config.dynamicSmemBytes = kFactorBytes;
+  cudaLaunchKernelEx(
+      &config, factor128_kernel, output, begin, t_inv);
+}
+
+void launch_apply(float* output, int begin, const float* t_inv) {
+  const int tiles = (kN - begin - kMicro) / kMicro;
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(tiles, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  config.dynamicSmemBytes = kApplyBytes;
+  cudaLaunchKernelEx(
+      &config, trsm_apply_kernel, output, begin, t_inv);
+}
+
+void launch_copy_back(float* output, const float* scratch, int begin) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(256, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &config, copy_back_kernel, output, scratch, begin);
+}
+
+void launch_wedges(float* output, int nb) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3((kN / nb) * 8, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(&config, zero_wedges_kernel, output, nb);
+}
+
+template <int Id>
+void launch_staged(
+    float* output, const float* input, float* t_inv,
+    float* scratch) {
+  using V = Variant<Id>;
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  CublasStateGuard guard(handle);
+  launch_copy(input, output);
+  for (int64_t panel = 0; panel < kN; panel += V::nb) {
+    if (panel > 0) {
+      gemm_history(handle, output, panel, V::nb);
+    }
+    for (int64_t micro = panel; micro < panel + V::nb;
+         micro += kMicro) {
+      if (micro > panel) {
+        gemm_inner(handle, output, panel, micro);
+      }
+      launch_factor(output, static_cast<int>(micro), t_inv);
+      if (micro + kMicro < kN) {
+        if constexpr (V::gemm_apply) {
+          gemm_apply_column(handle, output, t_inv, scratch, micro);
+          launch_copy_back(
+              output, scratch, static_cast<int>(micro));
+        } else {
+          launch_apply(output, static_cast<int>(micro), t_inv);
+        }
+      }
+    }
+  }
+  launch_wedges(output, V::nb);
+}
+
+void check_input(const at::Tensor& data) {
+  TORCH_CHECK(data.is_cuda(), "input must be CUDA");
+  TORCH_CHECK(
+      data.scalar_type() == at::kFloat, "input must be float32");
+  TORCH_CHECK(data.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(
+      data.dim() == 3 && data.size(0) == 1 &&
+      data.size(1) == kN && data.size(2) == kN,
+      "native input must have shape (1, 16384, 16384)");
+}
+
+void check_output(
+    const at::Tensor& data, const at::Tensor& output) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(
+      output.scalar_type() == at::kFloat, "output must be float32");
+  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(output.sizes() == data.sizes(), "output shape mismatch");
+  TORCH_CHECK(
+      output.device() == data.device(), "output device mismatch");
+}
+
+template <typename Kernel>
+void configure_dynamic(Kernel kernel, int dynamic_bytes) {
+  cudaError_t status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      dynamic_bytes);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "dynamic shared-memory opt-in failed: ",
+      cudaGetErrorString(status));
+  status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "shared-memory carveout failed: ", cudaGetErrorString(status));
+}
+
+template <typename Kernel>
+cudaFuncAttributes checked_attributes(Kernel kernel) {
+  cudaFuncAttributes attributes{};
+  const cudaError_t status =
+      cudaFuncGetAttributes(&attributes, kernel);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "kernel resource query failed: ", cudaGetErrorString(status));
+  return attributes;
+}
+
+void configure_kernels() {
+  configure_dynamic(factor128_kernel, kFactorBytes);
+  configure_dynamic(trsm_apply_kernel, kApplyBytes);
+  checked_attributes(factor128_kernel);
+  checked_attributes(trsm_apply_kernel);
+}
+
+void launch_variant(
+    const float* input, float* output, float* t_inv,
+    float* scratch, int variant) {
+  switch (variant) {
+    case 0: launch_staged<0>(output, input, t_inv, scratch); break;
+    case 1: launch_staged<1>(output, input, t_inv, scratch); break;
+    case 2: launch_staged<2>(output, input, t_inv, scratch); break;
+    case 3: launch_staged<3>(output, input, t_inv, scratch); break;
+    default:
+      TORCH_CHECK(false, "native variant must be in [0, 3]");
+  }
+}
+
+template <typename Kernel>
+int active_blocks(Kernel kernel, int threads, int dynamic_bytes) {
+  int active = 0;
+  const cudaError_t status =
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &active, kernel, threads, dynamic_bytes);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "occupancy query failed: ", cudaGetErrorString(status));
+  return active;
+}
+
+template <int Id>
+void write_metadata(int64_t* rows) {
+  using V = Variant<Id>;
+  int64_t* row =
+      rows + static_cast<int64_t>(Id) * kMetadataColumns;
+  configure_kernels();
+  const cudaFuncAttributes factor =
+      checked_attributes(factor128_kernel);
+  const cudaFuncAttributes apply =
+      checked_attributes(trsm_apply_kernel);
+  const cudaFuncAttributes copy =
+      checked_attributes(copy_lower_kernel);
+  const cudaFuncAttributes wedges =
+      checked_attributes(zero_wedges_kernel);
+  const int panels = kN / V::nb;
+  const int micros = kN / kMicro;
+  const int inner = panels * (V::nb / kMicro - 1);
+  const int big = panels - 1;
+  const int applies =
+      V::gemm_apply ? 2 * (micros - 1) : micros - 1;
+  row[0] = Id;
+  row[1] = kLeftLook;
+  row[2] = V::nb;
+  row[3] = V::trsm_mode;
+  row[4] = kMathTf32;
+  row[5] = kMathTf32;
+  row[6] = 512;
+  row[7] = factor.numRegs;
+  row[8] = factor.sharedSizeBytes;
+  row[9] = factor.localSizeBytes;
+  row[10] = kFactorBytes;
+  row[11] = apply.numRegs;
+  row[12] = apply.sharedSizeBytes;
+  row[13] = apply.localSizeBytes;
+  row[14] = V::gemm_apply ? 0 : kApplyBytes;
+  row[15] = copy.numRegs;
+  row[16] = wedges.numRegs;
+  row[17] = active_blocks(factor128_kernel, 512, kFactorBytes);
+  row[18] = active_blocks(trsm_apply_kernel, 256, kApplyBytes);
+  row[19] = 2 + big + inner + micros + applies;
+  row[20] = 0;
+  row[21] = kMicro;
+  row[22] = 0;
+  row[23] = 1;
+  row[24] = kFactorWide;
+  row[25] = 0;
+}
+
+}  // namespace
+
+void cholesky_b1n16384_prepare(int64_t variant) {
+  TORCH_CHECK(
+      variant >= 0 && variant < kVariantCount,
+      "native variant must be in [0, 3]");
+  configure_kernels();
+}
+
+void cholesky_b1n16384_out(
+    const at::Tensor& data, at::Tensor output, int64_t variant) {
+  check_input(data);
+  check_output(data, output);
+  TORCH_CHECK(
+      variant >= 0 && variant < kVariantCount,
+      "native variant must be in [0, 3]");
+  c10::cuda::CUDAGuard device_guard(data.device());
+  at::Tensor t_inv = at::empty(
+      {kMicro, kMicro}, data.options());
+  at::Tensor scratch;
+  float* scratch_pointer = nullptr;
+  if (kVariantUsesScratch[static_cast<int>(variant)]) {
+    scratch = at::empty({kN - kMicro, kMicro}, data.options());
+    scratch_pointer = scratch.data_ptr<float>();
+  }
+  launch_variant(
+      data.data_ptr<float>(), output.data_ptr<float>(),
+      t_inv.data_ptr<float>(), scratch_pointer,
+      static_cast<int>(variant));
+  const cudaError_t status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "Cholesky launch failed: ", cudaGetErrorString(status));
+}
+
+at::Tensor cholesky_b1n16384(
+    const at::Tensor& data, int64_t variant) {
+  auto output = at::empty_like(data);
+  cholesky_b1n16384_out(data, output, variant);
+  return output;
+}
+
+at::Tensor cholesky_b1n16384_metadata() {
+  auto result = at::zeros(
+      {kVariantCount, kMetadataColumns},
+      at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  int64_t* rows = result.data_ptr<int64_t>();
+  write_metadata<0>(rows);
+  write_metadata<1>(rows);
+  write_metadata<2>(rows);
+  write_metadata<3>(rows);
+  return result;
+}
+"""
+
+
+@lru_cache(maxsize=1)
+def _native_module():
+    tag = hashlib.sha256((_CPP_SOURCE + _CUDA_SOURCE).encode()).hexdigest()[:12]
+    previous_arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
+    try:
+        return load_inline(
+            name=f"cholesky_b1n16384_b200_{tag}",
+            cpp_sources=_CPP_SOURCE,
+            cuda_sources=_CUDA_SOURCE,
+            functions=None,
+            extra_cflags=[
+                "-O3",
+                "-DNDEBUG",
+                "-std=c++20",
+            ],
+            extra_cuda_cflags=[
+                "-O3",
+                "-DNDEBUG",
+                "-std=c++20",
+                "--use_fast_math",
+                "--extra-device-vectorization",
+                "--restrict",
+                "-lineinfo",
+                "-Xptxas=-O3,-v,-warn-spills",
+                "-gencode",
+                "arch=compute_100a,code=sm_100a",
+            ],
+            extra_ldflags=["-lcublas"],
+            verbose=False,
+        )
+    finally:
+        if previous_arch is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch
+
+
+_PREPARED_VARIANTS: set[int] = set()
+
+
+def _run_variant(
+    data: torch.Tensor,
+    variant: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if variant not in _VARIANT_IDS:
+        raise ValueError(f"variant must be in {_VARIANT_IDS}, got {variant}")
+    module = _native_module()
+    if variant not in _PREPARED_VARIANTS:
+        module.prepare(variant)
+        _PREPARED_VARIANTS.add(variant)
+    if out is None:
+        return module.run(data, variant)
+    module.run_out(data, out, variant)
+    return out
+
+
+def _variant_metadata() -> torch.Tensor:
+    return _native_module().metadata()
 
 
 def custom_kernel(data: input_t) -> output_t:
+    if (
+        data.is_cuda
+        and data.dtype == torch.float32
+        and data.is_contiguous()
+        and tuple(data.shape) == (1, 16384, 16384)
+    ):
+        return _run_variant(data, _DEFAULT_VARIANT)
     return torch.linalg.cholesky_ex(data, check_errors=False).L
