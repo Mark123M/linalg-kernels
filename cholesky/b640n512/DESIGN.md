@@ -18,9 +18,9 @@ matrix-tile parallelism. B640 already supplies 640 independent matrices.
 That is enough CTA-level work to hide the serial diagonal path without
 splitting each matrix across launches.
 
-The B640 path therefore launches exactly one CTA per matrix and fuses the
-complete static Cholesky graph into that CTA. This is a software execution
-strategy rather than a special hardware scheduler.
+Variants 0--18 launch exactly one CTA per matrix and fuse the complete
+static Cholesky graph into that CTA. Variants 19--20 are staged controls that
+redistribute factor, solve, and update work across specialized grids.
 
 ## Fused static DAG
 
@@ -97,6 +97,44 @@ Variant 17 keeps the same three-tile allocation but holds the current
 accumulator in the result tile between products. That permits the original
 4x4 lane ownership with only one 4x4 product in registers. Each previous
 operand pair is loaded once instead of once per 2x4 row phase.
+
+## Staged `NB=128` DAG
+
+Variants 19--20 split each matrix into four 128-column panels and execute:
+
+```text
+COPY_FULL
+for p = 0..3:
+    POTRF128(p, p)
+    if p != 3:
+        TRSM64x128(all remaining 64-row tiles)
+        GEMM(full trailing square, rank 128, batch 640)
+ZERO_STRICT_UPPER
+```
+
+This is 12 ordered operations: one vectorized copy, four factors, three
+solves, three cuBLAS updates, and one vectorized upper cleanup. Completion
+of one operation publishes its global writes to the next operation.
+
+- `POTRF128` uses one 256-thread CTA per matrix, a padded 128x129 dynamic
+  shared tile, four direct warp-level `POTF2-32` factors, subgroup TRSM
+  links, and FP32 local updates.
+- `TRSM64x128` uses one CTA per matrix and remaining 64-row tile. Four-lane
+  groups retain one 32-column RHS block in registers. Only 32 diagonal rows
+  are staged at a time, keeping the dynamic allocation at 50,304 bytes.
+- The update is one `cublasGemmStridedBatchedEx` over all 640 matrices.
+  It deliberately writes the full trailing square to expose a large,
+  regular GEMM; the final kernel restores exact strict-upper zeros.
+- Variant 19 requests `CUBLAS_COMPUTE_32F`. Variant 20 explicitly requests
+  `CUBLAS_COMPUTE_32F_FAST_TF32`.
+
+The cuBLAS calls use the current PyTorch handle with default
+high-performance math, atomic algorithms allowed, host scalar pointers, and
+the library's current default GEMM heuristic. Previous handle state is
+restored after the staged sequence. Every M/N/K, leading dimension, matrix
+stride, and pointer offset satisfies the documented 16-byte tensor-core
+alignment conditions. The deprecated tensor-op algorithm selector is not
+used.
 
 ## Tile strategies
 
@@ -350,6 +388,8 @@ sequences; they are not combined with further performance changes.
 | 16 | 64 | precise | scalar | product-stable left-looking 2x4, warp2 factor | 256, min 4 |
 | 17 | 64 | raw | scalar | shared-accumulator left-looking 4x4, warp2 factor | 256, min 4 |
 | 18 | 64 | raw | scalar | right-looking 4x4 preload, warp2 factor | 256, min 5 |
+| 19 | 128 | precise | sub4 | staged cuBLAS FP32 full-tail GEMM | 256 |
+| 20 | 128 | precise | sub4 | staged cuBLAS fast-TF32 full-tail GEMM | 256 |
 
 Native preparation reports registers, static shared memory, and local
 memory plus update mode, requested minimum residency, TMEM columns, schedule,
@@ -413,6 +453,11 @@ the serial diagonal path.
     factor from variant 14 replaces the recursive factor, directly testing
     the barrier hotspot measured in the right-looking profile without
     changing the winning update schedule.
+15. Variants 19--20 are the staged architectural experiment. They trade
+    twelve operation boundaries and extra panel reloads for role-specific
+    resource budgets, thousands of solve CTAs, and full-device cuBLAS
+    trailing updates. The FP32/fast-TF32 pair isolates tensor-product speed
+    from the scheduling change.
 
 ## User-run verification
 
@@ -431,11 +476,11 @@ python3 cholesky/b640n512/cholesky_b640n512_runner.py autotune \
   --variants all --rounds 3 --max-workers 4
 
 python3 cholesky/b640n512/cholesky_b640n512_runner.py autotune \
-  --variants 8,14,17,18 --rounds 3 --max-workers 4
+  --variants 8,18,19,20 --rounds 3 --max-workers 4
 
 POPCORN_BREV_PROFILER_URL=URL \
 python3 cholesky/b640n512/cholesky_b640n512_runner.py ncu \
-  --variants 8,14,17,18
+  --variants 8,18,19,20
 
 popcorn submit \
   --leaderboard cholesky \

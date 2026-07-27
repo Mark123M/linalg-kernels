@@ -100,8 +100,9 @@ The profile-driven implementation treats those halves as four explicit
 The sub4 solve therefore uses 50,304 bytes of dynamic shared memory and the
 sub8 solve uses 51,328 bytes, down from the original 102,400-byte launch
 budget. The active-block register array has compile-time indices so ptxas can
-scalarize it; the normal resource check still rejects the specialization if
-it creates a local frame larger than eight bytes.
+scalarize it. A local frame is recorded but is not a static rejection
+criterion: the autotuner measures the compiled kernel, and NCU spill traffic
+determines whether a frame is costly in practice.
 
 ### FP32 trailing update
 
@@ -213,14 +214,20 @@ The extension exposes:
 
 Preparation opts each kernel into the smallest role-specific dynamic
 shared-memory budget used by the implementation (about 49--108 KiB), requests the
-maximum shared-memory carveout, queries compiled resources, and rejects a
-kernel with a local frame larger than eight bytes. There is no substitution
-if a variant spills or cannot launch.
+maximum shared-memory carveout, and queries compiled resources. A variant is
+rejected when it cannot be configured or launched, not merely because ptxas
+allocated a local frame. There is no substitution for a failing variant.
 
 Metadata records threads, registers, local memory, static and dynamic shared
 memory, per-kernel active-block estimates, scheduler, root mode, row-group
 width, arithmetic mode, inner tensor use, tile sizes, launch count, cluster
 size, node count, and TMEM columns.
+
+The build retains ptxas spill warnings. Static local bytes are diagnostic
+metadata rather than a performance verdict: acceptance is based on
+correctness and measured endpoint time, while follow-up NCU inspection uses
+executed local load/store traffic and its stall contribution when a winning
+candidate spills.
 
 Compilation targets only `sm_100a` and uses:
 
@@ -304,9 +311,10 @@ The previous variant-6 implementation passed the baseline autotune and
 produced the NCU evidence above. The register-block solve is a new,
 unvalidated source revision. Required evidence, in order:
 
-1. CUDA compilation reports zero disallowed local-memory frames;
+1. CUDA compilation reports resources and spill warnings for every variant;
 2. the public test submission passes through the library fallback;
 3. target benchmark row 7 passes for all eight variants in every tuning
    round;
 4. the promoted winner is reprofiled, checking solve allocation, occupancy,
-   shared-load conflicts, short-scoreboard stalls, and elapsed time.
+   shared-load conflicts, short-scoreboard stalls, executed local-memory
+   traffic, and elapsed time.

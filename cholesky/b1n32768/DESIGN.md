@@ -592,11 +592,13 @@ means; every DESIGN entry labels direct measurements vs inferences.
 # DONE 2026-07-26: autotune --variants 12,13 (v13 promoted, 48.53 ms, +0.35 ms only)
 # DONE 2026-07-26: ncu --variants 13 (fused 234.8 us ~= separate sum; apply compute serializes)
 
-# 17. Inverse-GEMM apply vs the fused kernel:
-python3 cholesky/b1n32768/cholesky_b1n32768_runner.py autotune --variants 13,14 --rounds 3
+# DONE 2026-07-26: autotune --variants 13,14 (v14 promoted, 42.86 ms, 5.15x)
 
-# 18. If v14 wins, capture its split (factor share should dominate again):
+# 19. Capture the v14 split to size the next lever (factor chain expected dominant):
 python3 cholesky/b1n32768/cholesky_b1n32768_runner.py ncu --variants 14
+
+# 20. Refresh the board with v14 (~3% geomean over the 913708 submission):
+python3 cholesky/b1n32768/cholesky_b1n32768_runner.py submit --mode leaderboard
 
 # Sandbox-safe checks:
 python3 -m py_compile cholesky/b1n32768/cholesky_b1n32768.py
@@ -626,3 +628,4 @@ Benchmark-mode history for the target row (not leaderboard geomeans):
 | 2026-07-26 | 11 | 62.13 ms |
 | 2026-07-26 | 12 | 48.32 ms (promoted, 3-round median) |
 | 2026-07-26 | 13 | 48.53 ms (promoted, 3-round median; v12 48.85 ms same sweep) |
+| 2026-07-26 | 14 | 42.86 ms (promoted, 3-round median; v13 48.59 ms same sweep - the inverse-GEMM apply bought 5.7 ms) |

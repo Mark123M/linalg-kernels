@@ -1398,19 +1398,13 @@ void configure_dynamic(Kernel kernel, int dynamic_bytes) {
 }
 
 template <typename Kernel>
-cudaFuncAttributes checked_attributes(
-    Kernel kernel, int variant, const char* role) {
+cudaFuncAttributes checked_attributes(Kernel kernel) {
   cudaFuncAttributes attributes{};
   const cudaError_t status =
       cudaFuncGetAttributes(&attributes, kernel);
   TORCH_CHECK(
       status == cudaSuccess,
       "kernel resource query failed: ", cudaGetErrorString(status));
-  TORCH_CHECK(
-      attributes.localSizeBytes <= 8,
-      "variant ", variant, " ", role, " kernel uses ",
-      attributes.localSizeBytes,
-      " local bytes; spill-heavy variants are rejected");
   return attributes;
 }
 
@@ -1419,7 +1413,7 @@ void configure_one() {
   using V = Variant<Id>;
   if constexpr (V::scheduler == kDagScheduler) {
     configure_dynamic(cluster_dag_kernel, kClusterBytes);
-    checked_attributes(cluster_dag_kernel, Id, "cluster");
+    checked_attributes(cluster_dag_kernel);
   } else {
     auto factor =
         factor_kernel<V::root, V::width, V::tensor_inner, V::threads>;
@@ -1428,15 +1422,15 @@ void configure_one() {
         factor,
         V::tensor_inner ? kFactorTensorBytes : kFactorPlainBytes);
     configure_dynamic(solve, solve_bytes<V::width>());
-    checked_attributes(factor, Id, "factor");
-    checked_attributes(solve, Id, "solve");
+    checked_attributes(factor);
+    checked_attributes(solve);
     if constexpr (V::update == kFp32Update) {
       configure_dynamic(fp32_update_kernel, kFp32UpdateBytes);
-      checked_attributes(fp32_update_kernel, Id, "update");
+      checked_attributes(fp32_update_kernel);
     } else if constexpr (V::update == kTcUpdate) {
       auto update = tc_update_kernel<V::threads>;
       configure_dynamic(update, kTcUpdateBytes);
-      checked_attributes(update, Id, "update");
+      checked_attributes(update);
     }
   }
 }
@@ -1619,7 +1613,7 @@ void write_metadata(int64_t* rows) {
   int update_active = 0;
   if constexpr (V::scheduler == kDagScheduler) {
     configure_dynamic(cluster_dag_kernel, kClusterBytes);
-    factor = checked_attributes(cluster_dag_kernel, Id, "cluster");
+    factor = checked_attributes(cluster_dag_kernel);
     factor_active = active_blocks(
         cluster_dag_kernel, V::threads, kClusterBytes);
   } else {
@@ -1632,9 +1626,8 @@ void write_metadata(int64_t* rows) {
     configure_dynamic(factor_kernel_pointer, factor_bytes);
     configure_dynamic(
         solve_kernel_pointer, solve_bytes<V::width>());
-    factor = checked_attributes(
-        factor_kernel_pointer, Id, "factor");
-    solve = checked_attributes(solve_kernel_pointer, Id, "solve");
+    factor = checked_attributes(factor_kernel_pointer);
+    solve = checked_attributes(solve_kernel_pointer);
     factor_active =
         active_blocks(
             factor_kernel_pointer, V::threads, factor_bytes);
@@ -1644,16 +1637,14 @@ void write_metadata(int64_t* rows) {
             solve_bytes<V::width>());
     if constexpr (V::update == kFp32Update) {
       configure_dynamic(fp32_update_kernel, kFp32UpdateBytes);
-      update = checked_attributes(
-          fp32_update_kernel, Id, "update");
+      update = checked_attributes(fp32_update_kernel);
       update_active = active_blocks(
           fp32_update_kernel, 256, kFp32UpdateBytes);
     } else if constexpr (V::update == kTcUpdate) {
       auto update_kernel_pointer =
           tc_update_kernel<V::threads>;
       configure_dynamic(update_kernel_pointer, kTcUpdateBytes);
-      update = checked_attributes(
-          update_kernel_pointer, Id, "update");
+      update = checked_attributes(update_kernel_pointer);
       update_active =
           active_blocks(
               update_kernel_pointer, V::threads, kTcUpdateBytes);

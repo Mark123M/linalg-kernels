@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The autotuner may replace this exact line in retained candidate copies.
-_DEFAULT_VARIANT = 8  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 20  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "p64_raw_scalar_m4x4_t256",
     "p64_nr_scalar_m4x4_t256",
@@ -29,6 +29,8 @@ _VARIANT_NAMES = (
     "p64_precise_scalar_left_product_warp2_m2x4_t256_occ4",
     "p64_raw_scalar_left_shared_warp2_m4x4_t256_occ4",
     "p64_raw_scalar_preload_warp2_m4x4_t256_occ5",
+    "staged_p128_precise_sub4_cublas_fp32_t256",
+    "staged_p128_precise_sub4_cublas_tf32_t256",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -75,6 +77,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 _CUDA_SOURCE = r"""
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContextLight.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
@@ -85,9 +89,24 @@ namespace {
 
 constexpr int kBatch = 640;
 constexpr int kN = 512;
-constexpr int kVariantCount = 19;
+constexpr int kVariantCount = 21;
 constexpr int kMetadataColumns = 15;
 constexpr int kTmemDp = 1 << 16;
+constexpr int kStageOuter = 128;
+constexpr int kStageMicro = 64;
+constexpr int kStagePanelCount = 4;
+constexpr int kStageMicroCount = 8;
+constexpr int kStageWidth = 4;
+constexpr int kStageFactorBytes =
+    static_cast<int>(sizeof(float)) *
+    (kStageOuter * (kStageOuter + 1) + kStageOuter);
+constexpr int kStageSolveBytes =
+    static_cast<int>(sizeof(float)) *
+    (32 * (kStageOuter + 1) +
+     kStageMicro * (kStageOuter + kStageWidth));
+constexpr int kStageLaunchCount = 12;
+static_assert(kStageFactorBytes == 66560);
+static_assert(kStageSolveBytes == 50304);
 
 constexpr int kPreciseRoot = 0;
 constexpr int kNewtonRoot = 1;
@@ -99,10 +118,13 @@ constexpr int kBlock8Solve = 3;
 constexpr int kFp32Update = 0;
 constexpr int kTensorUpdate = 1;
 constexpr int kFp32PreloadUpdate = 2;
+constexpr int kBlasFp32Update = 3;
+constexpr int kBlasTf32Update = 4;
 constexpr int kRightSchedule = 0;
 constexpr int kLeftSchedule = 1;
 constexpr int kProductLeftSchedule = 2;
 constexpr int kSharedLeftSchedule = 3;
+constexpr int kStagedSchedule = 4;
 constexpr int kRecursiveFactor = 0;
 constexpr int kWarp2Factor = 1;
 
@@ -162,6 +184,10 @@ SPEC(17, 64, 256, kRawRoot, kScalarSolve, kFp32Update, 4, 0,
      kSharedLeftSchedule, kWarp2Factor);
 SPEC(18, 64, 256, kRawRoot, kScalarSolve, kFp32PreloadUpdate, 5, 0,
      kRightSchedule, kWarp2Factor);
+SPEC(19, 128, 256, kPreciseRoot, kSub4Solve, kBlasFp32Update, 1, 0,
+     kStagedSchedule, kRecursiveFactor);
+SPEC(20, 128, 256, kPreciseRoot, kSub4Solve, kBlasTf32Update, 1, 0,
+     kStagedSchedule, kRecursiveFactor);
 
 #undef SPEC
 
@@ -1297,6 +1323,453 @@ __device__ __forceinline__ void left_shared_current_tile(
   __syncthreads();
 }
 
+__device__ __forceinline__ float& stage_tile_at(
+    float* tile, int row, int column) {
+  return tile[row * (kStageOuter + 1) + column];
+}
+
+template <int RootMode>
+__device__ __forceinline__ void stage_potf2_32(
+    float* tile, float* inverse_diagonal, int begin) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  if (warp == 0) {
+#pragma unroll 1
+    for (int local_column = 0;
+         local_column < 32; ++local_column) {
+      const int column = begin + local_column;
+      float inverse = 0.0f;
+      if (lane == local_column) {
+        float diagonal;
+        root_pair<RootMode>(
+            stage_tile_at(tile, column, column),
+            diagonal, inverse);
+        stage_tile_at(tile, column, column) = diagonal;
+        inverse_diagonal[column] = inverse;
+      }
+      inverse = __shfl_sync(
+          0xffffffffu, inverse, local_column);
+      if (lane > local_column) {
+        const int row = begin + lane;
+        stage_tile_at(tile, row, column) *= inverse;
+      }
+      __syncwarp();
+      if (lane > local_column) {
+        const int row = begin + lane;
+        const float left =
+            stage_tile_at(tile, row, column);
+#pragma unroll 4
+        for (int target_local = local_column + 1;
+             target_local <= lane; ++target_local) {
+          const int target = begin + target_local;
+          stage_tile_at(tile, row, target) = fmaf(
+              -left,
+              stage_tile_at(tile, target, column),
+              stage_tile_at(tile, row, target));
+        }
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+}
+
+template <int Rows, int Columns>
+__device__ __forceinline__ void stage_local_trsm(
+    float* tile, const float* inverse_diagonal,
+    int row_begin, int column_begin) {
+  const int lane =
+      static_cast<int>(threadIdx.x) & (kStageWidth - 1);
+  const int row_index =
+      static_cast<int>(threadIdx.x) / kStageWidth;
+  if (row_index < Rows) {
+    const int row = row_begin + row_index;
+#pragma unroll 1
+    for (int local_column = 0;
+         local_column < Columns; ++local_column) {
+      const int column = column_begin + local_column;
+      float partial = 0.0f;
+#pragma unroll 4
+      for (int k = lane;
+           k < local_column; k += kStageWidth) {
+        partial = fmaf(
+            stage_tile_at(
+                tile, row, column_begin + k),
+            stage_tile_at(
+                tile, column, column_begin + k),
+            partial);
+      }
+#pragma unroll
+      for (int offset = kStageWidth / 2;
+           offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(
+            0xffffffffu, partial, offset, kStageWidth);
+      }
+      if (lane == 0) {
+        stage_tile_at(tile, row, column) =
+            (stage_tile_at(tile, row, column) - partial) *
+            inverse_diagonal[column];
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+}
+
+template <int Size, int K>
+__device__ __forceinline__ void stage_local_update(
+    float* tile, int target, int panel) {
+  constexpr int kElements = Size * Size;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kElements;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Size;
+    const int column = linear % Size;
+    if (column <= row) {
+      float value =
+          stage_tile_at(tile, target + row, target + column);
+#pragma unroll 4
+      for (int k = 0; k < K; ++k) {
+        value = fmaf(
+            -stage_tile_at(tile, target + row, panel + k),
+            stage_tile_at(tile, target + column, panel + k),
+            value);
+      }
+      stage_tile_at(
+          tile, target + row, target + column) = value;
+    }
+  }
+  __syncthreads();
+}
+
+template <int RootMode>
+__device__ __forceinline__ void stage_factor_local(
+    float* tile, float* inverse_diagonal) {
+  stage_potf2_32<RootMode>(
+      tile, inverse_diagonal, 0);
+  stage_local_trsm<32, 32>(
+      tile, inverse_diagonal, 32, 0);
+  stage_local_update<32, 32>(tile, 32, 0);
+  stage_potf2_32<RootMode>(
+      tile, inverse_diagonal, 32);
+  stage_local_trsm<64, 64>(
+      tile, inverse_diagonal, 64, 0);
+  stage_local_update<64, 64>(tile, 64, 0);
+  stage_potf2_32<RootMode>(
+      tile, inverse_diagonal, 64);
+  stage_local_trsm<32, 32>(
+      tile, inverse_diagonal, 96, 64);
+  stage_local_update<32, 32>(tile, 96, 64);
+  stage_potf2_32<RootMode>(
+      tile, inverse_diagonal, 96);
+}
+
+template <int RootMode>
+__device__ __forceinline__ void stage_factor_global(
+    float* matrix, int begin, float* work) {
+  float* tile = work;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kStageOuter * kStageOuter;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kStageOuter;
+    const int column = linear % kStageOuter;
+    stage_tile_at(tile, row, column) =
+        column <= row
+            ? load_global(
+                  matrix + (begin + row) * kN +
+                  begin + column)
+            : 0.0f;
+  }
+  __syncthreads();
+  float* inverse_diagonal =
+      tile + kStageOuter * (kStageOuter + 1);
+  stage_factor_local<RootMode>(
+      tile, inverse_diagonal);
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kStageOuter * kStageOuter;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kStageOuter;
+    const int column = linear % kStageOuter;
+    if (column <= row) {
+      store_global(
+          matrix + (begin + row) * kN +
+          begin + column,
+          stage_tile_at(tile, row, column));
+    }
+  }
+}
+
+template <int Block, int LocalColumn, int RegisterCount>
+__device__ __forceinline__ void stage_trsm_column(
+    float (&values)[RegisterCount],
+    const float* diagonal, const float* panel,
+    int row, int lane) {
+  constexpr int kDiagonalLd = kStageOuter + 1;
+  constexpr int kPanelLd = kStageOuter + kStageWidth;
+  constexpr int kBlockBegin = Block * 32;
+  constexpr int kColumn = kBlockBegin + LocalColumn;
+  constexpr int kOwner =
+      LocalColumn & (kStageWidth - 1);
+  constexpr int kOwnerSlot =
+      LocalColumn / kStageWidth;
+  static_assert(RegisterCount == 32 / kStageWidth);
+  float partial = 0.0f;
+#pragma unroll 4
+  for (int k = lane; k < kBlockBegin;
+       k += kStageWidth) {
+    partial = fmaf(
+        panel[row * kPanelLd + k],
+        diagonal[LocalColumn * kDiagonalLd + k],
+        partial);
+  }
+#pragma unroll
+  for (int slot = 0; slot < RegisterCount; ++slot) {
+    const int local_k =
+        lane + slot * kStageWidth;
+    if (local_k < LocalColumn) {
+      partial = fmaf(
+          values[slot],
+          diagonal[
+              LocalColumn * kDiagonalLd +
+              kBlockBegin + local_k],
+          partial);
+    }
+  }
+#pragma unroll
+  for (int offset = kStageWidth / 2;
+       offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(
+        0xffffffffu, partial, offset, kStageWidth);
+  }
+  const float owned_rhs = values[kOwnerSlot];
+  const float rhs = __shfl_sync(
+      0xffffffffu, owned_rhs, kOwner, kStageWidth);
+  float solved = 0.0f;
+  if (lane == 0) {
+    solved =
+        (rhs - partial) /
+        diagonal[LocalColumn * kDiagonalLd + kColumn];
+  }
+  solved = __shfl_sync(
+      0xffffffffu, solved, 0, kStageWidth);
+  if (lane == kOwner) {
+    values[kOwnerSlot] = solved;
+  }
+}
+
+template <int Block>
+__device__ __forceinline__ void stage_trsm_block(
+    float* matrix, int panel_begin,
+    float* diagonal, float* panel) {
+  constexpr int kDiagonalLd = kStageOuter + 1;
+  constexpr int kPanelLd = kStageOuter + kStageWidth;
+  constexpr int kBlockBegin = Block * 32;
+  constexpr int kRegisterCount = 32 / kStageWidth;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < 32 * kStageOuter;
+       linear += static_cast<int>(blockDim.x)) {
+    const int local_row = linear / kStageOuter;
+    const int column = linear % kStageOuter;
+    const int matrix_row = kBlockBegin + local_row;
+    diagonal[local_row * kDiagonalLd + column] =
+        column <= matrix_row
+            ? load_global(
+                  matrix +
+                  (panel_begin + matrix_row) * kN +
+                  panel_begin + column)
+            : 0.0f;
+  }
+  __syncthreads();
+  const int lane =
+      static_cast<int>(threadIdx.x) & (kStageWidth - 1);
+  const int row =
+      static_cast<int>(threadIdx.x) / kStageWidth;
+  if (row < kStageMicro) {
+    float values[kRegisterCount];
+#pragma unroll
+    for (int slot = 0;
+         slot < kRegisterCount; ++slot) {
+      values[slot] = panel[
+          row * kPanelLd + kBlockBegin +
+          lane + slot * kStageWidth];
+    }
+#define STAGE_TRSM_COLUMN(COLUMN)                              \
+    stage_trsm_column<Block, COLUMN>(                          \
+        values, diagonal, panel, row, lane)
+    STAGE_TRSM_COLUMN(0);
+    STAGE_TRSM_COLUMN(1);
+    STAGE_TRSM_COLUMN(2);
+    STAGE_TRSM_COLUMN(3);
+    STAGE_TRSM_COLUMN(4);
+    STAGE_TRSM_COLUMN(5);
+    STAGE_TRSM_COLUMN(6);
+    STAGE_TRSM_COLUMN(7);
+    STAGE_TRSM_COLUMN(8);
+    STAGE_TRSM_COLUMN(9);
+    STAGE_TRSM_COLUMN(10);
+    STAGE_TRSM_COLUMN(11);
+    STAGE_TRSM_COLUMN(12);
+    STAGE_TRSM_COLUMN(13);
+    STAGE_TRSM_COLUMN(14);
+    STAGE_TRSM_COLUMN(15);
+    STAGE_TRSM_COLUMN(16);
+    STAGE_TRSM_COLUMN(17);
+    STAGE_TRSM_COLUMN(18);
+    STAGE_TRSM_COLUMN(19);
+    STAGE_TRSM_COLUMN(20);
+    STAGE_TRSM_COLUMN(21);
+    STAGE_TRSM_COLUMN(22);
+    STAGE_TRSM_COLUMN(23);
+    STAGE_TRSM_COLUMN(24);
+    STAGE_TRSM_COLUMN(25);
+    STAGE_TRSM_COLUMN(26);
+    STAGE_TRSM_COLUMN(27);
+    STAGE_TRSM_COLUMN(28);
+    STAGE_TRSM_COLUMN(29);
+    STAGE_TRSM_COLUMN(30);
+    STAGE_TRSM_COLUMN(31);
+#undef STAGE_TRSM_COLUMN
+#pragma unroll
+    for (int slot = 0;
+         slot < kRegisterCount; ++slot) {
+      panel[
+          row * kPanelLd + kBlockBegin +
+          lane + slot * kStageWidth] = values[slot];
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void stage_trsm_global(
+    float* matrix, int row_begin,
+    int panel_begin, float* work) {
+  constexpr int kDiagonalLd = kStageOuter + 1;
+  constexpr int kPanelLd = kStageOuter + kStageWidth;
+  float* diagonal = work;
+  float* panel = diagonal + 32 * kDiagonalLd;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kStageMicro * kStageOuter;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kStageOuter;
+    const int column = linear % kStageOuter;
+    panel[row * kPanelLd + column] = load_global(
+        matrix + (row_begin + row) * kN +
+        panel_begin + column);
+  }
+  stage_trsm_block<0>(
+      matrix, panel_begin, diagonal, panel);
+  stage_trsm_block<1>(
+      matrix, panel_begin, diagonal, panel);
+  stage_trsm_block<2>(
+      matrix, panel_begin, diagonal, panel);
+  stage_trsm_block<3>(
+      matrix, panel_begin, diagonal, panel);
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kStageMicro * kStageOuter;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kStageOuter;
+    const int column = linear % kStageOuter;
+    store_global(
+        matrix + (row_begin + row) * kN +
+        panel_begin + column,
+        panel[row * kPanelLd + column]);
+  }
+}
+
+__global__ __launch_bounds__(256)
+void stage_copy_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output) {
+  constexpr int kCtasPerMatrix = 4;
+  constexpr int kVectors = kN * kN / 4;
+  const int matrix_index =
+      static_cast<int>(blockIdx.x) / kCtasPerMatrix;
+  const int rank =
+      static_cast<int>(blockIdx.x) % kCtasPerMatrix;
+  const int64_t base =
+      static_cast<int64_t>(matrix_index) * kN * kN;
+  for (int linear =
+           rank * static_cast<int>(blockDim.x) +
+           static_cast<int>(threadIdx.x);
+       linear < kVectors;
+       linear +=
+           kCtasPerMatrix * static_cast<int>(blockDim.x)) {
+    const int64_t offset = base + linear * 4;
+    *reinterpret_cast<float4*>(output + offset) =
+        *reinterpret_cast<const float4*>(input + offset);
+  }
+}
+
+__global__ __launch_bounds__(256)
+void stage_zero_upper_kernel(
+    float* __restrict__ output) {
+  constexpr int kCtasPerMatrix = 2;
+  constexpr int kVectorsPerRow = kN / 4;
+  constexpr int kVectors = kN * kVectorsPerRow;
+  const int matrix_index =
+      static_cast<int>(blockIdx.x) / kCtasPerMatrix;
+  const int rank =
+      static_cast<int>(blockIdx.x) % kCtasPerMatrix;
+  const int64_t base =
+      static_cast<int64_t>(matrix_index) * kN * kN;
+  for (int linear =
+           rank * static_cast<int>(blockDim.x) +
+           static_cast<int>(threadIdx.x);
+       linear < kVectors;
+       linear +=
+           kCtasPerMatrix * static_cast<int>(blockDim.x)) {
+    const int row = linear / kVectorsPerRow;
+    const int column =
+        (linear % kVectorsPerRow) * 4;
+    float* destination =
+        output + base + row * kN + column;
+    if (column > row) {
+      *reinterpret_cast<float4*>(destination) =
+          make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (column + 3 > row) {
+#pragma unroll
+      for (int item = 0; item < 4; ++item) {
+        if (column + item > row) {
+          destination[item] = 0.0f;
+        }
+      }
+    }
+  }
+}
+
+template <int RootMode>
+__global__ __launch_bounds__(256)
+void stage_factor_kernel(
+    float* __restrict__ output, int panel) {
+  extern __shared__ __align__(128)
+      unsigned char dynamic_bytes[];
+  const int matrix_index = static_cast<int>(blockIdx.x);
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  stage_factor_global<RootMode>(
+      matrix, panel * kStageOuter,
+      reinterpret_cast<float*>(dynamic_bytes));
+}
+
+__global__ __launch_bounds__(256)
+void stage_solve_kernel(
+    float* __restrict__ output,
+    int panel, int remaining) {
+  extern __shared__ __align__(128)
+      unsigned char dynamic_bytes[];
+  const int matrix_index =
+      static_cast<int>(blockIdx.x) / remaining;
+  const int row_index =
+      static_cast<int>(blockIdx.x) % remaining;
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  stage_trsm_global(
+      matrix,
+      (panel * 2 + 2 + row_index) * kStageMicro,
+      panel * kStageOuter,
+      reinterpret_cast<float*>(dynamic_bytes));
+}
+
 template <int Threads>
 __device__ __forceinline__ void pack_panel_tf32(
     uint32_t* packed, const float* matrix,
@@ -1654,47 +2127,232 @@ cudaFuncAttributes attributes_for(Kernel kernel) {
   return attributes;
 }
 
-template <int Id>
-void configure_one() {
-  using V = Variant<Id>;
-  auto kernel = fused_potrf_kernel<
-      V::tile, V::threads, V::root, V::solve,
-      V::update, V::minimum_blocks, V::schedule, V::factor>;
-  prefer_shared(kernel);
-  constexpr int kDynamicSharedBytes =
-      dynamic_shared_bytes<Id>();
-  if constexpr (kDynamicSharedBytes != 0) {
-    const cudaError_t status = cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        kDynamicSharedBytes);
-    TORCH_CHECK(
-        status == cudaSuccess,
-        "dynamic shared-memory opt-in failed for variant ",
-        Id, ": ", cudaGetErrorString(status));
+void check_cublas(
+    cublasStatus_t status, const char* role) {
+  TORCH_CHECK(
+      status == CUBLAS_STATUS_SUCCESS,
+      role, " failed with cuBLAS status ",
+      static_cast<int>(status));
+}
+
+class CublasFastState {
+ public:
+  explicit CublasFastState(cublasHandle_t handle)
+      : handle_(handle) {
+    check_cublas(
+        cublasGetMathMode(handle_, &math_mode_),
+        "query cuBLAS math mode");
+    check_cublas(
+        cublasGetAtomicsMode(handle_, &atomics_mode_),
+        "query cuBLAS atomics mode");
+    check_cublas(
+        cublasGetPointerMode(handle_, &pointer_mode_),
+        "query cuBLAS pointer mode");
+    check_cublas(
+        cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH),
+        "enable default high-performance cuBLAS math");
+    check_cublas(
+        cublasSetAtomicsMode(
+            handle_, CUBLAS_ATOMICS_ALLOWED),
+        "enable cuBLAS atomic algorithms");
+    check_cublas(
+        cublasSetPointerMode(
+            handle_, CUBLAS_POINTER_MODE_HOST),
+        "select host cuBLAS scalars");
   }
+
+  ~CublasFastState() {
+    cublasSetPointerMode(handle_, pointer_mode_);
+    cublasSetAtomicsMode(handle_, atomics_mode_);
+    cublasSetMathMode(handle_, math_mode_);
+  }
+
+  CublasFastState(const CublasFastState&) = delete;
+  CublasFastState& operator=(
+      const CublasFastState&) = delete;
+
+ private:
+  cublasHandle_t handle_;
+  cublasMath_t math_mode_{};
+  cublasAtomicsMode_t atomics_mode_{};
+  cublasPointerMode_t pointer_mode_{};
+};
+
+void launch_stage_copy(
+    const float* input, float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(kBatch * 4, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &config, stage_copy_kernel, input, output);
+}
+
+void launch_stage_zero(float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(kBatch * 2, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &config, stage_zero_upper_kernel, output);
+}
+
+void launch_stage_blas_update(
+    cublasHandle_t handle, float* output,
+    int panel, bool fast_tf32) {
+  const int begin = (panel + 1) * kStageOuter;
+  const int remaining = kN - begin;
+  const int panel_begin = panel * kStageOuter;
+  float* panel_pointer =
+      output + begin * kN + panel_begin;
+  float* destination =
+      output + begin * kN + begin;
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+  constexpr long long kStride =
+      static_cast<long long>(kN) * kN;
+  check_cublas(
+      cublasGemmStridedBatchedEx(
+          handle,
+          CUBLAS_OP_T, CUBLAS_OP_N,
+          remaining, remaining, kStageOuter,
+          &alpha,
+          panel_pointer, CUDA_R_32F, kN, kStride,
+          panel_pointer, CUDA_R_32F, kN, kStride,
+          &beta,
+          destination, CUDA_R_32F, kN, kStride,
+          kBatch,
+          fast_tf32
+              ? CUBLAS_COMPUTE_32F_FAST_TF32
+              : CUBLAS_COMPUTE_32F,
+          CUBLAS_GEMM_DEFAULT),
+      "staged batched trailing GEMM");
+}
+
+template <int Id>
+void launch_staged(
+    const float* input, float* output) {
+  using V = Variant<Id>;
+  static_assert(V::schedule == kStagedSchedule);
+  static_assert(
+      V::update == kBlasFp32Update ||
+      V::update == kBlasTf32Update);
+  cublasHandle_t handle =
+      at::cuda::getCurrentCUDABlasHandle();
+  CublasFastState fast_state(handle);
+  launch_stage_copy(input, output);
+  for (int panel = 0;
+       panel < kStagePanelCount; ++panel) {
+    cudaLaunchConfig_t factor_config{};
+    factor_config.gridDim = dim3(kBatch, 1, 1);
+    factor_config.blockDim = dim3(256, 1, 1);
+    factor_config.dynamicSmemBytes =
+        kStageFactorBytes;
+    cudaLaunchKernelEx(
+        &factor_config,
+        stage_factor_kernel<V::root>,
+        output, panel);
+
+    const int remaining =
+        kStageMicroCount - panel * 2 - 2;
+    if (remaining == 0) {
+      continue;
+    }
+    cudaLaunchConfig_t solve_config{};
+    solve_config.gridDim =
+        dim3(kBatch * remaining, 1, 1);
+    solve_config.blockDim = dim3(256, 1, 1);
+    solve_config.dynamicSmemBytes =
+        kStageSolveBytes;
+    cudaLaunchKernelEx(
+        &solve_config, stage_solve_kernel,
+        output, panel, remaining);
+    launch_stage_blas_update(
+        handle, output, panel,
+        V::update == kBlasTf32Update);
+  }
+  launch_stage_zero(output);
+}
+
+template <typename Kernel>
+cudaFuncAttributes configure_stage_kernel(
+    Kernel kernel, int dynamic_bytes,
+    int variant, const char* role) {
+  prefer_shared(kernel);
+  const cudaError_t status = cudaFuncSetAttribute(
+      kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      dynamic_bytes);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "dynamic shared-memory opt-in failed for variant ",
+      variant, " ", role, ": ",
+      cudaGetErrorString(status));
   const cudaFuncAttributes attributes =
       attributes_for(kernel);
   TORCH_CHECK(
       attributes.localSizeBytes <= 8,
-      "variant ", Id, " kernel uses ",
+      "variant ", variant, " ", role, " uses ",
       attributes.localSizeBytes,
       " local bytes, above the accepted 8-byte frame");
+  return attributes;
+}
+
+template <int Id>
+void configure_one() {
+  using V = Variant<Id>;
+  if constexpr (V::schedule == kStagedSchedule) {
+    configure_stage_kernel(
+        stage_factor_kernel<V::root>,
+        kStageFactorBytes, Id, "factor");
+    configure_stage_kernel(
+        stage_solve_kernel,
+        kStageSolveBytes, Id, "solve");
+  } else {
+    auto kernel = fused_potrf_kernel<
+        V::tile, V::threads, V::root, V::solve,
+        V::update, V::minimum_blocks,
+        V::schedule, V::factor>;
+    prefer_shared(kernel);
+    constexpr int kDynamicSharedBytes =
+        dynamic_shared_bytes<Id>();
+    if constexpr (kDynamicSharedBytes != 0) {
+      const cudaError_t status = cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          kDynamicSharedBytes);
+      TORCH_CHECK(
+          status == cudaSuccess,
+          "dynamic shared-memory opt-in failed for variant ",
+          Id, ": ", cudaGetErrorString(status));
+    }
+    const cudaFuncAttributes attributes =
+        attributes_for(kernel);
+    TORCH_CHECK(
+        attributes.localSizeBytes <= 8,
+        "variant ", Id, " kernel uses ",
+        attributes.localSizeBytes,
+        " local bytes, above the accepted 8-byte frame");
+  }
 }
 
 template <int Id>
 void launch_one(const float* input, float* output) {
   using V = Variant<Id>;
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(kBatch, 1, 1);
-  config.blockDim = dim3(V::threads, 1, 1);
-  config.dynamicSmemBytes = dynamic_shared_bytes<Id>();
-  cudaLaunchKernelEx(
-      &config,
-      fused_potrf_kernel<
-          V::tile, V::threads, V::root, V::solve,
-          V::update, V::minimum_blocks, V::schedule, V::factor>,
-      input, output);
+  if constexpr (V::schedule == kStagedSchedule) {
+    launch_staged<Id>(input, output);
+  } else {
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kBatch, 1, 1);
+    config.blockDim = dim3(V::threads, 1, 1);
+    config.dynamicSmemBytes =
+        dynamic_shared_bytes<Id>();
+    cudaLaunchKernelEx(
+        &config,
+        fused_potrf_kernel<
+            V::tile, V::threads, V::root, V::solve,
+            V::update, V::minimum_blocks,
+            V::schedule, V::factor>,
+        input, output);
+  }
 }
 
 void configure_variant(int variant) {
@@ -1718,8 +2376,10 @@ void configure_variant(int variant) {
     case 16: configure_one<16>(); break;
     case 17: configure_one<17>(); break;
     case 18: configure_one<18>(); break;
+    case 19: configure_one<19>(); break;
+    case 20: configure_one<20>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 18]");
+      TORCH_CHECK(false, "native variant must be in [0, 20]");
   }
 }
 
@@ -1745,18 +2405,45 @@ void launch_variant(
     case 16: launch_one<16>(input, output); break;
     case 17: launch_one<17>(input, output); break;
     case 18: launch_one<18>(input, output); break;
+    case 19: launch_one<19>(input, output); break;
+    case 20: launch_one<20>(input, output); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 18]");
+      TORCH_CHECK(false, "native variant must be in [0, 20]");
   }
 }
 
 template <int Id>
 void write_metadata(int64_t* rows) {
   using V = Variant<Id>;
-  const cudaFuncAttributes attributes = attributes_for(
-      fused_potrf_kernel<
-          V::tile, V::threads, V::root, V::solve,
-          V::update, V::minimum_blocks, V::schedule, V::factor>);
+  cudaFuncAttributes attributes{};
+  int shared_bytes = 0;
+  int launch_count = 1;
+  if constexpr (V::schedule == kStagedSchedule) {
+    const cudaFuncAttributes factor = attributes_for(
+        stage_factor_kernel<V::root>);
+    const cudaFuncAttributes solve = attributes_for(
+        stage_solve_kernel);
+    attributes = factor.numRegs >= solve.numRegs
+        ? factor : solve;
+    attributes.localSizeBytes =
+        factor.localSizeBytes >= solve.localSizeBytes
+            ? factor.localSizeBytes
+            : solve.localSizeBytes;
+    shared_bytes =
+        kStageFactorBytes >= kStageSolveBytes
+            ? kStageFactorBytes
+            : kStageSolveBytes;
+    launch_count = kStageLaunchCount;
+  } else {
+    attributes = attributes_for(
+        fused_potrf_kernel<
+            V::tile, V::threads, V::root, V::solve,
+            V::update, V::minimum_blocks,
+            V::schedule, V::factor>);
+    shared_bytes =
+        attributes.sharedSizeBytes +
+        dynamic_shared_bytes<Id>();
+  }
   int64_t* row =
       rows + static_cast<int64_t>(Id) * kMetadataColumns;
   row[0] = Id;
@@ -1765,11 +2452,10 @@ void write_metadata(int64_t* rows) {
   row[3] = V::root;
   row[4] = V::solve;
   row[5] = attributes.numRegs;
-  row[6] = attributes.sharedSizeBytes +
-      dynamic_shared_bytes<Id>();
+  row[6] = shared_bytes;
   row[7] = attributes.localSizeBytes;
   row[8] = kBatch;
-  row[9] = 1;
+  row[9] = launch_count;
   row[10] = V::update;
   row[11] = V::minimum_blocks;
   row[12] = V::tmem_columns;
@@ -1782,7 +2468,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b640n512_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 18]");
+      "native variant must be in [0, 20]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -1794,7 +2480,7 @@ void cholesky_b640n512_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 18]");
+      "native variant must be in [0, 20]");
   c10::cuda::CUDAGuard device_guard(data.device());
   launch_variant(
       data.data_ptr<float>(),
@@ -1840,6 +2526,8 @@ at::Tensor cholesky_b640n512_metadata() {
   write_metadata<16>(rows);
   write_metadata<17>(rows);
   write_metadata<18>(rows);
+  write_metadata<19>(rows);
+  write_metadata<20>(rows);
   return result;
 }
 """
@@ -1875,6 +2563,7 @@ def _native_module():
                 "-gencode",
                 "arch=compute_100a,code=sm_100a",
             ],
+            extra_ldflags=["-lcublas"],
             verbose=False,
         )
     finally:
