@@ -497,3 +497,26 @@ popcorn submit \
   --output /tmp/cholesky-b640n512-result.json \
   cholesky/b640n512/cholesky_b640n512.py
 ```
+
+## Nsight Systems endpoint
+
+The shape-local Modal launcher profiles one warmed factorization on B200:
+
+```bash
+.venv/bin/python -m modal run cholesky/b640n512/cholesky_b640n512_modal.py
+# Optional comparison:
+.venv/bin/python -m modal run cholesky/b640n512/cholesky_b640n512_modal.py --variant 20
+```
+
+`--variant -1` selects the tracked default, currently variant 20. Its staged
+128-column cuBLAS-TF32 schedule has 12 algorithm launches per factorization.
+Input generation, extension compilation, preparation, warmup, and correctness
+validation are outside the capture; the NVTX range contains exactly one
+out-parameter factorization.
+
+Artifacts are downloaded under `artifacts/nsys/`. `profile.nsys-rep` is the
+forward-compatible UI/VeloQ input, `kernel-trace.csv` is the ordered GPU
+timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
+and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
+export, human-readable statistics, command, profiler version, environment,
+preflight, stdout, and stderr are retained with the report.

@@ -222,54 +222,60 @@ __device__ __forceinline__ const float& tile_at(
 }
 
 // Eight-column redundant-corner factorization. Four threads share
-// each row solve and split its rank-8 trailing update.
+// each row solve and split its rank-8 trailing update. The corner and
+// inverse use the later inverse-build scratch to avoid per-thread copies.
 template <int Micro>
 __device__ __forceinline__ void factor_wide(
     float* __restrict__ tile,
     float* __restrict__ inverse_diagonal,
-    float* __restrict__ panel) {
+    float* __restrict__ panel,
+    float* __restrict__ corner_scratch) {
   constexpr int kGroup = 8;
   const int thread = static_cast<int>(threadIdx.x);
   const int row_index = thread >> 2;
   const int quarter = thread & 3;
+  float* inverse_scratch = corner_scratch + kGroup * kGroup;
 #pragma unroll 1
   for (int base = 0; base < Micro; base += kGroup) {
-    float corner[kGroup][kGroup];
-    float inverse[kGroup];
+    if (thread < kGroup) {
 #pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
-#pragma unroll
-      for (int j = 0; j <= i; ++j) {
-        corner[i][j] = tile_at<Micro>(tile, base + i, base + j);
+      for (int i = thread; i < kGroup; ++i) {
+        corner_scratch[i * kGroup + thread] =
+            tile_at<Micro>(tile, base + i, base + thread);
       }
     }
+    __syncthreads();
+    if (thread == 0) {
 #pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      const float diagonal = __fsqrt_rn(corner[j][j]);
-      const float inv = __fdiv_rn(1.0f, diagonal);
-      corner[j][j] = diagonal;
-      inverse[j] = inv;
+      for (int j = 0; j < kGroup; ++j) {
+        const float diagonal =
+            __fsqrt_rn(corner_scratch[j * kGroup + j]);
+        const float inv = __fdiv_rn(1.0f, diagonal);
+        corner_scratch[j * kGroup + j] = diagonal;
+        inverse_scratch[j] = inv;
 #pragma unroll
-      for (int i = j + 1; i < kGroup; ++i) {
-        corner[i][j] *= inv;
-      }
+        for (int i = j + 1; i < kGroup; ++i) {
+          corner_scratch[i * kGroup + j] *= inv;
+        }
 #pragma unroll
-      for (int i = j + 1; i < kGroup; ++i) {
+        for (int i = j + 1; i < kGroup; ++i) {
 #pragma unroll
-        for (int target = j + 1; target <= i; ++target) {
-          corner[i][target] = fmaf(
-              -corner[i][j], corner[target][j], corner[i][target]);
+          for (int target = j + 1; target <= i; ++target) {
+            corner_scratch[i * kGroup + target] = fmaf(
+                -corner_scratch[i * kGroup + j],
+                corner_scratch[target * kGroup + j],
+                corner_scratch[i * kGroup + target]);
+          }
         }
       }
     }
+    __syncthreads();
+    if (thread < kGroup) {
+      inverse_diagonal[base + thread] = inverse_scratch[thread];
 #pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      if (thread == j) {
-        inverse_diagonal[base + j] = inverse[j];
-#pragma unroll
-        for (int i = j; i < kGroup; ++i) {
-          tile_at<Micro>(tile, base + i, base + j) = corner[i][j];
-        }
+      for (int i = thread; i < kGroup; ++i) {
+        tile_at<Micro>(tile, base + i, base + thread) =
+            corner_scratch[i * kGroup + thread];
       }
     }
     const int row = base + kGroup + row_index;
@@ -284,9 +290,10 @@ __device__ __forceinline__ void factor_wide(
         float value = solved[j];
 #pragma unroll
         for (int i = 0; i < j; ++i) {
-          value = fmaf(-solved[i], corner[j][i], value);
+          value = fmaf(
+              -solved[i], corner_scratch[j * kGroup + i], value);
         }
-        solved[j] = value * inverse[j];
+        solved[j] = value * inverse_scratch[j];
       }
       if (quarter == 0) {
 #pragma unroll
@@ -605,7 +612,7 @@ void factor_kernel(
             : 0.0f;
   }
   __syncthreads();
-  factor_wide<Micro>(tile, inverse_diagonal, panel);
+  factor_wide<Micro>(tile, inverse_diagonal, panel, mid);
   for (int linear = static_cast<int>(threadIdx.x);
        linear < Micro * Micro;
        linear += static_cast<int>(blockDim.x)) {
@@ -835,7 +842,7 @@ void fused_micro_kernel(
     if constexpr (Compact) {
       factor_compact<Micro>(tile, inverse_diagonal, panel);
     } else {
-      factor_wide<Micro>(tile, inverse_diagonal, panel);
+      factor_wide<Micro>(tile, inverse_diagonal, panel, mid);
     }
     for (int linear = static_cast<int>(threadIdx.x);
          linear < Micro * Micro;

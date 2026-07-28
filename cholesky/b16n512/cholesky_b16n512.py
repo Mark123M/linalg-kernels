@@ -12,7 +12,7 @@ _DEFAULT_VARIANT = 2  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "r16_micro4x4_precise_scalar_u256",
     "r16_micro4x4_nr_scalar_u256",
-    "r16_micro4x4_raw_scalar_u256",
+    "r16_micro4x4_raw_fused_u256",
     "r32_micro4x4_precise_scalar_u256",
     "r16_scalar_precise_scalar_u256",
     "r16_micro4x4_precise_sub4_u256",
@@ -438,6 +438,122 @@ void factor_kernel(float* __restrict__ output, int panel) {
   }
 }
 
+// Variant 2 fuses each diagonal factor with every row-tile solve. Each CTA
+// redundantly factors the 64x64 diagonal, avoiding an inter-kernel dependency
+// and reducing the production schedule from 23 launches to 16.
+template <int RootMode, int FactorMode>
+__global__ __launch_bounds__(128)
+void factor_solve_kernel(
+    float* __restrict__ output, int panel) {
+  __shared__ __align__(128) float tile[kTile * kLd];
+  __shared__ __align__(128) float rhs[kTile * kLd];
+  __shared__ float inverse_diagonal[kTile];
+
+  const int matrix_index = static_cast<int>(blockIdx.x);
+  const int local_row = static_cast<int>(blockIdx.y) + panel;
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  const int panel_begin = panel * kTile;
+  const int row_begin = local_row * kTile;
+  const bool is_factor = local_row == panel;
+
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kTile * kTile; linear += 128) {
+    const int row = linear / kTile;
+    const int column = linear % kTile;
+    tile_at(tile, row, column) =
+        column <= row
+            ? load_global(
+                  matrix + (panel_begin + row) * kN +
+                  panel_begin + column)
+            : 0.0f;
+  }
+  if (!is_factor) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      rhs[row * kLd + column] = load_global(
+          matrix + (row_begin + row) * kN +
+          panel_begin + column);
+    }
+  }
+  __syncthreads();
+
+  if constexpr (FactorMode == kRecursive16Factor) {
+    factor32_recursive16<RootMode>(
+        tile, inverse_diagonal, 0);
+  } else {
+    factor32<RootMode>(tile, inverse_diagonal, 0);
+  }
+  __syncthreads();
+  local_trsm_sub4<32, 32>(
+      tile, inverse_diagonal, 32, 0);
+  __syncthreads();
+  local_update32(tile, 32, 0);
+  __syncthreads();
+  if constexpr (FactorMode == kRecursive16Factor) {
+    factor32_recursive16<RootMode>(
+        tile, inverse_diagonal, 32);
+  } else {
+    factor32<RootMode>(tile, inverse_diagonal, 32);
+  }
+  __syncthreads();
+
+  if (is_factor) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      if (column <= row) {
+        store_global(
+            matrix + (panel_begin + row) * kN +
+            panel_begin + column,
+            tile_at(tile, row, column));
+      }
+    }
+  } else {
+    if (static_cast<int>(threadIdx.x) < kTile) {
+      const int column = static_cast<int>(threadIdx.x);
+      if constexpr (RootMode == kPreciseRoot) {
+        inverse_diagonal[column] = __fdiv_rn(
+            1.0f, tile[column * kLd + column]);
+      } else {
+        inverse_diagonal[column] = __fdividef(
+            1.0f, tile[column * kLd + column]);
+      }
+    }
+    __syncthreads();
+
+    if (static_cast<int>(threadIdx.x) < kTile) {
+      const int row = static_cast<int>(threadIdx.x);
+#pragma unroll 1
+      for (int column = 0; column < kTile; ++column) {
+        float value = rhs[row * kLd + column];
+#pragma unroll 4
+        for (int k = 0; k < column; ++k) {
+          value = fmaf(
+              -rhs[row * kLd + k],
+              tile[column * kLd + k], value);
+        }
+        rhs[row * kLd + column] =
+            value * inverse_diagonal[column];
+      }
+    }
+    __syncthreads();
+
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      store_global(
+          matrix + (row_begin + row) * kN +
+          panel_begin + column,
+          rhs[row * kLd + column]);
+    }
+  }
+}
+
 template <int SolveMode, int RootMode>
 __global__ void solve_kernel(
     float* __restrict__ output, int panel, int remaining) {
@@ -764,12 +880,19 @@ void reject_large_local_frame(
 template <int Id>
 void configure_one() {
   using V = Variant<Id>;
-  prefer_shared(factor_kernel<V::root, V::factor>);
-  prefer_shared(solve_kernel<V::solve, V::root>);
-  reject_large_local_frame(
-      factor_kernel<V::root, V::factor>, Id, "factor");
-  reject_large_local_frame(
-      solve_kernel<V::solve, V::root>, Id, "solve");
+  if constexpr (Id == 2) {
+    prefer_shared(factor_solve_kernel<V::root, V::factor>);
+    reject_large_local_frame(
+        factor_solve_kernel<V::root, V::factor>,
+        Id, "factor_solve");
+  } else {
+    prefer_shared(factor_kernel<V::root, V::factor>);
+    prefer_shared(solve_kernel<V::solve, V::root>);
+    reject_large_local_frame(
+        factor_kernel<V::root, V::factor>, Id, "factor");
+    reject_large_local_frame(
+        solve_kernel<V::solve, V::root>, Id, "solve");
+  }
   prefer_shared(
       fp32_update_kernel<V::update_threads, V::update>);
   reject_large_local_frame(
@@ -801,26 +924,40 @@ void launch_one(float* output, const float* input) {
   using V = Variant<Id>;
   launch_copy(input, output);
   for (int panel = 0; panel < kTileCount; ++panel) {
-    cudaLaunchConfig_t factor_config{};
-    factor_config.gridDim = dim3(kBatch, 1, 1);
-    factor_config.blockDim = dim3(128, 1, 1);
-    cudaLaunchKernelEx(
-        &factor_config, factor_kernel<V::root, V::factor>,
-        output, panel);
+    int trailing;
+    if constexpr (Id == 2) {
+      const int remaining = kTileCount - panel;
+      cudaLaunchConfig_t fuse_config{};
+      fuse_config.gridDim = dim3(kBatch, remaining, 1);
+      fuse_config.blockDim = dim3(128, 1, 1);
+      cudaLaunchKernelEx(
+          &fuse_config,
+          factor_solve_kernel<V::root, V::factor>,
+          output, panel);
+      trailing = remaining - 1;
+    } else {
+      cudaLaunchConfig_t factor_config{};
+      factor_config.gridDim = dim3(kBatch, 1, 1);
+      factor_config.blockDim = dim3(128, 1, 1);
+      cudaLaunchKernelEx(
+          &factor_config, factor_kernel<V::root, V::factor>,
+          output, panel);
 
-    const int remaining = kTileCount - panel - 1;
-    if (remaining == 0) {
+      trailing = kTileCount - panel - 1;
+      if (trailing > 0) {
+        cudaLaunchConfig_t solve_config{};
+        solve_config.gridDim = dim3(kBatch * trailing, 1, 1);
+        solve_config.blockDim = dim3(V::solve_threads, 1, 1);
+        cudaLaunchKernelEx(
+            &solve_config, solve_kernel<V::solve, V::root>,
+            output, panel, trailing);
+      }
+    }
+    if (trailing == 0) {
       continue;
     }
 
-    cudaLaunchConfig_t solve_config{};
-    solve_config.gridDim = dim3(kBatch * remaining, 1, 1);
-    solve_config.blockDim = dim3(V::solve_threads, 1, 1);
-    cudaLaunchKernelEx(
-        &solve_config, solve_kernel<V::solve, V::root>,
-        output, panel, remaining);
-
-    const int tasks = remaining * (remaining + 1) / 2;
+    const int tasks = trailing * (trailing + 1) / 2;
     cudaLaunchConfig_t update_config{};
     update_config.gridDim = dim3(kBatch * tasks, 1, 1);
     update_config.blockDim = dim3(V::update_threads, 1, 1);
@@ -863,10 +1000,16 @@ void launch_variant(
 template <int Id>
 void write_metadata(int64_t* rows) {
   using V = Variant<Id>;
-  const cudaFuncAttributes factor =
-      attributes_for(factor_kernel<V::root, V::factor>);
-  const cudaFuncAttributes solve =
-      attributes_for(solve_kernel<V::solve, V::root>);
+  cudaFuncAttributes factor{};
+  cudaFuncAttributes solve{};
+  if constexpr (Id == 2) {
+    factor =
+        attributes_for(factor_solve_kernel<V::root, V::factor>);
+    solve = factor;
+  } else {
+    factor = attributes_for(factor_kernel<V::root, V::factor>);
+    solve = attributes_for(solve_kernel<V::solve, V::root>);
+  }
   const cudaFuncAttributes update = attributes_for(
       fp32_update_kernel<V::update_threads, V::update>);
   int64_t* row =
@@ -889,7 +1032,7 @@ void write_metadata(int64_t* rows) {
   row[15] = V::solve;
   row[16] = V::factor;
   row[17] = kTile;
-  row[18] = 23;
+  row[18] = Id == 2 ? 16 : 23;
 }
 
 }  // namespace

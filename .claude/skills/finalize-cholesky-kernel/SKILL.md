@@ -1,6 +1,6 @@
 ---
 name: finalize-cholesky-kernel
-description: Finalizes the cholesky.py kernel for submission. Use when the user asks to update/finalize cholesky.py, consolidate cholesky kernels.
+description: Finalizes the cholesky.py kernel for submission. Use when the user asks to update/finalize cholesky.py, fold cholesky kernels.
 ---
 
 ## Instructions

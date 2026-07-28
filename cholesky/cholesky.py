@@ -24,10 +24,10 @@ submission:
                              TEMPORARILY DISABLED: this shape is routed to
                              torch. The extension is still built into this
                              file; only its dispatch entry is commented out.
-  (16, 512, 512)   b16n512   variant 2   r16_micro4x4_raw_scalar_u256
-                             staged 64x64 panel factorization across separate
-                             factor/solve/update launches with a 4x4
-                             micro-tiled FP32 update.
+  (16, 512, 512)   b16n512   variant 2   r16_micro4x4_raw_fused_u256
+                             staged 64x64 right-looking Cholesky with fused
+                             factor/solve launches and a 4x4 micro-tiled
+                             FP32 update.
   (640, 512, 512)  b640n512  variant 20  staged_p128_precise_sub4_cublas_tf32_t256
                              staged 128-column panels across separate
                              factor/solve launches, with one fast-TF32
@@ -1292,7 +1292,7 @@ def _module_b64n256():
 
 
 # ---------------------------------------------------------------------------
-# (16, 512, 512) - b16n512 variant 2
+# (16, 512, 512) - b16n512 variant 2, fused factor/solve
 # ---------------------------------------------------------------------------
 
 _CPP_SOURCE_B16N512 = r"""
@@ -1514,102 +1514,102 @@ void copy_lower_kernel(const float* __restrict__ input,
   }
 }
 
-// Stage 1: factor the 64x64 diagonal block of one panel.
-__global__ __launch_bounds__(kFactorThreads)
-void factor_kernel(float* __restrict__ output, int panel) {
+// Fused factor + solve: one grid covers the diagonal factorization and
+// every remaining row tile's triangular solve.  All blocks redundantly
+// factor the diagonal so they can proceed without inter-block sync.
+__global__ __launch_bounds__(128)
+void factor_solve_kernel(float* __restrict__ output, int panel) {
   __shared__ __align__(128) float tile[kTile * kLd];
+  __shared__ __align__(128) float rhs[kTile * kLd];
   __shared__ float inverse_diagonal[kTile];
-  const int matrix_index = static_cast<int>(blockIdx.x);
-  float* matrix = output + static_cast<int64_t>(matrix_index) * kN * kN;
-  const int begin = panel * kTile;
 
+  const int matrix_index = static_cast<int>(blockIdx.x);
+  const int local_row = static_cast<int>(blockIdx.y) + panel;
+  float* matrix = output + static_cast<int64_t>(matrix_index) * kN * kN;
+  const int panel_begin = panel * kTile;
+  const int row_begin = local_row * kTile;
+  const bool is_factor = (local_row == panel);
+
+  // Load diagonal block (all blocks).
   for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
+       linear < kTile * kTile; linear += 128) {
     const int row = linear / kTile;
     const int column = linear % kTile;
     tile_at(tile, row, column) =
         column <= row
-            ? load_global(matrix + (begin + row) * kN + begin + column)
+            ? load_global(matrix + (panel_begin + row) * kN +
+                          panel_begin + column)
             : 0.0f;
+  }
+
+  // Load the rhs panel (solve blocks only).
+  if (!is_factor) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      rhs[row * kLd + column] = load_global(
+          matrix + (row_begin + row) * kN + panel_begin + column);
+    }
   }
   __syncthreads();
 
+  // Factor the 64x64 diagonal (all blocks — redundant, but avoids
+  // inter-block synchronisation).
   factor32_recursive16(tile, inverse_diagonal, 0);
   __syncthreads();
-
   local_trsm_sub4<32, 32>(tile, inverse_diagonal, 32, 0);
   __syncthreads();
-
   local_update32(tile, 32, 0);
   __syncthreads();
-
   factor32_recursive16(tile, inverse_diagonal, 32);
   __syncthreads();
 
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int column = linear % kTile;
-    if (column <= row) {
-      store_global(matrix + (begin + row) * kN + begin + column,
-                   tile_at(tile, row, column));
-    }
-  }
-}
-
-// Stage 2: triangular solve of every remaining row tile against the panel.
-__global__ void solve_kernel(
-    float* __restrict__ output, int panel, int remaining) {
-  __shared__ __align__(128) float diagonal[kTile * kLd];
-  __shared__ __align__(128) float rhs[kTile * kLd];
-  __shared__ float inverse_diagonal[kTile];
-
-  const int matrix_index = static_cast<int>(blockIdx.x) / remaining;
-  const int row_tile = panel + 1 + static_cast<int>(blockIdx.x) % remaining;
-  float* matrix = output + static_cast<int64_t>(matrix_index) * kN * kN;
-  const int panel_begin = panel * kTile;
-  const int row_begin = row_tile * kTile;
-
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int column = linear % kTile;
-    diagonal[row * kLd + column] =
-        column <= row
-            ? load_global(
-                  matrix + (panel_begin + row) * kN + panel_begin + column)
-            : 0.0f;
-    rhs[row * kLd + column] = load_global(
-        matrix + (row_begin + row) * kN + panel_begin + column);
-  }
-  __syncthreads();
-  if (static_cast<int>(threadIdx.x) < kTile) {
-    const int column = static_cast<int>(threadIdx.x);
-    inverse_diagonal[column] =
-        __fdividef(1.0f, diagonal[column * kLd + column]);
-  }
-  __syncthreads();
-
-  if (static_cast<int>(threadIdx.x) < kTile) {
-    const int row = static_cast<int>(threadIdx.x);
-#pragma unroll 1
-    for (int column = 0; column < kTile; ++column) {
-      float value = rhs[row * kLd + column];
-#pragma unroll 4
-      for (int k = 0; k < column; ++k) {
-        value = fmaf(-rhs[row * kLd + k], diagonal[column * kLd + k], value);
+  // Write factored diagonal (only the diagonal block).
+  if (is_factor) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      if (column <= row) {
+        store_global(matrix + (panel_begin + row) * kN +
+                         panel_begin + column,
+                     tile_at(tile, row, column));
       }
-      rhs[row * kLd + column] = value * inverse_diagonal[column];
     }
   }
-  __syncthreads();
 
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int column = linear % kTile;
-    store_global(matrix + (row_begin + row) * kN + panel_begin + column,
-                 rhs[row * kLd + column]);
+  // Triangular solve (solve blocks only).
+  if (!is_factor) {
+    if (static_cast<int>(threadIdx.x) < kTile) {
+      const int column = static_cast<int>(threadIdx.x);
+      inverse_diagonal[column] =
+          __fdividef(1.0f, tile[column * kLd + column]);
+    }
+    __syncthreads();
+
+    if (static_cast<int>(threadIdx.x) < kTile) {
+      const int row = static_cast<int>(threadIdx.x);
+#pragma unroll 1
+      for (int column = 0; column < kTile; ++column) {
+        float value = rhs[row * kLd + column];
+#pragma unroll 4
+        for (int k = 0; k < column; ++k) {
+          value =
+              fmaf(-rhs[row * kLd + k], tile[column * kLd + k], value);
+        }
+        rhs[row * kLd + column] = value * inverse_diagonal[column];
+      }
+    }
+    __syncthreads();
+
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += 128) {
+      const int row = linear / kTile;
+      const int column = linear % kTile;
+      store_global(matrix + (row_begin + row) * kN + panel_begin + column,
+                   rhs[row * kLd + column]);
+    }
   }
 }
 
@@ -1721,22 +1721,18 @@ void launch_all(const float* input, float* output) {
   cudaLaunchKernelEx(&copy_config, copy_lower_kernel, input, output);
 
   for (int panel = 0; panel < kTileCount; ++panel) {
-    cudaLaunchConfig_t factor_config{};
-    factor_config.gridDim = dim3(kBatch, 1, 1);
-    factor_config.blockDim = dim3(kFactorThreads, 1, 1);
-    cudaLaunchKernelEx(&factor_config, factor_kernel, output, panel);
+    const int remaining = kTileCount - panel;
+    cudaLaunchConfig_t fuse_config{};
+    fuse_config.gridDim = dim3(kBatch, remaining, 1);
+    fuse_config.blockDim = dim3(128, 1, 1);
+    cudaLaunchKernelEx(&fuse_config, factor_solve_kernel, output, panel);
 
-    const int remaining = kTileCount - panel - 1;
-    if (remaining == 0) {
+    const int trailing = remaining - 1;
+    if (trailing == 0) {
       continue;
     }
 
-    cudaLaunchConfig_t solve_config{};
-    solve_config.gridDim = dim3(kBatch * remaining, 1, 1);
-    solve_config.blockDim = dim3(kSolveThreads, 1, 1);
-    cudaLaunchKernelEx(&solve_config, solve_kernel, output, panel, remaining);
-
-    const int tasks = remaining * (remaining + 1) / 2;
+    const int tasks = trailing * (trailing + 1) / 2;
     cudaLaunchConfig_t update_config{};
     update_config.gridDim = dim3(kBatch * tasks, 1, 1);
     update_config.blockDim = dim3(kUpdateThreads, 1, 1);
@@ -1748,8 +1744,7 @@ void launch_all(const float* input, float* output) {
 }  // namespace
 
 void cholesky_b16n512_prepare() {
-  prefer_shared(factor_kernel);
-  prefer_shared(solve_kernel);
+  prefer_shared(factor_solve_kernel);
   prefer_shared(fp32_update_kernel);
 }
 
@@ -3623,52 +3618,58 @@ __device__ __forceinline__ float& tile_at(
 
 // Eight-column redundant-corner factorization. Four threads share
 // each row solve and split its rank-8 trailing update.
+// corner_sm and inverse are in shared memory to cut register pressure.
 __device__ __forceinline__ void factor_wide(
     float* __restrict__ tile,
     float* __restrict__ inverse_diagonal,
-    float* __restrict__ panel) {
+    float* __restrict__ panel,
+    float* __restrict__ corner_sm) {
   constexpr int kGroup = 8;
   const int thread = static_cast<int>(threadIdx.x);
   const int row_index = thread >> 2;
   const int quarter = thread & 3;
+  float* inverse_sm = corner_sm + kGroup * kGroup;
 #pragma unroll 1
   for (int base = 0; base < kMicro; base += kGroup) {
-    float corner[kGroup][kGroup];
-    float inverse[kGroup];
+    if (thread < kGroup) {
 #pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
-#pragma unroll
-      for (int j = 0; j <= i; ++j) {
-        corner[i][j] = tile_at(tile, base + i, base + j);
+      for (int i = thread; i < kGroup; ++i) {
+        corner_sm[i * kGroup + thread] =
+            tile_at(tile, base + i, base + thread);
       }
     }
+    __syncthreads();
+    if (thread == 0) {
 #pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      const float diagonal = __fsqrt_rn(corner[j][j]);
-      const float inv = __fdiv_rn(1.0f, diagonal);
-      corner[j][j] = diagonal;
-      inverse[j] = inv;
+      for (int j = 0; j < kGroup; ++j) {
+        const float diagonal =
+            __fsqrt_rn(corner_sm[j * kGroup + j]);
+        const float inv = __fdiv_rn(1.0f, diagonal);
+        corner_sm[j * kGroup + j] = diagonal;
+        inverse_sm[j] = inv;
 #pragma unroll
-      for (int i = j + 1; i < kGroup; ++i) {
-        corner[i][j] *= inv;
-      }
+        for (int i = j + 1; i < kGroup; ++i) {
+          corner_sm[i * kGroup + j] *= inv;
+        }
 #pragma unroll
-      for (int i = j + 1; i < kGroup; ++i) {
+        for (int i = j + 1; i < kGroup; ++i) {
 #pragma unroll
-        for (int target = j + 1; target <= i; ++target) {
-          corner[i][target] = fmaf(
-              -corner[i][j], corner[target][j], corner[i][target]);
+          for (int target = j + 1; target <= i; ++target) {
+            corner_sm[i * kGroup + target] = fmaf(
+                -corner_sm[i * kGroup + j],
+                corner_sm[target * kGroup + j],
+                corner_sm[i * kGroup + target]);
+          }
         }
       }
     }
+    __syncthreads();
+    if (thread < kGroup) {
+      inverse_diagonal[base + thread] = inverse_sm[thread];
 #pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      if (thread == j) {
-        inverse_diagonal[base + j] = inverse[j];
-#pragma unroll
-        for (int i = j; i < kGroup; ++i) {
-          tile_at(tile, base + i, base + j) = corner[i][j];
-        }
+      for (int i = thread; i < kGroup; ++i) {
+        tile_at(tile, base + i, base + thread) =
+            corner_sm[i * kGroup + thread];
       }
     }
     const int row = base + kGroup + row_index;
@@ -3683,9 +3684,10 @@ __device__ __forceinline__ void factor_wide(
         float value = solved[j];
 #pragma unroll
         for (int i = 0; i < j; ++i) {
-          value = fmaf(-solved[i], corner[j][i], value);
+          value = fmaf(
+              -solved[i], corner_sm[j * kGroup + i], value);
         }
-        solved[j] = value * inverse[j];
+        solved[j] = value * inverse_sm[j];
       }
       if (quarter == 0) {
 #pragma unroll
@@ -3926,7 +3928,7 @@ void fused_micro_kernel(
               : 0.0f;
     }
     __syncthreads();
-    factor_wide(tile, inverse_diagonal, panel);
+    factor_wide(tile, inverse_diagonal, panel, mid);
     for (int linear = static_cast<int>(threadIdx.x);
          linear < kMicro * kMicro;
          linear += static_cast<int>(blockDim.x)) {

@@ -332,3 +332,27 @@ right-looking square GEMMs. Within the leading left-looking custom family,
 fixed-128, fixed-512, and adaptive are separated by less than 1%, so all
 three remain in the confirmation set. Variant 1 is retained to measure the
 best competing algorithm family under the same rounds.
+
+## Nsight Systems endpoint
+
+The shape-local Modal launcher profiles one warmed factorization on B200:
+
+```bash
+.venv/bin/python -m modal run cholesky/b8n2048/cholesky_b8n2048_modal.py
+# Optional comparison:
+.venv/bin/python -m modal run cholesky/b8n2048/cholesky_b8n2048_modal.py --variant 5
+```
+
+`--variant -1` selects the tracked default, currently native variant 5.
+Metadata records 48 algorithm launches for its fixed-128 left-looking custom
+schedule. Variant 0 is the torch baseline and is intentionally rejected by
+this native out-parameter endpoint. Input generation, compilation,
+preparation, warmup, and correctness validation are outside the capture; the
+NVTX range contains exactly one factorization.
+
+Artifacts are downloaded under `artifacts/nsys/`. `profile.nsys-rep` is the
+forward-compatible UI/VeloQ input, `kernel-trace.csv` is the ordered GPU
+timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
+and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
+export, human-readable statistics, command, profiler version, environment,
+preflight, stdout, and stderr are retained with the report.

@@ -629,3 +629,26 @@ Benchmark-mode history for the target row (not leaderboard geomeans):
 | 2026-07-26 | 12 | 48.32 ms (promoted, 3-round median) |
 | 2026-07-26 | 13 | 48.53 ms (promoted, 3-round median; v12 48.85 ms same sweep) |
 | 2026-07-26 | 14 | 42.86 ms (promoted, 3-round median; v13 48.59 ms same sweep - the inverse-GEMM apply bought 5.7 ms) |
+
+## Nsight Systems endpoint
+
+The shape-local Modal launcher profiles one warmed factorization on B200:
+
+```bash
+.venv/bin/python -m modal run cholesky/b1n32768/cholesky_b1n32768_modal.py
+# Optional comparison:
+.venv/bin/python -m modal run cholesky/b1n32768/cholesky_b1n32768_modal.py --variant 14
+```
+
+`--variant -1` selects the tracked default, currently variant 14. Its
+NB=1024 inverse-GEMM schedule has 1,023 algorithm launches per
+factorization. Input generation, extension compilation, preparation, warmup,
+and correctness validation are outside the capture; the NVTX range contains
+exactly one out-parameter factorization.
+
+Artifacts are downloaded under `artifacts/nsys/`. `profile.nsys-rep` is the
+forward-compatible UI/VeloQ input, `kernel-trace.csv` is the ordered GPU
+timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
+and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
+export, human-readable statistics, command, profiler version, environment,
+preflight, stdout, and stderr are retained with the report.
