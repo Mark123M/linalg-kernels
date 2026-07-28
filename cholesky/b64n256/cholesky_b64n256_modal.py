@@ -29,7 +29,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 22
+VARIANT_COUNT = 39
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "cta256_rec32_scalar_simt_precise",
@@ -54,6 +54,23 @@ VARIANT_NAMES = (
     "cta512_rec32_outer_sub8_tc_all_refined",
     "cta512_rec32_scalar_tc_all_refined_potf2_128",
     "cta512_rec32_scalar_tc_all_refined_tc_batch",
+    "cta512_rec32_scalar_tc_all_refined_pad129_tc_batch",
+    "cta512_rec32_outer_ll32_simt_tc_all_refined_pad129",
+    "cta512_rec32_outer_ll32_tc_all_refined_pad129",
+    "cta512_ll8_tc_outer_refined_pad129",
+    "cta512_ll16_tc_outer_refined_pad129",
+    "cta512_ll32_tc_outer_refined_pad129",
+    "cta512_ll16_outer_ll32_tc_outer_refined_pad129_tc_batch",
+    "cta512_ll8_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_regrow_tc_outer_refined_pad129",
+    "cta512_ll8_sub4row_tc_outer_refined_pad129",
+    "cta256_ll8_tc_outer_refined_pad129",
+    "cta128_ll8_tc_outer_refined_pad129",
+    "cta512_ll8_outer_ll32_tc_outer_refined_pad129",
+    "cta512_ll8_regrow_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_outer_ll32_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129",
+    "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129_deferred",
 )
 METADATA_COLUMNS = (
     "variant",
@@ -76,6 +93,11 @@ METADATA_COLUMNS = (
     "outer_trsm_mode",
     "potf2_threads",
     "tc_slice_batching",
+    "potrf_panel",
+    "outer_trsm_panel",
+    "outer_trsm_tensor",
+    "ll_row_mode",
+    "defer_output",
 )
 CASES = (
     "dense",

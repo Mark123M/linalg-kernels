@@ -8,8 +8,8 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
-_DEFAULT_VARIANT = 18  # POPCORN_VARIANT
-_VARIANT_COUNT = 22
+_DEFAULT_VARIANT = 37  # POPCORN_VARIANT
+_VARIANT_COUNT = 39
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
 
 _VARIANT_NAMES = (
@@ -35,6 +35,23 @@ _VARIANT_NAMES = (
     "cta512_rec32_outer_sub8_tc_all_refined",
     "cta512_rec32_scalar_tc_all_refined_potf2_128",
     "cta512_rec32_scalar_tc_all_refined_tc_batch",
+    "cta512_rec32_scalar_tc_all_refined_pad129_tc_batch",
+    "cta512_rec32_outer_ll32_simt_tc_all_refined_pad129",
+    "cta512_rec32_outer_ll32_tc_all_refined_pad129",
+    "cta512_ll8_tc_outer_refined_pad129",
+    "cta512_ll16_tc_outer_refined_pad129",
+    "cta512_ll32_tc_outer_refined_pad129",
+    "cta512_ll16_outer_ll32_tc_outer_refined_pad129_tc_batch",
+    "cta512_ll8_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_regrow_tc_outer_refined_pad129",
+    "cta512_ll8_sub4row_tc_outer_refined_pad129",
+    "cta256_ll8_tc_outer_refined_pad129",
+    "cta128_ll8_tc_outer_refined_pad129",
+    "cta512_ll8_outer_ll32_tc_outer_refined_pad129",
+    "cta512_ll8_regrow_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_outer_ll32_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129",
+    "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129_deferred",
 )
 
 _METADATA_COLUMNS = (
@@ -58,6 +75,11 @@ _METADATA_COLUMNS = (
     "outer_trsm_mode",
     "potf2_threads",
     "tc_slice_batching",
+    "potrf_panel",
+    "outer_trsm_panel",
+    "outer_trsm_tensor",
+    "ll_row_mode",
+    "defer_output",
 )
 
 _CPP_SOURCE = r"""
@@ -131,8 +153,8 @@ constexpr int kClusterBytes =
 constexpr int kClusterTcBytes =
     kClusterTcFloats * static_cast<int>(sizeof(float));
 
-constexpr int kVariantCount = 22;
-constexpr int kMetadataColumns = 20;
+constexpr int kVariantCount = 39;
+constexpr int kMetadataColumns = 25;
 constexpr int kPreciseRoot = 0;
 constexpr int kRefinedRoot = 1;
 constexpr int kRawRoot = 2;
@@ -145,6 +167,9 @@ constexpr int kTensorBlockTrsm = 2;
 constexpr int kSimtUpdate = 0;
 constexpr int kTcOuterUpdate = 1;
 constexpr int kTcAllUpdate = 2;
+constexpr int kLlSharedRows = 0;
+constexpr int kLlRegisterRows = 1;
+constexpr int kLlSub4Rows = 2;
 constexpr uint32_t kTmemDp = 1u << 16;
 
 template <int VariantId>
@@ -164,6 +189,11 @@ struct Variant;
     static constexpr int outer_trsm = TRSM;                           \
     static constexpr int potf2_threads = THREADS;                     \
     static constexpr bool batch_tc_slices = false;                    \
+    static constexpr int potrf_panel = 0;                              \
+    static constexpr int outer_trsm_panel = 0;                         \
+    static constexpr bool outer_trsm_tensor = false;                   \
+    static constexpr int ll_row_mode = kLlSharedRows;                  \
+    static constexpr bool defer_output = false;                        \
   }
 
 SPEC(0, 256, kPreciseRoot, 32, kRecursive32, kScalarTrsm, kSimtUpdate, false);
@@ -201,6 +231,86 @@ template <> struct Variant<20> : Variant<11> {
 
 template <> struct Variant<21> : Variant<11> {
   static constexpr bool batch_tc_slices = true;
+};
+
+template <> struct Variant<22> : Variant<18> {
+  static constexpr bool batch_tc_slices = true;
+};
+
+template <> struct Variant<23> : Variant<18> {
+  static constexpr int outer_trsm_panel = 32;
+};
+
+template <> struct Variant<24> : Variant<18> {
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
+};
+
+template <> struct Variant<25> : Variant<18> {
+  static constexpr int update = kTcOuterUpdate;
+  static constexpr int potrf_panel = 8;
+};
+
+template <> struct Variant<26> : Variant<18> {
+  static constexpr int update = kTcOuterUpdate;
+  static constexpr int potrf_panel = 16;
+};
+
+template <> struct Variant<27> : Variant<18> {
+  static constexpr int update = kTcOuterUpdate;
+  static constexpr int potrf_panel = 32;
+};
+
+template <> struct Variant<28> : Variant<18> {
+  static constexpr int update = kTcOuterUpdate;
+  static constexpr bool batch_tc_slices = true;
+  static constexpr int potrf_panel = 16;
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
+};
+
+template <> struct Variant<29> : Variant<25> {
+  static constexpr bool defer_output = true;
+};
+
+template <> struct Variant<30> : Variant<25> {
+  static constexpr int ll_row_mode = kLlRegisterRows;
+};
+
+template <> struct Variant<31> : Variant<25> {
+  static constexpr int ll_row_mode = kLlSub4Rows;
+};
+
+template <> struct Variant<32> : Variant<25> {
+  static constexpr int threads = 256;
+};
+
+template <> struct Variant<33> : Variant<25> {
+  static constexpr int threads = 128;
+};
+
+template <> struct Variant<34> : Variant<25> {
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
+};
+
+template <> struct Variant<35> : Variant<29> {
+  static constexpr int ll_row_mode = kLlRegisterRows;
+};
+
+template <> struct Variant<36> : Variant<29> {
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
+};
+
+template <> struct Variant<37> : Variant<30> {
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
+};
+
+template <> struct Variant<38> : Variant<35> {
+  static constexpr int outer_trsm_panel = 32;
+  static constexpr bool outer_trsm_tensor = true;
 };
 
 void check_input(const at::Tensor& data) {
@@ -644,6 +754,180 @@ __device__ __forceinline__ void trsm_single(
   __syncthreads();
 }
 
+template <int RootMode, bool PadA10, int Panel>
+__device__ __forceinline__ void warp_potf2_panel(
+    float* s, int panel_begin) {
+  static_assert(Panel == 8 || Panel == 16 || Panel == 32);
+  constexpr int storage_floats =
+      PadA10 ? kPaddedSingleFloats : kSingleFloats;
+  const int tid = static_cast<int>(threadIdx.x);
+  if (tid < 32) {
+    const int lane = tid & 31;
+    for (int column = 0; column < Panel; ++column) {
+      const int j = panel_begin + column;
+      if (lane == 0) {
+        float diagonal;
+        float inverse;
+        root_pair<RootMode>(
+            single_at<PadA10>(s, j, j), diagonal, inverse);
+        single_at<PadA10>(s, j, j) = diagonal;
+        s[storage_floats - 1] = inverse;
+      }
+      __syncwarp();
+      const float inverse = s[storage_floats - 1];
+      for (int local_row = column + 1 + lane;
+           local_row < Panel; local_row += 32) {
+        single_at<PadA10>(s, panel_begin + local_row, j) *= inverse;
+      }
+      __syncwarp();
+      for (int local_row = column + 1 + lane;
+           local_row < Panel; local_row += 32) {
+        const int row = panel_begin + local_row;
+        const float left = single_at<PadA10>(s, row, j);
+        for (int local_col = column + 1;
+             local_col <= local_row; ++local_col) {
+          const int col = panel_begin + local_col;
+          single_at<PadA10>(s, row, col) =
+              fmaf(-left, single_at<PadA10>(s, col, j),
+                   single_at<PadA10>(s, row, col));
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
+template <int RootMode, bool PadA10, int Panel, int RowMode>
+__device__ __forceinline__ void potrf128_left_single(
+    float* s, int begin) {
+  static_assert(kTile % Panel == 0);
+  for (int panel = 0; panel < kTile; panel += Panel) {
+    const int panel_begin = begin + panel;
+    const int remaining = kTile - panel;
+    const int values = remaining * Panel;
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < values; linear += static_cast<int>(blockDim.x)) {
+      const int local_row = linear / Panel;
+      const int local_col = linear - local_row * Panel;
+      const int row = panel_begin + local_row;
+      const int col = panel_begin + local_col;
+      if (col <= row) {
+        float value = single_at<PadA10>(s, row, col);
+        for (int k = 0; k < panel; ++k) {
+          value = fmaf(
+              -single_at<PadA10>(s, row, begin + k),
+              single_at<PadA10>(s, col, begin + k), value);
+        }
+        single_at<PadA10>(s, row, col) = value;
+      }
+    }
+    __syncthreads();
+
+    warp_potf2_panel<RootMode, PadA10, Panel>(s, panel_begin);
+    __syncthreads();
+
+    const int rows = remaining - Panel;
+    if constexpr (RowMode == kLlSharedRows) {
+      for (int local_row = static_cast<int>(threadIdx.x);
+           local_row < rows; local_row += static_cast<int>(blockDim.x)) {
+        const int row = panel_begin + Panel + local_row;
+        for (int local_col = 0; local_col < Panel; ++local_col) {
+          const int col = panel_begin + local_col;
+          float value = single_at<PadA10>(s, row, col);
+          for (int k = 0; k < local_col; ++k) {
+            value = fmaf(
+                -single_at<PadA10>(s, row, panel_begin + k),
+                single_at<PadA10>(s, col, panel_begin + k), value);
+          }
+          single_at<PadA10>(s, row, col) =
+              value / single_at<PadA10>(s, col, col);
+        }
+      }
+    } else if constexpr (RowMode == kLlRegisterRows) {
+      static_assert(Panel == 8);
+      for (int local_row = static_cast<int>(threadIdx.x);
+           local_row < rows; local_row += static_cast<int>(blockDim.x)) {
+        const int row = panel_begin + Panel + local_row;
+        float values[Panel];
+#pragma unroll
+        for (int local_col = 0; local_col < Panel; ++local_col) {
+          values[local_col] =
+              single_at<PadA10>(s, row, panel_begin + local_col);
+        }
+#pragma unroll
+        for (int local_col = 0; local_col < Panel; ++local_col) {
+          const int col = panel_begin + local_col;
+          float value = values[local_col];
+#pragma unroll
+          for (int k = 0; k < local_col; ++k) {
+            value = fmaf(
+                -values[k],
+                single_at<PadA10>(s, col, panel_begin + k), value);
+          }
+          values[local_col] =
+              value / single_at<PadA10>(s, col, col);
+        }
+#pragma unroll
+        for (int local_col = 0; local_col < Panel; ++local_col) {
+          single_at<PadA10>(s, row, panel_begin + local_col) =
+              values[local_col];
+        }
+      }
+    } else {
+      static_assert(RowMode == kLlSub4Rows && Panel == 8);
+      const int lane = static_cast<int>(threadIdx.x) & 3;
+      const int group = static_cast<int>(threadIdx.x) >> 2;
+      const int groups = static_cast<int>(blockDim.x) >> 2;
+      const uint32_t mask =
+          0xfu << (static_cast<int>(threadIdx.x) & 28);
+      for (int local_row = group; local_row < rows; local_row += groups) {
+        const int row = panel_begin + Panel + local_row;
+#pragma unroll
+        for (int local_col = 0; local_col < Panel; ++local_col) {
+          const int col = panel_begin + local_col;
+          float partial =
+              lane == 0 ? single_at<PadA10>(s, row, col) : 0.0f;
+#pragma unroll
+          for (int k = lane; k < local_col; k += 4) {
+            partial = fmaf(
+                -single_at<PadA10>(s, row, panel_begin + k),
+                single_at<PadA10>(s, col, panel_begin + k), partial);
+          }
+          partial += __shfl_down_sync(mask, partial, 2, 4);
+          partial += __shfl_down_sync(mask, partial, 1, 4);
+          if (lane == 0) {
+            single_at<PadA10>(s, row, col) =
+                partial / single_at<PadA10>(s, col, col);
+          }
+          __syncwarp(mask);
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int Panel, bool PadA10>
+__device__ __forceinline__ void outer_trsm_update_simt(
+    float* s, int row_begin, int rows, int col_begin, int solved_cols) {
+  const int values = rows * Panel;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < values; linear += static_cast<int>(blockDim.x)) {
+    const int local_row = linear / Panel;
+    const int local_col = linear - local_row * Panel;
+    const int row = row_begin + local_row;
+    const int col = col_begin + solved_cols + local_col;
+    float value = single_at<PadA10>(s, row, col);
+    for (int k = 0; k < solved_cols; ++k) {
+      value = fmaf(
+          -single_at<PadA10>(s, row, col_begin + k),
+          single_at<PadA10>(s, col, col_begin + k), value);
+    }
+    single_at<PadA10>(s, row, col) = value;
+  }
+  __syncthreads();
+}
+
 template <bool PadA10>
 __device__ __forceinline__ void simt_update_single(
     float* s, int target, int size, int panel, int panel_cols) {
@@ -781,6 +1065,160 @@ __device__ __forceinline__ void tc_update_single(
   tmem_deallocate<false>(tmem_base, kTile);
 }
 
+template <int Panel, bool PadA10, bool BatchSlices>
+__device__ __forceinline__ void outer_trsm_update_tc(
+    float* s, int row_begin, int col_begin, int solved_cols,
+    float* scratch, uint32_t* tmem_slot,
+    uint64_t* barrier, int& phase) {
+  static_assert(Panel == 32);
+  static_assert(3 * (kTile * 8 + Panel * 8) <= kTcScratchFloats);
+  tmem_allocate<false>(tmem_slot, kTile);
+  const uint32_t tmem_base = *tmem_slot;
+
+  if constexpr (BatchSlices) {
+    constexpr int slices_per_group = 3;
+    constexpr int a_slice_values = kTile * 8;
+    constexpr int b_slice_values = Panel * 8;
+    constexpr int b_offset = slices_per_group * a_slice_values;
+    for (int group_k = 0; group_k < solved_cols;
+         group_k += slices_per_group * 8) {
+      const int active_slices =
+          min(slices_per_group, (solved_cols - group_k) / 8);
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < active_slices * a_slice_values;
+           linear += static_cast<int>(blockDim.x)) {
+        const int slice = linear / a_slice_values;
+        const int within = linear - slice * a_slice_values;
+        const int row = within >> 3;
+        const int column = within & 7;
+        reinterpret_cast<uint32_t*>(scratch)[
+            slice * a_slice_values +
+            kmajor_offset(row, column, kTile)] =
+            to_tf32(single_at<PadA10>(
+                s, row_begin + row,
+                col_begin + group_k + slice * 8 + column));
+      }
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < active_slices * b_slice_values;
+           linear += static_cast<int>(blockDim.x)) {
+        const int slice = linear / b_slice_values;
+        const int within = linear - slice * b_slice_values;
+        const int row = within >> 3;
+        const int column = within & 7;
+        reinterpret_cast<uint32_t*>(scratch)[
+            b_offset + slice * b_slice_values +
+            kmajor_offset(row, column, Panel)] =
+            to_tf32(single_at<PadA10>(
+                s, col_begin + solved_cols + row,
+                col_begin + group_k + slice * 8 + column));
+      }
+      __syncthreads();
+      proxy_fence();
+      __syncthreads();
+      for (int slice = 0; slice < active_slices; ++slice) {
+        issue_tf32_mma<kTile, Panel, false>(
+            tmem_base,
+            make_kmajor_descriptor(
+                scratch + slice * a_slice_values, kTile),
+            make_kmajor_descriptor(
+                scratch + b_offset + slice * b_slice_values, Panel),
+            group_k != 0 || slice != 0);
+      }
+      tensor_commit<false>(barrier);
+      barrier_wait(barrier, phase);
+      phase ^= 1;
+    }
+  } else {
+    constexpr int a_slice_values = kTile * 8;
+    for (int k = 0; k < solved_cols; k += 8) {
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < a_slice_values; linear += static_cast<int>(blockDim.x)) {
+        const int row = linear >> 3;
+        const int column = linear & 7;
+        reinterpret_cast<uint32_t*>(scratch)[
+            kmajor_offset(row, column, kTile)] =
+            to_tf32(single_at<PadA10>(
+                s, row_begin + row, col_begin + k + column));
+      }
+      for (int linear = static_cast<int>(threadIdx.x);
+           linear < Panel * 8; linear += static_cast<int>(blockDim.x)) {
+        const int row = linear >> 3;
+        const int column = linear & 7;
+        reinterpret_cast<uint32_t*>(scratch)[
+            a_slice_values + kmajor_offset(row, column, Panel)] =
+            to_tf32(single_at<PadA10>(
+                s, col_begin + solved_cols + row,
+                col_begin + k + column));
+      }
+      __syncthreads();
+      proxy_fence();
+      __syncthreads();
+      issue_tf32_mma<kTile, Panel, false>(
+          tmem_base,
+          make_kmajor_descriptor(scratch, kTile),
+          make_kmajor_descriptor(scratch + a_slice_values, Panel),
+          k != 0);
+      tensor_commit<false>(barrier);
+      barrier_wait(barrier, phase);
+      phase ^= 1;
+    }
+  }
+
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (warp < 4) {
+    const int row = warp * 32 + lane;
+    for (int local_col = 0; local_col < Panel; ++local_col) {
+      const uint32_t address =
+          tmem_base + static_cast<uint32_t>(warp * 32) * kTmemDp +
+          static_cast<uint32_t>(local_col);
+      single_at<PadA10>(
+          s, row_begin + row,
+          col_begin + solved_cols + local_col) -= tmem_load_one(address);
+    }
+  }
+  __syncthreads();
+  tmem_deallocate<false>(tmem_base, kTile);
+}
+
+template <int Panel, bool TensorUpdate, bool PadA10, bool BatchSlices>
+__device__ __forceinline__ void blocked_outer_trsm_single(
+    float* s, int row_begin, int rows, int col_begin, int cols,
+    float* scratch, uint32_t* tmem_slot,
+    uint64_t* barrier, int& phase) {
+  static_assert(Panel == 32);
+  for (int solved_cols = 0; solved_cols < cols; solved_cols += Panel) {
+    if (solved_cols != 0) {
+      if constexpr (TensorUpdate) {
+        outer_trsm_update_tc<Panel, PadA10, BatchSlices>(
+            s, row_begin, col_begin, solved_cols,
+            scratch, tmem_slot, barrier, phase);
+      } else {
+        outer_trsm_update_simt<Panel, PadA10>(
+            s, row_begin, rows, col_begin, solved_cols);
+      }
+    }
+    for (int local_row = static_cast<int>(threadIdx.x);
+         local_row < rows; local_row += static_cast<int>(blockDim.x)) {
+      const int row = row_begin + local_row;
+      for (int local_col = 0; local_col < Panel; ++local_col) {
+        const int col = col_begin + solved_cols + local_col;
+        float value = single_at<PadA10>(s, row, col);
+        for (int k = 0; k < local_col; ++k) {
+          value = fmaf(
+              -single_at<PadA10>(
+                  s, row, col_begin + solved_cols + k),
+              single_at<PadA10>(
+                  s, col, col_begin + solved_cols + k), value);
+        }
+        single_at<PadA10>(s, row, col) =
+            value / single_at<PadA10>(s, col, col);
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <int RootMode, int FactorMode, int TrsmMode, int UpdateMode,
           bool PadA10, bool BatchTcSlices,
           int Potf2Threads, int CtaThreads>
@@ -832,6 +1270,22 @@ __device__ __forceinline__ void potrf128_single(
   }
 }
 
+template <typename V>
+__device__ __forceinline__ void factor128_variant(
+    float* s, int begin, float* scratch, uint32_t* tmem_slot,
+    uint64_t* barrier, int& phase) {
+  if constexpr (V::potrf_panel == 0) {
+    potrf128_single<
+        V::root, V::factor, V::trsm, V::update,
+        V::pad_a10, V::batch_tc_slices,
+        V::potf2_threads, V::threads>(
+            s, begin, scratch, tmem_slot, barrier, phase);
+  } else {
+    potrf128_left_single<
+        V::root, V::pad_a10, V::potrf_panel, V::ll_row_mode>(s, begin);
+  }
+}
+
 template <int VariantId>
 __global__ __launch_bounds__(Variant<VariantId>::threads, 1)
 void single_kernel(const float* __restrict__ input,
@@ -853,9 +1307,11 @@ void single_kernel(const float* __restrict__ input,
   float* matrix_output =
       output + static_cast<int64_t>(matrix) * kN * kN;
 
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kN * kN; linear += static_cast<int>(blockDim.x)) {
-    matrix_output[linear] = 0.0f;
+  if constexpr (!V::defer_output) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kN * kN; linear += static_cast<int>(blockDim.x)) {
+      matrix_output[linear] = 0.0f;
+    }
   }
   for (int linear = static_cast<int>(threadIdx.x);
        linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
@@ -876,32 +1332,41 @@ void single_kernel(const float* __restrict__ input,
     barrier_init(barrier);
   }
 
-  potrf128_single<
-      V::root, V::factor, V::trsm, V::update,
-      V::pad_a10, V::batch_tc_slices,
-      V::potf2_threads, V::threads>(
-          storage, 0, scratch, tmem_slot, barrier, phase);
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int col = linear % kTile;
-    if (col <= row) {
-      matrix_output[row * kN + col] =
-          single_at<V::pad_a10>(storage, row, col);
+  factor128_variant<V>(
+      storage, 0, scratch, tmem_slot, barrier, phase);
+  if constexpr (!V::defer_output) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
+      const int row = linear / kTile;
+      const int col = linear % kTile;
+      if (col <= row) {
+        matrix_output[row * kN + col] =
+            single_at<V::pad_a10>(storage, row, col);
+      }
     }
+    __syncthreads();
   }
-  __syncthreads();
 
-  trsm_single<V::outer_trsm, V::pad_a10>(
-      storage, kTile, kTile, 0, kTile);
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int col = linear % kTile;
-    matrix_output[(row + kTile) * kN + col] =
-        single_at<V::pad_a10>(storage, row + kTile, col);
+  if constexpr (V::outer_trsm_panel == 0) {
+    trsm_single<V::outer_trsm, V::pad_a10>(
+        storage, kTile, kTile, 0, kTile);
+  } else {
+    blocked_outer_trsm_single<
+        V::outer_trsm_panel, V::outer_trsm_tensor,
+        V::pad_a10, V::batch_tc_slices>(
+            storage, kTile, kTile, 0, kTile,
+            scratch, tmem_slot, barrier, phase);
   }
-  __syncthreads();
+  if constexpr (!V::defer_output) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
+      const int row = linear / kTile;
+      const int col = linear % kTile;
+      matrix_output[(row + kTile) * kN + col] =
+          single_at<V::pad_a10>(storage, row + kTile, col);
+    }
+    __syncthreads();
+  }
 
   if constexpr (V::update == kSimtUpdate) {
     simt_update_single<V::pad_a10>(
@@ -910,25 +1375,37 @@ void single_kernel(const float* __restrict__ input,
     tc_update_single<128, V::pad_a10, V::batch_tc_slices>(
         storage, kTile, 0, scratch, tmem_slot, barrier, phase);
   }
-  potrf128_single<
-      V::root, V::factor, V::trsm, V::update,
-      V::pad_a10, V::batch_tc_slices,
-      V::potf2_threads, V::threads>(
-          storage, kTile, scratch, tmem_slot, barrier, phase);
+  factor128_variant<V>(
+      storage, kTile, scratch, tmem_slot, barrier, phase);
 
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / kTile;
-    const int col = linear % kTile;
-    if (col <= row) {
-      matrix_output[(row + kTile) * kN + col + kTile] =
-          single_at<V::pad_a10>(
-              storage, row + kTile, col + kTile);
+  if constexpr (V::defer_output) {
+    if constexpr (V::tensor) {
+      tmem_relinquish<false>();
     }
-  }
-  __syncthreads();
-  if constexpr (V::tensor) {
-    tmem_relinquish<false>();
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kN * kN; linear += static_cast<int>(blockDim.x)) {
+      const int row = linear / kN;
+      const int col = linear % kN;
+      matrix_output[linear] =
+          col <= row
+              ? single_at<V::pad_a10>(storage, row, col)
+              : 0.0f;
+    }
+  } else {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kTile * kTile; linear += static_cast<int>(blockDim.x)) {
+      const int row = linear / kTile;
+      const int col = linear % kTile;
+      if (col <= row) {
+        matrix_output[(row + kTile) * kN + col + kTile] =
+            single_at<V::pad_a10>(
+                storage, row + kTile, col + kTile);
+      }
+    }
+    __syncthreads();
+    if constexpr (V::tensor) {
+      tmem_relinquish<false>();
+    }
   }
 }
 
@@ -1484,7 +1961,12 @@ void configure_all() {
   configure_one<12>(); configure_one<13>(); configure_one<14>();
   configure_one<15>(); configure_one<16>(); configure_one<17>();
   configure_one<18>(); configure_one<19>(); configure_one<20>();
-  configure_one<21>();
+  configure_one<21>(); configure_one<22>(); configure_one<23>();
+  configure_one<24>(); configure_one<25>(); configure_one<26>();
+  configure_one<27>(); configure_one<28>(); configure_one<29>();
+  configure_one<30>(); configure_one<31>(); configure_one<32>();
+  configure_one<33>(); configure_one<34>(); configure_one<35>();
+  configure_one<36>(); configure_one<37>(); configure_one<38>();
 }
 
 template <int Id>
@@ -1542,8 +2024,25 @@ void launch_variant(const float* input, float* output, int variant) {
     case 19: launch_one<19>(input, output); break;
     case 20: launch_one<20>(input, output); break;
     case 21: launch_one<21>(input, output); break;
+    case 22: launch_one<22>(input, output); break;
+    case 23: launch_one<23>(input, output); break;
+    case 24: launch_one<24>(input, output); break;
+    case 25: launch_one<25>(input, output); break;
+    case 26: launch_one<26>(input, output); break;
+    case 27: launch_one<27>(input, output); break;
+    case 28: launch_one<28>(input, output); break;
+    case 29: launch_one<29>(input, output); break;
+    case 30: launch_one<30>(input, output); break;
+    case 31: launch_one<31>(input, output); break;
+    case 32: launch_one<32>(input, output); break;
+    case 33: launch_one<33>(input, output); break;
+    case 34: launch_one<34>(input, output); break;
+    case 35: launch_one<35>(input, output); break;
+    case 36: launch_one<36>(input, output); break;
+    case 37: launch_one<37>(input, output); break;
+    case 38: launch_one<38>(input, output); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 21]");
+      TORCH_CHECK(false, "native variant must be in [0, 38]");
   }
 }
 
@@ -1601,6 +2100,11 @@ void write_metadata(int64_t* rows) {
       V::cluster && V::tensor ? kTensorBlockTrsm : V::outer_trsm;
   row[18] = V::potf2_threads;
   row[19] = V::batch_tc_slices ? 1 : 0;
+  row[20] = V::potrf_panel;
+  row[21] = V::outer_trsm_panel;
+  row[22] = V::outer_trsm_tensor ? 1 : 0;
+  row[23] = V::ll_row_mode;
+  row[24] = V::defer_output ? 1 : 0;
 }
 
 }  // namespace
@@ -1615,7 +2119,7 @@ void cholesky_b64n256_out(const at::Tensor& data,
   check_input(data);
   check_output(data, out);
   TORCH_CHECK(variant >= 0 && variant < kVariantCount,
-              "native variant must be in [0, 21]");
+              "native variant must be in [0, 38]");
   launch_variant(
       data.data_ptr<float>(), out.data_ptr<float>(),
       static_cast<int>(variant));
@@ -1646,6 +2150,15 @@ at::Tensor cholesky_b64n256_metadata() {
   write_metadata<16>(rows); write_metadata<17>(rows);
   write_metadata<18>(rows); write_metadata<19>(rows);
   write_metadata<20>(rows); write_metadata<21>(rows);
+  write_metadata<22>(rows); write_metadata<23>(rows);
+  write_metadata<24>(rows); write_metadata<25>(rows);
+  write_metadata<26>(rows); write_metadata<27>(rows);
+  write_metadata<28>(rows); write_metadata<29>(rows);
+  write_metadata<30>(rows); write_metadata<31>(rows);
+  write_metadata<32>(rows); write_metadata<33>(rows);
+  write_metadata<34>(rows); write_metadata<35>(rows);
+  write_metadata<36>(rows); write_metadata<37>(rows);
+  write_metadata<38>(rows);
   return result;
 }
 """

@@ -7,14 +7,19 @@ with shape `(64, 256, 256)`. `custom_kernel` calls the raw extension only for
 that exact shape. Every other shape returns
 `torch.linalg.cholesky_ex(data, check_errors=False).L`.
 
-The production ID is variant 8. Variant IDs are append-only. The Popcorn
+The production ID is variant 18. Variant IDs are append-only. The Popcorn
 sweep may change only the integer on the tracked `# POPCORN_VARIANT` line
 after its promotion gates pass.
 
-Variants 18--21 are isolated, append-only descendants of the profiled
-512-thread variant 11. Each changes exactly one mechanism so correctness,
-resources, and timing can be attributed to that optimization. They have not
-yet passed B200 compilation or numerical validation.
+Variants 18--21 are isolated descendants of the profiled 512-thread variant
+11. Variants 22--28 are append-only experiments derived from the fused
+left-looking panel design in `references/icl-utk-987-2017.pdf`. Variant 18
+remains unchanged as their timing and correctness control.
+
+Variants 29--38 are append-only descendants of the B200-winning variant 25.
+They test the synchronization, register residency, thread-block geometry, and
+mixed outer/inner blocking ideas in `references/imple_tuning_batch.pdf` and
+`references/fast-batch-2014.pdf`. Variant 25 is their unchanged control.
 
 ## Matrix layout
 
@@ -51,6 +56,15 @@ Every output element is first set to zero. Only the computed lower triangle is
 subsequently written, making strict-upper zeros exact rather than a side
 effect of an input copy.
 
+Variant 29 and its descendants defer all three factor-block writes until the
+factorization is complete. They then traverse the complete lower triangle
+once and write zero for every upper-triangular position. This replaces the
+baseline's 65,536-element zero pass plus 32,896 factor stores with one
+65,536-element final pass, while removing the two intermediate output loops
+and their CTA barriers. The first warp relinquishes its no-longer-used TMEM
+permit before final writeback, so the deferred path also needs no terminal
+CTA barrier.
+
 ## Factorization
 
 The outer factorization is:
@@ -83,6 +97,48 @@ column phase to threads 0--127. Those four warps use named CTA barrier 1 with
 an explicit 128-thread participant count. Threads 128--511 wait only at the
 single full-CTA barrier at factor exit. The original full-CTA POTF2 path is
 unchanged for variants 0--19 and 21.
+
+Variants 25--27 replace each recursive right-looking `POTRF128` with a direct
+left-looking factorization using panel widths 8, 16, and 32. At each step all
+threads update only the current rectangular panel from already-computed
+factor columns. Warp zero factors the small diagonal block with warp-local
+synchronization, after which complete rows independently solve the panel
+below the diagonal. The panel update, diagonal factor, and row solve use three
+CTA barriers per panel instead of three CTA barriers per column in each of
+eight `POTF2-32` calls. Panel updates and diagonal arithmetic remain FP32.
+
+Variants 23 and 24 block the outer `A10` solve at 32 columns. A left-looking
+cross-panel update first removes contributions from previously solved
+columns, then every row performs a 32-column FP32 triangular solve. Variant
+23 computes the cross-panel update with FP32 FMA. Variant 24 packs
+128-by-8 and 32-by-8 operands and issues rectangular 128-by-32 TF32
+operations, while retaining the panel solve and stored factor in FP32.
+
+Variant 28 combines the 16-column left-looking `POTRF128`, the tensor
+32-column outer solve, padded `A10`, and batched K slices. It intentionally
+keeps only the outer 128-by-128 Schur update on the original tensor path;
+variants 25--28 do not issue the recursive 64-by-64 tensor updates.
+
+Variants 30 and 35 replace the LL8 below-panel row solve's repeated shared
+loads and stores with an eight-value register array per participating thread.
+Each complete row is loaded once, solved left to right in registers, and
+written once. Variant 31 instead assigns a four-lane subgroup to each row.
+Its 128 subgroups make up to 120 below-panel rows active concurrently, testing
+whether shorter reductions outweigh shuffle and subgroup-synchronization
+costs.
+
+Variants 32 and 33 retain the v25 algorithm while reducing the CTA from 512
+threads to 256 and 128. The 214,544-byte shared allocation still limits the
+kernel to one CTA per SM, so this is a direct test of useful-warps versus
+latency-hiding rather than an occupancy-capacity experiment.
+
+Variants 34 and 36--38 combine the winning inner width of eight with a
+32-column left-looking outer solve. This is the two-level blocking reported
+by Dong et al.: an outer right-looking update, a recursively left-looking
+panel, an outer block size of 32, and an inner block size of eight. The
+cross-panel outer updates use TF32 tensor operations while diagonal factors
+and triangular solves remain FP32. Variants 35--38 test the useful
+combinations of register rows, deferred output, and outer blocking.
 
 Cluster tensor variants block the 128-column outer TRSM at 64 columns. They
 solve the first half in FP32, convert copies of that panel and the off-diagonal
@@ -125,6 +181,12 @@ slices at a time and uses four groups. Across both recursive 64 updates and
 the outer 128 update this reduces 32 commit/wait groups to six, without
 changing shared-memory size. Variants 0--20 retain one commit/wait per K=8
 slice.
+
+Variant 22 combines variant 18's padded `A10` with the existing batched-slice
+mechanism. It is the low-risk control for whether the two independently
+successful layout and commit-count changes compose. Variant 28 also batches
+the rectangular outer-solve update in groups of up to three K=8 slices, the
+largest group that fits both operands in the existing conversion area.
 
 One-SM update shapes are 64-by-64 and 128-by-128. The 64-row TMEM epilogue
 uses the four 16-row subpartition groups; every lane executes each synchronous
@@ -208,12 +270,20 @@ removed after the block decomposition passed normal validation.
 | 19 | 512 | 1 CTA | recursive 32 | scalar recursive, 8-lane outer | TCGen all eligible | refined |
 | 20 | 512 | 1 CTA | recursive 32, 128 participants | scalar row | TCGen all eligible | refined |
 | 21 | 512 | 1 CTA | recursive 32 | scalar row | TCGen all eligible, batched K slices | refined |
+| 22 | 512 | 1 CTA | recursive 32 | scalar row | TCGen all, padded A10, batched K | refined |
+| 23 | 512 | 1 CTA | recursive 32 | LL32 outer, FP32 update | TCGen all, padded A10 | refined |
+| 24 | 512 | 1 CTA | recursive 32 | LL32 outer, TF32 update | TCGen all, padded A10 | refined |
+| 25 | 512 | 1 CTA | LL8 POTRF128 | scalar outer | TCGen outer, padded A10 | refined |
+| 26 | 512 | 1 CTA | LL16 POTRF128 | scalar outer | TCGen outer, padded A10 | refined |
+| 27 | 512 | 1 CTA | LL32 POTRF128 | scalar outer | TCGen outer, padded A10 | refined |
+| 28 | 512 | 1 CTA | LL16 POTRF128 | LL32 outer, TF32 update | TCGen outer, padded A10, batched K | refined |
 
 `_variant_metadata()` returns one row per ID with registers, local bytes,
 static and dynamic shared bytes, occupancy, cluster size, tensor use,
 recursive base, factor/TRSM/update modes, root mode, and launch-bound threads.
 It also records the A10 leading dimension, outer TRSM mode, POTF2 participant
-count, and whether TC slices are batched.
+count, whether TC slices are batched, both panel widths, and whether the
+blocked outer solve uses tensor operations.
 
 ## Autotuning and promotion
 
@@ -327,6 +397,93 @@ The sweep re-read an unchanged source hash and atomically promoted variant 8.
 This differs from the isolated Modal winner because the public geomean also
 contains the held-constant fallback shapes and normal remote timing noise.
 
+## B200 results and NCU: 2026-07-28
+
+The retained tuning payload is
+`artifacts/tune/tuning_20260728T094014Z.json`. All eight requested variants
+passed all six exact-shape input families.
+
+| Rank | ID | Median ms | Experiment |
+|---:|---:|---:|---|
+| 1 | 25 | 0.235434 | LL8, scalar outer TRSM, tensor outer Schur |
+| 2 | 28 | 0.257947 | LL16 plus tensor-blocked outer TRSM |
+| 3 | 24 | 0.280321 | recursive factor plus tensor-blocked outer TRSM |
+| 4 | 26 | 0.288754 | LL16 |
+| 5 | 23 | 0.292595 | recursive factor plus SIMT-blocked outer TRSM |
+| 6 | 22 | 0.300578 | padded recursive control with batched tensor slices |
+| 7 | 18 | 0.305545 | padded recursive control |
+| 8 | 27 | 0.368414 | LL32 |
+
+Variant 25 is 22.9 percent faster than v18. The inner-width sweep has a clear
+minimum at eight: v25 is 18.5 percent faster than LL16 and 36.1 percent faster
+than LL32. Tensor blocking of the outer solve was useful in isolation, with
+v24 8.3 percent faster than v18, but the previous round did not test it with
+the winning LL8 factor.
+
+The follow-up report is
+`artifacts/ncu/b64_n256_brev_ncu_20260728T094217Z/`
+`v25_cta512_ll8_tc_outer_refined_pad129/`
+`profile.3-batch-64-n-256-cond-2-seed-41256/profile.ncu-rep`.
+Nsight Compute 2026.2 measured 410.18 microseconds, versus 235.43
+microseconds in the normal tuning harness; absolute NCU duration is therefore
+not used as the tuning baseline.
+
+The report measured 12.08 percent SM throughput, 12.59 percent memory
+throughput, 24.99 percent achieved occupancy, and no spills. Each scheduler
+had four active warps on average but only 0.25 eligible warps; no warp was
+eligible in 80.62 percent of cycles. Warp sampling attributed 80,898 of
+112,331 samples, or 72.0 percent, to barriers. The four dominant barrier
+locations were:
+
+| Generated CUDA line | Barrier samples | Phase |
+|---:|---:|---|
+| 680 | 40,431 | completion of the LL8 below-panel row solve |
+| 1145 | 25,051 | output of solved `L10` before its Schur update |
+| 653 | 8,545 | completion of the current left-looking panel update |
+| 675 | 4,957 | completion of the warp-local 8-by-8 factor |
+
+The `L10` output barrier alone accounts for 31.0 percent of all barrier
+samples. The following Schur update only reads `L10` and writes `A11`, so
+that barrier does not protect an address dependency. The LL8 row solve uses
+at most 120 of 512 threads, explaining why its necessary completion barrier
+is the largest remaining idle point.
+
+Shared memory is secondary but measurable: the report records 344,192 shared
+store requests, 130,686 store-bank conflicts, and 307,712 excessive shared
+wavefronts, 4.0 percent of all shared wavefronts. The load/store pipeline
+reached only 12.16 percent of peak for shared traffic, so bank remapping is
+lower priority than shortening the synchronization critical path.
+
+The native report displays a PM Sampling section, but
+`veloq ncu metrics --counter 'pmsampling:*'` returns zero counters. No
+equivalent metric was substituted, and no phase timeline is inferred from
+that absent family. The source-attributed `warpsampling:*` counters above are
+direct measurements present in the report.
+
+The two papers reinforce the measured choices without being copied
+architecture-blindly. Dong et al. found recursive left-looking panels inside
+a right-looking trailing update, with outer block 32 and inner block 8, to be
+their best K40 configuration. Kurzak et al. kept the mutable panel in fast
+local storage, delayed writes, and autotuned both panel width and thread-block
+shape; register residency and avoiding unnecessary conditionals were
+essential. Their common 64-thread shape is not assumed optimal for B200, but
+it motivates the explicit 128/256/512-thread sweep.
+
+The new experiment matrix is:
+
+| ID | Change from v25 |
+|---:|---|
+| 29 | defer all factor output to one final lower-triangle traversal |
+| 30 | keep each LL8 row in eight registers during its solve |
+| 31 | solve one LL8 row per four-lane subgroup |
+| 32 | use 256 threads |
+| 33 | use 128 threads |
+| 34 | add the 32-column tensor-blocked outer solve |
+| 35 | deferred output plus register rows |
+| 36 | deferred output plus outer-32 |
+| 37 | register rows plus outer-32 |
+| 38 | deferred output, register rows, and outer-32 |
+
 ## Verification commands
 
 Before this append-only pass, the Python compilation, diff check,
@@ -334,17 +491,26 @@ forbidden-token search, Modal tuning, Popcorn test, and three-round Popcorn
 sweep commands had been run. NCU profiling remains for a subsequent
 profiling pass.
 
-For the append-only variants 18--21 pass, Python compilation, `git
-diff --check`, the forbidden-token search, and a CUDA 13.1 SM100a
-translation-unit compilation completed without errors. The CUDA compile
-reported only the existing PyTorch BFloat16 host/device constexpr warnings.
-GPU access is blocked in the assistant environment, so this pass did not run
-the extension or validate numerical results. The first required B200 command
-is:
+For variants 22--28, Python compilation, `git diff --check`, the
+forbidden-token search, a direct algebra/indexing check, CUDA 13.1 SM100a
+translation-unit compilation, and B200 six-family tuning completed. The CUDA
+compile reported only the existing PyTorch BFloat16 host/device constexpr
+warnings. Variants 22, 25, 26, 27, and 28 use 47--48 registers; variant 23
+uses 62 and variant 24 uses 71. None spills.
+
+For variants 29--38, Python compilation, `git diff --check`, the
+forbidden-token search, a direct FP32 algebra/indexing check, and a full CUDA
+13.1 SM100a translation-unit compilation completed. The new kernels have no
+stack frame and no spills. Variants 29, 30, 31, 32, 33, and 34 use 47, 64,
+48, 48, 48, and 48 registers, respectively; combined variants 35--38 use 63,
+48, 64, and 63 registers. The only compiler diagnostics are the existing
+PyTorch BFloat16 constexpr warnings.
+
+B200 execution remains required. The first required B200 command is:
 
 ```bash
 .venv/bin/modal run cholesky/b64n256/cholesky_b64n256_modal.py \
-  --action tune --variants 11,18,19,20,21
+  --action tune --variants 25,29,30,31,32,33,34,35,36,37,38
 
 python3 -m py_compile \
   cholesky/b64n256/cholesky_b64n256.py \
@@ -378,10 +544,7 @@ primary custom-path correctness gate.
 
 ## Current status
 
-The extension revision before variants 18--21 compiled on B200 and all 18
-stable variants passed the six target-sized Modal cases without
-tensor-specific tolerance relaxation. Variant 11 was the isolated Modal
-winner; variant 8 won the three-round whole-grid sweep and remains the
-promoted default. Popcorn integration passed. Variants 18--21 require B200
-compilation, six-case validation, target timing, and follow-up NCU captures
-before any promotion decision.
+Variant 25 passes all six exact-shape validation families and is the current
+isolated B200 winner at a 235.4-microsecond median. Variant 18 remains the
+production default pending the next tuning round and normal promotion gates.
+Variants 29--38 are the unmeasured append-only candidates.
