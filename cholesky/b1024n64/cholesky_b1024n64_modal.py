@@ -36,8 +36,8 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 24
-VARIANT_IDS = (*range(20), 22, 23)
+VARIANT_COUNT = 25
+VARIANT_IDS = (*range(20), 22, 23, 24)
 VARIANT_NAMES = (
     "w4_blk_precise",
     "w4_blk_refined",
@@ -63,6 +63,7 @@ VARIANT_NAMES = (
     "retired_sync27",
     "w4_int_scalar_raw_shared_tail16",
     "w4_int_f2_raw_right_rootlook_shared_tail32",
+    "w4_right_hybrid_load1_raw_acc1_look1_cutlass_names",
 )
 LOCAL_SOLUTION = "cholesky/b1024n64/cholesky_b1024n64.py"
 LOCAL_SCRIPT = "cholesky/b1024n64/cholesky_b1024n64_modal.py"

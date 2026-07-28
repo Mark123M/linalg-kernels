@@ -390,3 +390,15 @@ passed all 17 cases. The final capture measured factor medians
 119.200/25.472/10.624 us, custom lower-update medians 21.984/6.816 us,
 and a 2.206 ms kernel span, 8.7% below the old default. Static validation
 and the case-insensitive rejected-token scan passed.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `9` and the cloned public variant is `10`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 runner autotune retained variant 9. Median mean time was
+2.200835 ms for variant 10 versus 2.201686 ms for variant 9, which was faster
+but below the 0.5% promotion gate.

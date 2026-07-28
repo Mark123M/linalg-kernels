@@ -446,3 +446,15 @@ popcorn submit --leaderboard cholesky --gpu B200 --mode test --no-tui \
 | 2026-07-21 | Retired failed rendezvous variants | restored the active kernel/harness to variants 0--19 and the original 19-column metadata ABI; retained focused `--variants` tune selection and added an explicit metadata-shape check |
 | 2026-07-21 | Added v22/v23 instruction-footprint hybrids | v22 = v6 register columns 0--47 + compact shared 16x16 tail; v23 = v13 root-lookahead through k=31 + compact shared 32x32 tail; original v6/v13 untouched; awaiting focused B200 sweep of 6,13,22,23 |
 | 2026-07-21 | Local CUDA 13.1 SM100a build + SASS count | build/load passes; v22: 164 regs, 16,640 B smem, zero stack/spills, 4,344 instructions (−37.6% vs v6); v23: 255 regs, 16,896 B smem, zero stack/spills, 5,512 instructions (−21.0% vs v13) |
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `13` and the cloned public variant is `24`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 Modal Popcorn sweep retained variant 13. The public B200
+geomean was 1.869219 ms for variant 13 versus 1.898057 ms for variant 24, so
+the cutlass-named clone was rejected.

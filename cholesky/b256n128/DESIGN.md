@@ -478,3 +478,15 @@ Please provide the tuning JSON after `--action tune`, `ncu-details.txt` for
 each captured variant, and the Popcorn `summary.json`. The `.nsys-rep` and
 `.ncu-rep` files are only needed if GUI or source-correlated follow-up analysis
 is required.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `23` and the cloned public variant is `28`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 three-round Modal Popcorn sweep selected variant 28. Median
+public B200 geomean was 1.964597 ms for variant 28 versus 1.999115 ms for
+variant 23, so the tracked default was promoted to the cutlass-named clone.

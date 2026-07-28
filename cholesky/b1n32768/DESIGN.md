@@ -700,3 +700,15 @@ and ID 15 is indistinguishable from the default capture. None passed the
 faster-than-default timeline screen, so no authoritative autotune was run.
 Variant 14 remains the default. Static validation and the case-insensitive
 rejected-token scan passed.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `14` and the cloned public variant is `18`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 runner autotune promoted variant 18. Median mean time was
+42.945897 ms for variant 18 versus 42.961749 ms for variant 14, so the
+tracked default was promoted to the cutlass-named clone.

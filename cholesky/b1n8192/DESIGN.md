@@ -292,3 +292,15 @@ regression for ID 11, so the 0.5% promotion gate retained variant 8.
 ID 12 did not pass the faster-than-default timeline screen and was not
 autotuned. Static validation and the case-insensitive rejected-token scan
 passed.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `8` and the cloned public variant is `13`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 runner autotune retained variant 8. Median mean time was
+5.772411 ms for variant 8 versus 5.775386 ms for variant 13, so the
+cutlass-named clone was rejected.

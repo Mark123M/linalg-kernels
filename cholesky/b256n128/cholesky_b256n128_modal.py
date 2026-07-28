@@ -41,7 +41,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 28
+VARIANT_COUNT = 29
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "phase_v6_precise_u8",
@@ -72,6 +72,7 @@ VARIANT_NAMES = (
     "simt_balanced_v6_raw_overlap",
     "simt_balanced_v13_warptail",
     "simt_balanced_v13_rows",
+    "simt_balanced_v13_raw_overlap_cutlass_names",
 )
 
 LOCAL_SOLUTION = "cholesky/b256n128/cholesky_b256n128.py"

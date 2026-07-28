@@ -41,6 +41,7 @@ VARIANT_NAMES = (
     "cluster_dag_refined_sub8_tc_all_t512",
     "staged_p128_to_p64_at_r512_tf32",
     "staged_p128_p64_p32_at_r512_r128_tf32",
+    "staged_p128_p64_p32_at_r512_r128_tf32_cutlass_names",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

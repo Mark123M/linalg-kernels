@@ -44,6 +44,7 @@ VARIANT_NAMES = (
     "ll_nb512_m64_microfused_compact_split2_tf32",
     "ll_nb512_m64_to_m32_at_r1024_tf32",
     "ll_nb512_m64_to_m32_at_r2048_tf32",
+    "ll_nb512_m64_microfused_split2_tf32_cutlass_names",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

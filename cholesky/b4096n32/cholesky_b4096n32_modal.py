@@ -36,7 +36,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 34
+VARIANT_COUNT = 35
 VARIANT_NAMES = (
     "w1_precise",
     "w1_refined",
@@ -72,6 +72,7 @@ VARIANT_NAMES = (
     "w2_raw_sw16_right_rootlook",
     "w2_raw_sw8_left",
     "w2_raw_sw8_right",
+    "w2_raw_sw8_left_cutlass_names",
 )
 LOCAL_SOLUTION = "cholesky/b4096n32/cholesky_b4096n32.py"
 LOCAL_SCRIPT = "cholesky/b4096n32/cholesky_b4096n32_modal.py"

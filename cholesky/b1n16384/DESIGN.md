@@ -186,3 +186,15 @@ the number of micro steps costs more than it saves at this shape. Per the
 timeline screen, none advanced to the authoritative autotune. Variant 0
 remains the default and no final-default capture was needed. Static
 validation and the case-insensitive rejected-token scan passed.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `0` and the cloned public variant is `7`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 runner autotune retained variant 0. Median mean time was
+15.128629 ms for variant 0 versus 15.161088 ms for variant 7, so the
+cutlass-named clone was rejected.

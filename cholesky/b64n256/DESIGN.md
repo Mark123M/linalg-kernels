@@ -548,3 +548,15 @@ Variant 25 passes all six exact-shape validation families and is the current
 isolated B200 winner at a 235.4-microsecond median. Variant 18 remains the
 production default pending the next tuning round and normal promotion gates.
 Variants 29--38 are the unmeasured append-only candidates.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `37` and the cloned public variant is `39`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 Modal tune retained variant 37. Median time was 0.192456 ms for
+variant 37 versus 0.197982 ms for variant 39, so the cutlass-named clone was
+rejected before an authoritative Popcorn promotion run.

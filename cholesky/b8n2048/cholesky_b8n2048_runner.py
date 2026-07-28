@@ -44,6 +44,7 @@ VARIANT_NAMES = (
     "rl_adaptive_hybrid_fp32",
     "ll_m128_to_m64_at_r1024_tf32",
     "ll_m128_m64_m32_at_r1024_r256_tf32",
+    "ll_m128_to_m64_at_r1024_tf32_cutlass_names",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

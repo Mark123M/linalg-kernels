@@ -320,3 +320,15 @@ statistics files. After `--action ncu`, provide `ncu-details.txt` for each
 selected variant; the `.ncu-rep` is only needed for GUI inspection. After
 `--action popcorn`, provide `summary.json` so the winning ID can replace the
 provisional default.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `32` and the cloned public variant is `34`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 Modal Popcorn sweep selected variant 34. The public B200
+geomean was 1.803467 ms for variant 34 versus 1.888341 ms for variant 32, so
+the tracked default was promoted to the cutlass-named clone.

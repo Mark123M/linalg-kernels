@@ -29,7 +29,7 @@ from typing import Any
 import modal
 
 
-VARIANT_COUNT = 39
+VARIANT_COUNT = 40
 VARIANT_IDS = tuple(range(VARIANT_COUNT))
 VARIANT_NAMES = (
     "cta256_rec32_scalar_simt_precise",
@@ -71,6 +71,7 @@ VARIANT_NAMES = (
     "cta512_ll8_outer_ll32_tc_outer_refined_pad129_deferred",
     "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129",
     "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129_deferred",
+    "cta512_ll8_regrow_outer_ll32_tc_outer_refined_pad129_cutlass_names",
 )
 METADATA_COLUMNS = (
     "variant",

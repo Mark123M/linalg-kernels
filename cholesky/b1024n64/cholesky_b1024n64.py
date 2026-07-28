@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 from functools import lru_cache
@@ -15,8 +16,10 @@ from torch.utils.cpp_extension import load_inline
 # The Popcorn tuner replaces this exact line in temporary, untracked copies.
 # 6, 8, 5, 11, 4, 7, 10
 _DEFAULT_VARIANT = 13  # POPCORN_VARIANT
-_VARIANT_COUNT = 24
-_VARIANT_IDS = (*range(20), 22, 23)
+_CUTLASS_BASE_VARIANT = 13
+_CUTLASS_VARIANT = 24
+_VARIANT_COUNT = 25
+_VARIANT_IDS = (*range(20), 22, 23, _CUTLASS_VARIANT)
 _CUSOLVERDX_VARIANT = 19
 
 _CPP_SOURCE = r"""
@@ -1382,6 +1385,28 @@ def _dx_info_buffer(device: str) -> torch.Tensor:
     return torch.zeros(1024, dtype=torch.int32, device=device)
 
 
+
+_CUTLASS_KERNEL_NAMES = (
+    "crout_64_kernel",
+    "right_looking_64_kernel",
+    "crout_hybrid_64_kernel",
+    "right_hybrid_64_kernel",
+    "smem_64_kernel",
+    "smem_reg_64_kernel",
+)
+_CUTLASS_KERNEL_RE = re.compile(
+    r"\b(" + "|".join(
+        re.escape(name) for name in _CUTLASS_KERNEL_NAMES
+    ) + r")\b"
+)
+
+
+def _cutlass_cuda_source() -> str:
+    return _CUTLASS_KERNEL_RE.sub(
+        lambda match: f"cutlass_{match.group(1)}", _CUDA_SOURCE
+    )
+
+
 @lru_cache(maxsize=1)
 def _native_module():
     previous_arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
@@ -1412,15 +1437,52 @@ def _native_module():
             os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch
 
 
+
+@lru_cache(maxsize=1)
+def _cutlass_module():
+    cuda_source = _cutlass_cuda_source()
+    previous_arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
+    try:
+        return load_inline(
+            name="cholesky_b1024n64_algorithms_v4_cutlass",
+            cpp_sources=_CPP_SOURCE,
+            cuda_sources=cuda_source,
+            functions=None,
+            extra_cflags=["-O3", "-std=c++20"],
+            extra_cuda_cflags=[
+                "-O3",
+                "-std=c++20",
+                "--use_fast_math",
+                "--extra-device-vectorization",
+                "-lineinfo",
+                "-Xptxas=-O3,-v,-warn-spills",
+                "-gencode",
+                "arch=compute_100a,code=sm_100a",
+            ],
+            verbose=False,
+        )
+    finally:
+        if previous_arch is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch
+
+
 def _run_variant(
     data: torch.Tensor,
     variant: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if variant not in _VARIANT_IDS:
-        raise ValueError(
-            f"variant must be one of {_VARIANT_IDS}, got {variant}"
-        )
+        raise ValueError(f"variant must be in {_VARIANT_IDS}, got {variant}")
+    if variant == _CUTLASS_VARIANT:
+        module = _cutlass_module()
+        selected = _CUTLASS_BASE_VARIANT
+        if out is None:
+            return module.run(data, selected)
+        module.run_out(data, out, selected)
+        return out
     if variant == _CUSOLVERDX_VARIANT:
         module = _cusolverdx_module()
         if out is None:
@@ -1435,7 +1497,10 @@ def _run_variant(
 
 
 def _variant_metadata() -> torch.Tensor:
-    return _native_module().metadata()
+    metadata = _native_module().metadata()
+    cutlass = metadata[_CUTLASS_BASE_VARIANT].clone().unsqueeze(0)
+    cutlass[0, 0] = _CUTLASS_VARIANT
+    return torch.cat((metadata, cutlass), dim=0)
 
 
 def custom_kernel(data: input_t) -> output_t:

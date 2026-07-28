@@ -244,3 +244,15 @@ autotune rounds. The authoritative benchmark rejected the favorable
 single-capture result: the best adaptive ID regressed 8.6% versus ID 2.
 The 0.5% promotion gate therefore retained variant 2. Static validation
 and the case-insensitive rejected-token scan passed.
+
+## Cutlass-name clone experiment
+
+A cutlass-named clone has been added for the current tracked default variant.
+The public base variant is `2` and the cloned public variant is `9`.
+The clone compiles identical CUDA algorithm source after renaming every custom
+`__global__` kernel entry point and matching launch/configuration reference to
+use a `cutlass_` prefix.
+
+The 2026-07-28 runner autotune promoted variant 9. Median mean time was
+494.656 us for variant 9 versus 498.027 us for variant 2, clearing the 0.5%
+promotion gate.

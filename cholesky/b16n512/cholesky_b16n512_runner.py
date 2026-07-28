@@ -30,7 +30,7 @@ PROMOTION_RATIO = decimal.Decimal("0.995")
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
-VARIANT_COUNT = 9
+VARIANT_COUNT = 10
 VARIANT_NAMES = (
     "r16_micro4x4_precise_scalar_u256",
     "r16_micro4x4_nr_scalar_u256",
@@ -41,6 +41,7 @@ VARIANT_NAMES = (
     "r16_micro2x4_precise_scalar_u512",
     "r16_raw_fused_m64_to_m32_at_r256",
     "r16_raw_fused_m64_to_m32_at_r128",
+    "staged64_fp32_raw_scalar_u256_cutlass_names",
 )
 DEFAULT_MARKER = re.compile(
     r"^_DEFAULT_VARIANT = \d+  # POPCORN_VARIANT$", re.MULTILINE
