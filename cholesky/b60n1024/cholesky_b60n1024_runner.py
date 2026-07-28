@@ -25,6 +25,8 @@ import urllib.request
 LEADERBOARD = "cholesky"
 GPU = "B200"
 TARGET_BENCHMARK_INDEX = 7
+BASELINE_VARIANT = 9
+PROMOTION_RATIO = decimal.Decimal("0.995")
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
@@ -37,6 +39,8 @@ VARIANT_NAMES = (
     "staged_precise_sub4_cublas_fp32_t256",
     "staged_precise_sub4_cublas_tf32_t256",
     "cluster_dag_refined_sub8_tc_all_t512",
+    "staged_p128_to_p64_at_r512_tf32",
+    "staged_p128_p64_p32_at_r512_r128_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -451,6 +455,11 @@ def _autotune(args: argparse.Namespace) -> Path:
         raise ValueError("--rounds must be positive")
     if args.max_workers <= 0:
         raise ValueError("--max-workers must be positive")
+    if BASELINE_VARIANT not in variants:
+        raise ValueError(
+            f"promotion requires current default {BASELINE_VARIANT} in "
+            "the sweep so the 0.5% gate uses a contemporaneous baseline"
+        )
     help_text = _preflight_output(args.popcorn)
     _cli_id()
     source_path = _source_path()
@@ -579,14 +588,42 @@ def _autotune(args: argparse.Namespace) -> Path:
             "no variant passed every public benchmark row in every round; "
             f"inspect {summary_path}"
         )
-    winner = ranking[0]["variant"]
-    winner_source = run_dir / (
-        f"winner_v{winner:02d}_{VARIANT_NAMES[winner]}.py"
+    baseline = next(
+        (
+            item for item in ranking
+            if item["variant"] == BASELINE_VARIANT
+        ),
+        None,
     )
-    shutil.copy2(submissions[winner], winner_source)
-    promotion = _atomic_promote(
-        source_path, source, source_hash, winner
-    )
+    candidates = [
+        item for item in ranking
+        if item["variant"] != BASELINE_VARIANT
+    ]
+    winner = candidates[0] if candidates else None
+    threshold: decimal.Decimal | None = None
+    promoted_variant: int | None = None
+    if baseline is None:
+        promotion = "retained_default_baseline_failed"
+    elif winner is None:
+        promotion = "retained_default_no_candidate"
+    else:
+        baseline_mean = decimal.Decimal(baseline["median_mean_ns"])
+        threshold = baseline_mean * PROMOTION_RATIO
+        winner_mean = decimal.Decimal(winner["median_mean_ns"])
+        if winner_mean <= threshold:
+            promoted_variant = int(winner["variant"])
+            promotion = _atomic_promote(
+                source_path, source, source_hash, promoted_variant
+            )
+        else:
+            promotion = "retained_default_below_required_gain"
+        winner_source = run_dir / (
+            f"best_candidate_v{winner['variant']:02d}_"
+            f"{winner['name']}.py"
+        )
+        shutil.copy2(
+            submissions[int(winner["variant"])], winner_source
+        )
     _write_json(
         summary_path,
         {
@@ -606,13 +643,18 @@ def _autotune(args: argparse.Namespace) -> Path:
             ),
             "ranking": ranking,
             "winner": winner,
-            "winner_source": str(winner_source),
+            "baseline": baseline,
+            "promotion_ratio": str(PROMOTION_RATIO),
+            "promotion_threshold_ns": (
+                str(threshold) if threshold is not None else None
+            ),
+            "promoted_variant": promoted_variant,
             "promotion": promotion,
         },
     )
     print(
-        f"winner={winner} median_mean_ns="
-        f"{ranking[0]['median_mean_ns']} promotion={promotion}",
+        f"best_candidate={winner} baseline={baseline} "
+        f"promotion={promotion}",
         flush=True,
     )
     return summary_path

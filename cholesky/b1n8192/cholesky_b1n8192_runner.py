@@ -25,10 +25,11 @@ import urllib.request
 LEADERBOARD = "cholesky"
 GPU = "B200"
 TARGET_BENCHMARK_INDEX = 12
+BASELINE_VARIANT = 8
+PROMOTION_RATIO = decimal.Decimal("0.995")
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
-BASELINE_TARGET_NS = decimal.Decimal("6371008.014678955")
 VARIANT_NAMES = (
     "ll_nb1024_m128_microfused_tf32",
     "ll_nb1024_m128_invgemm_tf32",
@@ -41,6 +42,8 @@ VARIANT_NAMES = (
     "ll_nb512_m64_microfused_split2_tf32",
     "ll_nb512_m64_microfused_compact_tf32",
     "ll_nb512_m64_microfused_compact_split2_tf32",
+    "ll_nb512_m64_to_m32_at_r1024_tf32",
+    "ll_nb512_m64_to_m32_at_r2048_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -431,6 +434,11 @@ def _autotune(args: argparse.Namespace) -> Path:
     variants = _parse_variants(args.variants)
     if args.rounds <= 0 or args.max_workers <= 0:
         raise ValueError("rounds and max-workers must be positive")
+    if BASELINE_VARIANT not in variants:
+        raise ValueError(
+            f"promotion requires current default {BASELINE_VARIANT} in "
+            "the sweep so the 0.5% gate uses a contemporaneous baseline"
+        )
     help_text = _preflight_output(args.popcorn)
     _cli_id()
     source_path = _source_path()
@@ -557,21 +565,42 @@ def _autotune(args: argparse.Namespace) -> Path:
             "no variant passed every round; inspect "
             f"{summary_path}"
         )
-    winner = ranking[0]["variant"]
-    winner_mean = decimal.Decimal(ranking[0]["median_mean_ns"])
-    winner_source = run_dir / (
-        f"winner_v{winner:02d}_{VARIANT_NAMES[winner]}.py"
+    baseline = next(
+        (
+            item for item in ranking
+            if item["variant"] == BASELINE_VARIANT
+        ),
+        None,
     )
-    shutil.copy2(submissions[winner], winner_source)
-    beat_baseline = winner_mean < BASELINE_TARGET_NS
-    if beat_baseline:
-        promotion = _atomic_promote(
-            source_path, source, source_hash, winner
-        )
-        promoted_variant: int | None = winner
+    candidates = [
+        item for item in ranking
+        if item["variant"] != BASELINE_VARIANT
+    ]
+    winner = candidates[0] if candidates else None
+    threshold: decimal.Decimal | None = None
+    promoted_variant: int | None = None
+    if baseline is None:
+        promotion = "retained_default_baseline_failed"
+    elif winner is None:
+        promotion = "retained_default_no_candidate"
     else:
-        promotion = "retained_default_no_baseline_win"
-        promoted_variant = None
+        baseline_mean = decimal.Decimal(baseline["median_mean_ns"])
+        threshold = baseline_mean * PROMOTION_RATIO
+        winner_mean = decimal.Decimal(winner["median_mean_ns"])
+        if winner_mean <= threshold:
+            promoted_variant = int(winner["variant"])
+            promotion = _atomic_promote(
+                source_path, source, source_hash, promoted_variant
+            )
+        else:
+            promotion = "retained_default_below_required_gain"
+        winner_source = run_dir / (
+            f"best_candidate_v{winner['variant']:02d}_"
+            f"{winner['name']}.py"
+        )
+        shutil.copy2(
+            submissions[int(winner["variant"])], winner_source
+        )
     _write_json(
         summary_path,
         {
@@ -591,17 +620,18 @@ def _autotune(args: argparse.Namespace) -> Path:
             ),
             "ranking": ranking,
             "winner": winner,
-            "winner_source": str(winner_source),
-            "baseline_target_ns": str(BASELINE_TARGET_NS),
-            "beat_baseline": beat_baseline,
+            "baseline": baseline,
+            "promotion_ratio": str(PROMOTION_RATIO),
+            "promotion_threshold_ns": (
+                str(threshold) if threshold is not None else None
+            ),
             "promoted_variant": promoted_variant,
             "promotion": promotion,
         },
     )
     print(
-        f"winner={winner} median_mean_ns="
-        f"{ranking[0]['median_mean_ns']} "
-        f"baseline_ns={BASELINE_TARGET_NS} promotion={promotion}",
+        f"best_candidate={winner} baseline={baseline} "
+        f"promotion={promotion}",
         flush=True,
     )
     return summary_path

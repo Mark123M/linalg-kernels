@@ -652,3 +652,51 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+VeloQ measured the default inverse-building POTRF128 launches at roughly
+83 us throughout the warmed timeline. The trace includes kernels, runtime,
+synchronization, and NVTX records but no GPU metrics, so this is direct
+timing evidence only.
+
+All appended schedules keep NB=1024:
+
+| ID | Width schedule for remaining `R` | POTRF 128/64/32 | TRSM 128/64/32 |
+|---:|---|---:|---:|
+| 15 | 128 to `R=4096`, then 64 | 224 / 64 / 0 | 224 / 63 / 0 |
+| 16 | 128 to `R=8192`, then 64 | 192 / 128 / 0 | 192 / 127 / 0 |
+| 17 | 128/64/32 at `R=8192` and `R=1024` | 192 / 112 / 32 | 192 / 112 / 31 |
+
+The precise 64- and 32-wide direct factors and inverse builders mirror the
+16384 implementation. The width-64 factor composes two POTF2-32 blocks
+with a local solve/lower update; width 32 is direct. Inner history GEMMs,
+inverse-apply GEMMs, and float4 copy-backs use the selected compile-time
+width. The default 128-wide implementation is not refactored.
+
+The two cut points are NB-aligned, so each 1024-wide outer panel has one
+micro width. No rank contribution crosses a width boundary, the dense
+inverse retains exact strict-upper zeros, and the existing NB-wedge cleanup
+restores the output contract.
+
+All three variants passed the Modal B200 preflight with scaled
+reconstruction residual `0.061490` against a limit of 16. VeloQ showed
+the requested `128 -> 64` order for IDs 15/16 and `128 -> 64 -> 32` for
+ID 17. In ID 17 the factor medians were 83.136 us, 67.136 us, and
+30.720 us, reductions of 19.2% and 54.2%. Width-specialized copy-back
+medians fell from 4.896 us to 2.048 us and 1.632 us. The history/apply
+dimensions selected distinct cuBLAS kernel families as the width changed.
+
+| ID | W128/W64/W32 factor p50 (us) | Kernel trace span (ms) | Delta from default |
+|---:|---:|---:|---:|
+| 14 | 82.9 / - / - | 44.583 | baseline |
+| 15 | 82.9 / 67.0 / - | 44.615 | +0.1% |
+| 16 | 82.8 / 66.9 / - | 48.634 | +9.1% |
+| 17 | 83.1 / 67.1 / 30.7 | 49.225 | +10.4% |
+
+Although every smaller factor/copy specialization is materially faster per
+launch, the additional launches erase the gain; IDs 16/17 regress clearly
+and ID 15 is indistinguishable from the default capture. None passed the
+faster-than-default timeline screen, so no authoritative autotune was run.
+Variant 14 remains the default. Static validation and the case-insensitive
+rejected-token scan passed.

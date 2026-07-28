@@ -202,3 +202,45 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+VeloQ measured the variant-2 fused factor/solve launch near 49 us through
+all non-final 64-wide panels; only the final launch fell to about 22 us.
+The trace exposes kernels, runtime, synchronization, and NVTX records but
+no GPU metrics, so this plateau is a direct timeline measurement.
+
+Variants 7 and 8 retain the raw-root 64-wide fused kernel for their prefix
+and append a 32-wide direct factor/solve plus a lower-only rank-32 update:
+
+| ID | Width schedule for remaining `R` | POTRF 64/32 | TRSM 64/32 | Launches |
+|---:|---|---:|---:|---:|
+| 7 | 64 when `R > 256`, otherwise 32 | 4 / 8 | 4 / 7 | 24 |
+| 8 | 64 when `R > 128`, otherwise 32 | 6 / 4 | 6 / 3 | 20 |
+
+The 32-wide fused kernel uses 128 threads and the existing warp-direct
+POTF2-32 arithmetic. Each non-factor CTA redundantly factors the same
+diagonal block, then solves one 32-row tile. The accompanying rank-32
+update partitions only the lower trailing matrix into 32x32 tiles, so no
+strict-upper value is written or later consumed. Width cutovers are
+64-aligned, and the established width-64 update completes before the
+first width-32 factor.
+
+Both candidates passed the Modal B200 preflight; scaled reconstruction
+residuals were `0.003330` for ID 7 and `0.003154` for ID 8. VeloQ confirmed
+that the width-64 factor/solve launches precede the width-32 launches.
+Across the two traces, fused factor/solve medians fell from 48.8-49.1 us
+to 27.2-27.5 us (about 44%), while lower-update medians fell from
+14.8-15.3 us to 7.6-8.0 us (about 48-49%).
+
+| ID | Kernel trace span | Delta from default | Autotune median target mean |
+|---:|---:|---:|---:|
+| 2 | 598.462 us | baseline | 498.724 us |
+| 7 | 591.456 us | -1.2% | 563.407 us |
+| 8 | 558.046 us | -6.8% | 541.606 us |
+
+Every public row and the target row passed in all three alternating
+autotune rounds. The authoritative benchmark rejected the favorable
+single-capture result: the best adaptive ID regressed 8.6% versus ID 2.
+The 0.5% promotion gate therefore retained variant 2. Static validation
+and the case-insensitive rejected-token scan passed.

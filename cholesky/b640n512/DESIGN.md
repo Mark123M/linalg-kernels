@@ -508,7 +508,8 @@ The shape-local Modal launcher profiles one warmed factorization on B200:
 .venv/bin/python -m modal run cholesky/b640n512/cholesky_b640n512_modal.py --variant 20
 ```
 
-`--variant -1` selects the tracked default, currently variant 20. Its staged
+`--variant -1` selects the tracked default, now variant 21. The former
+variant-20 staged
 128-column cuBLAS-TF32 schedule has 12 algorithm launches per factorization.
 Input generation, extension compilation, preparation, warmup, and correctness
 validation are outside the capture; the NVTX range contains exactly one
@@ -520,3 +521,53 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+The warmed variant-20 NSys timeline shows all four 128-wide POTRF launches
+at approximately 325-336 us even though the solve and GEMM grids contract.
+This is direct VeloQ timeline evidence; the report has runtime,
+synchronization, kernel, and NVTX records but no GPU metrics.
+
+Two append-only schedules retain precise factor arithmetic and TF32 trailing
+updates:
+
+| ID | Width schedule for remaining `R` | POTRF 128/64/32 | TRSM 128/64/32 |
+|---:|---|---:|---:|
+| 21 | 128 when `R > 256`, otherwise 64 | 2 / 4 / 0 | 2 / 3 / 0 |
+| 22 | 128 when `R > 256`, 64 when `R > 64`, otherwise 32 | 2 / 3 / 2 | 2 / 3 / 1 |
+
+The width-64 and width-32 factors reuse the established POTF2-32 primitive;
+the width-64 specialization adds one 32-row TRSM/update before its second
+direct factor. Their solve kernels use compile-time square row tiles and
+four-thread column groups. Updates with more than 128 rows remaining use
+the existing handle-based strided-batched GEMM with the selected rank.
+At 128 rows or fewer, a custom rank-specialized kernel updates only lower
+64x64 or 32x32 tiles.
+
+All cutovers are aligned to both the outgoing and incoming widths. Each
+factor consumes a lower block fully updated by the preceding rank update,
+each solve writes a complete panel column, and diagonal update tiles suppress
+strict-upper stores. The final upper-zero pass is unchanged.
+
+Both candidates passed the Modal B200 preflight with scaled reconstruction
+residual `1.187654`. VeloQ confirmed `128 -> 64` ordering for ID 21 and
+`128 -> 64 -> 32` for ID 22. In ID 22 the factor medians were
+332.800 us, 64.416 us, and 23.648 us; solve medians were 380.544 us,
+77.312 us, and 12.607 us. The custom lower-update median dropped from
+41.472 us at width 64 to 8.672 us at width 32. Every transition therefore
+cleared the 10% gate.
+
+| ID | Kernel trace span | Delta from ID 20 | Autotune median target mean |
+|---:|---:|---:|---:|
+| 20 | 3.368 ms | baseline | 3.065 ms |
+| 21 | 2.914 ms | -13.5% | 2.887 ms |
+| 22 | 2.903 ms | -13.8% | 2.891 ms |
+
+All public rows and the target row passed in all three alternating rounds.
+ID 21 improved the authoritative target median by 5.8%, passed the 0.5%
+gate, and is now the tracked default. Official test submission 920855
+passed all 17 cases. The final promoted-default capture measured
+332.416/64.128 us factor medians, 380.447/77.248 us solve medians, and a
+2.878 ms kernel span, 14.5% below the original trace. Static validation
+and the case-insensitive rejected-token scan passed.

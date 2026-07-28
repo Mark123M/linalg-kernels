@@ -50,6 +50,9 @@ VARIANT_NAMES = (
     "ll_nb1024_rank8w_tf32",
     "ll_nb1024_microfused_tf32",
     "ll_nb1024_invgemm_tf32",
+    "ll_nb1024_m128_to_m64_at_r4096_tf32",
+    "ll_nb1024_m128_to_m64_at_r8192_tf32",
+    "ll_nb1024_m128_m64_m32_at_r8192_r1024_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

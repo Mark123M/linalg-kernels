@@ -241,3 +241,54 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+VeloQ analysis of the warmed variant-8 timeline measured the fused
+64-wide factor/solve launch at roughly 35-38 us while its grid contracted
+from 255 consumer CTAs to 3. The trace contains kernel, runtime,
+synchronization, and NVTX data but no GPU metrics. The fixed duration is
+therefore a direct timeline observation; its internal cause is not inferred
+from hardware counters.
+
+Variants 11 and 12 are append-only controls and do not change the tracked
+default:
+
+| ID | NB | Width schedule for remaining `R` | POTRF 64/32 | TRSM 64/32 |
+|---:|---:|---|---:|---:|
+| 11 | 512 | 64 when `R > 1024`, otherwise 32 | 112 / 32 | 112 / 31 |
+| 12 | 512 | 64 when `R > 2048`, otherwise 32 | 96 / 64 | 96 / 63 |
+
+The 32-wide specialization uses 128 threads, an `ld=33` shared tile,
+10,752 bytes of factor storage, and one consumer per trailing tile. It
+reuses the exact FP32 square-root/division factor path and the existing
+inverse construction. At width 32 the inverse builder completes after its
+single 32-wide diagonal inversion; the 64- and 128-wide combine stages are
+compile-time absent. The four consumer warps each own one eight-column
+stripe and collectively cover one 32x32 solve tile.
+
+Both cutovers occur on NB=512 boundaries. Consequently every outer history
+update still covers exactly one 512-wide panel, while each inner update,
+factor, inverse publication, and apply uses a single compile-time width.
+The release/acquire handoff and final strict-upper wedge cleanup are
+unchanged. The flag workspace is sized by the minimum width so the
+width-32 tail uses disjoint in-bounds publication slots.
+
+Both candidates passed the Modal B200 preflight with scaled reconstruction
+residuals `0.090949` and `0.090948`. VeloQ confirmed that all width-64
+fused launches precede the width-32 launches. ID 11 reduced the fused
+factor/solve median from 36.896 us to 20.320 us (44.9%); ID 12 measured
+37.216 us and 20.256 us (45.6%).
+
+| ID | Kernel trace span | Delta from ID 8 | Autotune median target mean |
+|---:|---:|---:|---:|
+| 8 | 6.785 ms | baseline | 5.779 ms |
+| 11 | 6.108 ms | -10.0% | 6.102 ms |
+| 12 | 6.824 ms | +0.6% | not advanced |
+
+ID 11 and the current default passed every public row and the target row
+in all three alternating rounds. The authoritative median showed a 5.6%
+regression for ID 11, so the 0.5% promotion gate retained variant 8.
+ID 12 did not pass the faster-than-default timeline screen and was not
+autotuned. Static validation and the case-insensitive rejected-token scan
+passed.

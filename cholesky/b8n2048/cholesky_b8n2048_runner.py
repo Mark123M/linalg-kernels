@@ -25,6 +25,7 @@ import urllib.request
 LEADERBOARD = "cholesky"
 GPU = "B200"
 TARGET_BENCHMARK_INDEX = 9
+BASELINE_VARIANT = 11
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
@@ -41,6 +42,8 @@ VARIANT_NAMES = (
     "ll_adaptive_cublas_tf32",
     "ll_adaptive_custom_fp32",
     "rl_adaptive_hybrid_fp32",
+    "ll_m128_to_m64_at_r1024_tf32",
+    "ll_m128_m64_m32_at_r1024_r256_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -439,10 +442,10 @@ def _autotune(args: argparse.Namespace) -> Path:
     variants = _parse_variants(args.variants)
     if args.rounds <= 0 or args.max_workers <= 0:
         raise ValueError("rounds and max-workers must be positive")
-    if not args.no_promote and 0 not in variants:
+    if not args.no_promote and BASELINE_VARIANT not in variants:
         raise ValueError(
-            "promotion requires variant 0 in the sweep so the 0.5% gate "
-            "uses a contemporaneous baseline"
+            f"promotion requires current default {BASELINE_VARIANT} in "
+            "the sweep so the 0.5% gate uses a contemporaneous baseline"
         )
     help_text = _preflight_output(args.popcorn)
     _cli_id()
@@ -555,10 +558,15 @@ def _autotune(args: argparse.Namespace) -> Path:
     )
     summary_path = run_dir / "summary.json"
     native_ranking = [
-        item for item in ranking if item["variant"] != 0
+        item for item in ranking
+        if item["variant"] != BASELINE_VARIANT
     ]
     baseline = next(
-        (item for item in ranking if item["variant"] == 0), None
+        (
+            item for item in ranking
+            if item["variant"] == BASELINE_VARIANT
+        ),
+        None,
     )
     promotion = "disabled"
     promoted_variant: int | None = None

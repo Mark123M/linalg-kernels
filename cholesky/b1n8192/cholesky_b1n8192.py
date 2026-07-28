@@ -21,6 +21,8 @@ _VARIANT_NAMES = (
     "ll_nb512_m64_microfused_split2_tf32",
     "ll_nb512_m64_microfused_compact_tf32",
     "ll_nb512_m64_microfused_compact_split2_tf32",
+    "ll_nb512_m64_to_m32_at_r1024_tf32",
+    "ll_nb512_m64_to_m32_at_r2048_tf32",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -52,6 +54,13 @@ _METADATA_COLUMNS = (
     "implemented",
     "factor_mode",
     "apply_mode",
+    "tail_policy",
+    "potrf128_count",
+    "potrf64_count",
+    "potrf32_count",
+    "trsm128_count",
+    "trsm64_count",
+    "trsm32_count",
 )
 
 _CPP_SOURCE = r"""
@@ -95,8 +104,8 @@ namespace {
 
 constexpr int kN = 8192;
 constexpr int kPanelLd = 9;
-constexpr int kVariantCount = 11;
-constexpr int kMetadataColumns = 26;
+constexpr int kVariantCount = 13;
+constexpr int kMetadataColumns = 33;
 
 constexpr int kLeftLook = 0;
 constexpr int kTrsmFusedMicro = 3;
@@ -109,6 +118,19 @@ constexpr int kApplySplit2 = 1;
 
 template <int Micro>
 struct Tile;
+
+template <>
+struct Tile<32> {
+  static constexpr int micro = 32;
+  static constexpr int ld = 33;
+  static constexpr int threads = 128;
+  static constexpr int half = 16;
+  static constexpr int factor_bytes =
+      static_cast<int>(sizeof(float)) *
+      (2 * micro * ld + micro + micro * kPanelLd + half * half);
+  static constexpr int apply_bytes =
+      static_cast<int>(sizeof(float)) * 2 * micro * ld;
+};
 
 template <>
 struct Tile<64> {
@@ -136,6 +158,8 @@ struct Tile<128> {
       static_cast<int>(sizeof(float)) * 2 * micro * ld;
 };
 
+static_assert(Tile<32>::factor_bytes == 10752);
+static_assert(Tile<32>::apply_bytes == 8448);
 static_assert(Tile<64>::factor_bytes == 39936);
 static_assert(Tile<64>::apply_bytes == 33280);
 static_assert(Tile<128>::factor_bytes == 153600);
@@ -151,6 +175,10 @@ struct Variant;
     static constexpr int trsm_mode = TRSM;                           \
     static constexpr int factor_mode = FACTOR;                       \
     static constexpr int consumer_split = SPLIT;                     \
+    static constexpr int min_micro = MICRO;                          \
+    static constexpr int tail_policy = 0;                            \
+    static constexpr int tail_cutoff = 0;                            \
+    static constexpr bool adaptive = false;                          \
     static constexpr bool fused = TRSM == kTrsmFusedMicro;           \
     static constexpr bool gemm = TRSM == kTrsmGemm;                  \
     static constexpr bool compact = FACTOR == kFactorCompact;        \
@@ -170,6 +198,27 @@ SPEC(10, 512, 64, kTrsmFusedMicro, kFactorCompact, 2);
 
 #undef SPEC
 
+#define ADAPTIVE_SPEC(ID, CUTOFF, POLICY)                            \
+  template <> struct Variant<ID> {                                   \
+    static constexpr int nb = 512;                                   \
+    static constexpr int micro = 64;                                 \
+    static constexpr int trsm_mode = kTrsmFusedMicro;                \
+    static constexpr int factor_mode = kFactorWide;                  \
+    static constexpr int consumer_split = 1;                         \
+    static constexpr int min_micro = 32;                             \
+    static constexpr int tail_policy = POLICY;                       \
+    static constexpr int tail_cutoff = CUTOFF;                       \
+    static constexpr bool adaptive = true;                           \
+    static constexpr bool fused = true;                              \
+    static constexpr bool gemm = false;                              \
+    static constexpr bool compact = false;                           \
+  }
+
+ADAPTIVE_SPEC(11, 1024, 1);
+ADAPTIVE_SPEC(12, 2048, 2);
+
+#undef ADAPTIVE_SPEC
+
 template <int... Ids>
 constexpr std::array<bool, sizeof...(Ids)> flags_usage_of(
     std::integer_sequence<int, Ids...>) {
@@ -188,12 +237,20 @@ constexpr std::array<int, sizeof...(Ids)> micro_of(
   return {Variant<Ids>::micro...};
 }
 
+template <int... Ids>
+constexpr std::array<int, sizeof...(Ids)> min_micro_of(
+    std::integer_sequence<int, Ids...>) {
+  return {Variant<Ids>::min_micro...};
+}
+
 constexpr auto kVariantUsesFlags =
     flags_usage_of(std::make_integer_sequence<int, kVariantCount>{});
 constexpr auto kVariantUsesScratch =
     scratch_usage_of(std::make_integer_sequence<int, kVariantCount>{});
 constexpr auto kVariantMicro =
     micro_of(std::make_integer_sequence<int, kVariantCount>{});
+constexpr auto kVariantMinMicro =
+    min_micro_of(std::make_integer_sequence<int, kVariantCount>{});
 
 __device__ __forceinline__ int64_t matrix_index(
     int row, int column) {
@@ -1232,6 +1289,42 @@ void launch_staged(
   launch_wedges(output, V::nb);
 }
 
+template <int Id>
+void launch_adaptive(
+    float* output, const float* input, float* t_inv,
+    int* flags) {
+  using V = Variant<Id>;
+  static_assert(V::adaptive);
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  CublasStateGuard guard(handle);
+  launch_copy(input, output);
+  for (int64_t panel = 0; panel < kN; panel += V::nb) {
+    if (panel > 0) {
+      gemm_history(handle, output, panel, V::nb);
+    }
+    int64_t micro = panel;
+    while (micro < panel + V::nb) {
+      const int remaining = static_cast<int>(kN - micro);
+      if (remaining > V::tail_cutoff) {
+        if (micro > panel) {
+          gemm_inner<64>(handle, output, panel, micro);
+        }
+        launch_fused_micro<64, false, 1>(
+            output, static_cast<int>(micro), t_inv, flags);
+        micro += 64;
+      } else {
+        if (micro > panel) {
+          gemm_inner<32>(handle, output, panel, micro);
+        }
+        launch_fused_micro<32, false, 1>(
+            output, static_cast<int>(micro), t_inv, flags);
+        micro += 32;
+      }
+    }
+  }
+  launch_wedges(output, V::nb);
+}
+
 void check_input(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda(), "input must be CUDA");
   TORCH_CHECK(
@@ -1297,7 +1390,20 @@ template <int Id>
 void configure_one() {
   using V = Variant<Id>;
   constexpr int Micro = V::micro;
-  if constexpr (V::fused) {
+  if constexpr (V::adaptive) {
+    configure_dynamic(
+        fused_micro_kernel<64, false, 1>,
+        Tile<64>::factor_bytes);
+    configure_dynamic(
+        fused_micro_kernel<32, false, 1>,
+        Tile<32>::factor_bytes);
+    checked_attributes(fused_micro_kernel<64, false, 1>);
+    checked_attributes(fused_micro_kernel<32, false, 1>);
+    TORCH_CHECK(
+        (fused_micro_grid_limit<64, false, 1>() >= 2 &&
+         fused_micro_grid_limit<32, false, 1>() >= 2),
+        "adaptive fused kernels need a consumer CTA");
+  } else if constexpr (V::fused) {
     configure_dynamic(
         fused_micro_kernel<
             Micro, V::compact, V::consumer_split>,
@@ -1330,8 +1436,10 @@ void configure_variant(int variant) {
     case 8: configure_one<8>(); break;
     case 9: configure_one<9>(); break;
     case 10: configure_one<10>(); break;
+    case 11: configure_one<11>(); break;
+    case 12: configure_one<12>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 10]");
+      TORCH_CHECK(false, "native variant must be in [0, 12]");
   }
 }
 
@@ -1361,8 +1469,12 @@ void launch_variant(
         output, input, t_inv, flags, scratch); break;
     case 10: launch_staged<10>(
         output, input, t_inv, flags, scratch); break;
+    case 11: launch_adaptive<11>(
+        output, input, t_inv, flags); break;
+    case 12: launch_adaptive<12>(
+        output, input, t_inv, flags); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 10]");
+      TORCH_CHECK(false, "native variant must be in [0, 12]");
   }
 }
 
@@ -1399,8 +1511,16 @@ void write_metadata(int64_t* rows) {
   const cudaFuncAttributes wedges =
       checked_attributes(zero_wedges_kernel);
   const int panels = kN / V::nb;
-  const int micros = kN / Micro;
-  const int inner = panels * (V::nb / Micro - 1);
+  const int potrf128 =
+      V::adaptive ? 0 : (Micro == 128 ? kN / 128 : 0);
+  const int potrf64 =
+      V::adaptive
+          ? (kN - V::tail_cutoff) / 64
+          : (Micro == 64 ? kN / 64 : 0);
+  const int potrf32 =
+      V::adaptive ? V::tail_cutoff / 32 : 0;
+  const int micros = potrf128 + potrf64 + potrf32;
+  const int inner = micros - panels;
   const int big = panels - 1;
   const int applies = V::gemm ? 2 * (micros - 1) : 0;
   const int flag_fill = V::fused ? 1 : 0;
@@ -1432,6 +1552,15 @@ void write_metadata(int64_t* rows) {
   row[24] = V::factor_mode;
   row[25] =
       V::consumer_split == 2 ? kApplySplit2 : kApplyWhole;
+  row[26] = V::tail_policy;
+  row[27] = potrf128;
+  row[28] = potrf64;
+  row[29] = potrf32;
+  row[30] = potrf128 > 0 && potrf64 == 0 && potrf32 == 0
+      ? potrf128 - 1 : potrf128;
+  row[31] = potrf64 > 0 && potrf32 == 0
+      ? potrf64 - 1 : potrf64;
+  row[32] = potrf32 > 0 ? potrf32 - 1 : 0;
 }
 
 }  // namespace
@@ -1439,7 +1568,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b1n8192_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 10]");
+      "native variant must be in [0, 12]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -1449,17 +1578,18 @@ void cholesky_b1n8192_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 10]");
+      "native variant must be in [0, 12]");
   c10::cuda::CUDAGuard device_guard(data.device());
   const int selected = static_cast<int>(variant);
   const int micro = kVariantMicro[selected];
+  const int min_micro = kVariantMinMicro[selected];
   at::Tensor t_inv = at::empty(
       {static_cast<int64_t>(micro) * micro}, data.options());
   at::Tensor flags;
   int* flags_pointer = nullptr;
   if (kVariantUsesFlags[selected]) {
     flags = at::zeros(
-        {kN / micro}, data.options().dtype(at::kInt));
+        {kN / min_micro}, data.options().dtype(at::kInt));
     flags_pointer = flags.data_ptr<int>();
   }
   at::Tensor scratch;
@@ -1503,6 +1633,8 @@ at::Tensor cholesky_b1n8192_metadata() {
   write_metadata<8>(rows);
   write_metadata<9>(rows);
   write_metadata<10>(rows);
+  write_metadata<11>(rows);
+  write_metadata<12>(rows);
   return result;
 }
 """

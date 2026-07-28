@@ -223,3 +223,4 @@ profiles/
 
 # Generated tuning and profiler output for Cholesky shape specializations.
 /cholesky/b[0-9]*n[0-9]*/artifacts/
+*.run

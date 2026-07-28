@@ -343,8 +343,8 @@ The shape-local Modal launcher profiles one warmed factorization on B200:
 .venv/bin/python -m modal run cholesky/b8n2048/cholesky_b8n2048_modal.py --variant 5
 ```
 
-`--variant -1` selects the tracked default, currently native variant 5.
-Metadata records 48 algorithm launches for its fixed-128 left-looking custom
+`--variant -1` selects the tracked default, now native variant 11.
+Metadata records 72 algorithm launches for its adaptive left-looking custom
 schedule. Variant 0 is the torch baseline and is intentionally rejected by
 this native out-parameter endpoint. Input generation, compilation,
 preparation, warmup, and correctness validation are outside the capture; the
@@ -356,3 +356,52 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+The warmed variant-5 timeline holds each POTRF128 near 145-148 us. Its TRSM
+falls initially but then plateaus around 43 us after the grid drops below
+one B200 wave. These are direct VeloQ timeline measurements; the report
+contains no GPU metrics.
+
+Variants 11 and 12 preserve the left-looking TF32 schedule while varying
+the compile-time micro width:
+
+| ID | Width schedule for remaining `R` | POTRF 128/64/32 | TRSM 128/64/32 |
+|---:|---|---:|---:|
+| 11 | 128 when `R > 1024`, otherwise 64 | 8 / 16 / 0 | 8 / 15 / 0 |
+| 12 | 128 when `R > 1024`, 64 when `R > 256`, otherwise 32 | 8 / 12 / 8 | 8 / 12 / 7 |
+
+Every step first applies the complete left-looking history GEMM to the
+current width, then launches a matching direct factor and triangular solve.
+The width-128 and width-64 factors are compile-time compositions of the
+existing POTF2-32, local TRSM, and lower-only local update; width 32 ends
+after the direct factor. Solve row tiles are 64 at widths 128 and 64, and
+32 at width 32. Library GEMM dimensions therefore change with every width
+band without introducing a new library dependency.
+
+The history update contains every previously completed column, so changing
+width cannot omit or repeat a rank contribution. Factors read only the
+updated lower block, solves write the complete panel below it, and the
+existing final upper-zero pass remains unchanged.
+
+Both candidates passed the Modal B200 preflight with scaled reconstruction
+residual `0.373713`. VeloQ confirmed `128 -> 64` ordering for ID 11 and
+`128 -> 64 -> 32` for ID 12. In ID 12, factor medians were
+146.144/54.176/22.656 us and solve medians were
+68.384/23.392/10.656 us. The reductions are 63%, 58%, 66%, and 54%
+across the two width transitions.
+
+| ID | Kernel trace span | Delta from ID 5 | Autotune median target mean |
+|---:|---:|---:|---:|
+| 5 | 3.483 ms | baseline | 3.330 ms |
+| 11 | 3.348 ms | -3.9% | 3.265 ms |
+| 12 | 3.375 ms | -3.1% | 3.274 ms |
+
+All public rows and the target row passed in all three alternating rounds.
+ID 11 improved the authoritative target median by 1.9%, passed the 0.5%
+gate, and is now the tracked default. Official test submission 920854
+passed all 17 cases. The final capture measured factor medians
+146.272/54.336 us, solve medians 67.584/23.392 us, and a 3.345 ms kernel
+span, 3.9% below the old default. Static validation and the
+case-insensitive rejected-token scan passed.

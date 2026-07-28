@@ -17,6 +17,8 @@ _VARIANT_NAMES = (
     "r16_scalar_precise_scalar_u256",
     "r16_micro4x4_precise_sub4_u256",
     "r16_micro2x4_precise_scalar_u512",
+    "r16_raw_fused_m64_to_m32_at_r256",
+    "r16_raw_fused_m64_to_m32_at_r128",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -41,6 +43,13 @@ _METADATA_COLUMNS = (
     "factor_mode",
     "outer_block",
     "launch_count",
+    "tail_policy",
+    "potrf128_count",
+    "potrf64_count",
+    "potrf32_count",
+    "trsm128_count",
+    "trsm64_count",
+    "trsm32_count",
 )
 
 _CPP_SOURCE = r"""
@@ -78,8 +87,8 @@ constexpr int kN = 512;
 constexpr int kTile = 64;
 constexpr int kTileCount = 8;
 constexpr int kLd = 65;
-constexpr int kVariantCount = 7;
-constexpr int kMetadataColumns = 19;
+constexpr int kVariantCount = 9;
+constexpr int kMetadataColumns = 26;
 
 constexpr int kPreciseRoot = 0;
 constexpr int kNewtonRoot = 1;
@@ -104,6 +113,9 @@ struct Variant;
     static constexpr int update_threads = UTHREADS; \
     static constexpr int solve_threads =        \
         SOLVE == kScalarSolve ? 128 : 256;      \
+    static constexpr bool adaptive = false;     \
+    static constexpr int tail_cutoff = 0;       \
+    static constexpr int tail_policy = 0;       \
   }
 
 SPEC(0, kPreciseRoot, kScalarSolve, kRecursive16Factor,
@@ -122,6 +134,26 @@ SPEC(6, kPreciseRoot, kScalarSolve, kRecursive16Factor,
      kMicro2x4Update, 512);
 
 #undef SPEC
+
+#define ADAPTIVE_SPEC(ID, CUTOFF, POLICY)        \
+  template <> struct Variant<ID> {               \
+    static constexpr int root = kRawRoot;        \
+    static constexpr int solve = kScalarSolve;   \
+    static constexpr int factor =                \
+        kRecursive16Factor;                      \
+    static constexpr int update =                \
+        kMicro4x4Update;                         \
+    static constexpr int update_threads = 256;   \
+    static constexpr int solve_threads = 128;    \
+    static constexpr bool adaptive = true;       \
+    static constexpr int tail_cutoff = CUTOFF;   \
+    static constexpr int tail_policy = POLICY;   \
+  }
+
+ADAPTIVE_SPEC(7, 256, 1);
+ADAPTIVE_SPEC(8, 128, 2);
+
+#undef ADAPTIVE_SPEC
 
 __device__ __forceinline__ float load_global(const float* pointer) {
   return __ldcg(pointer);
@@ -554,6 +586,93 @@ void factor_solve_kernel(
   }
 }
 
+template <int RootMode>
+__global__ __launch_bounds__(128)
+void factor_solve32_kernel(
+    float* __restrict__ output, int begin) {
+  constexpr int kWidth = 32;
+  __shared__ __align__(128) float tile[kWidth * kLd];
+  __shared__ __align__(128) float rhs[kWidth * kLd];
+  __shared__ float inverse_diagonal[kWidth];
+
+  const int matrix_index = static_cast<int>(blockIdx.x);
+  const int local_row = static_cast<int>(blockIdx.y);
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  const int row_begin = begin + local_row * kWidth;
+  const bool is_factor = local_row == 0;
+
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kWidth * kWidth; linear += 128) {
+    const int row = linear / kWidth;
+    const int column = linear % kWidth;
+    tile_at(tile, row, column) =
+        column <= row
+            ? load_global(
+                  matrix + (begin + row) * kN +
+                  begin + column)
+            : 0.0f;
+    if (!is_factor) {
+      rhs[row * kLd + column] = load_global(
+          matrix + (row_begin + row) * kN +
+          begin + column);
+    }
+  }
+  __syncthreads();
+
+  factor32<RootMode>(tile, inverse_diagonal, 0);
+  __syncthreads();
+
+  if (is_factor) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kWidth * kWidth; linear += 128) {
+      const int row = linear / kWidth;
+      const int column = linear % kWidth;
+      if (column <= row) {
+        store_global(
+            matrix + (begin + row) * kN + begin + column,
+            tile_at(tile, row, column));
+      }
+    }
+  } else {
+    if (static_cast<int>(threadIdx.x) < kWidth) {
+      const int column = static_cast<int>(threadIdx.x);
+      if constexpr (RootMode == kPreciseRoot) {
+        inverse_diagonal[column] = __fdiv_rn(
+            1.0f, tile[column * kLd + column]);
+      } else {
+        inverse_diagonal[column] = __fdividef(
+            1.0f, tile[column * kLd + column]);
+      }
+    }
+    __syncthreads();
+    if (static_cast<int>(threadIdx.x) < kWidth) {
+      const int row = static_cast<int>(threadIdx.x);
+#pragma unroll 1
+      for (int target = 0; target < kWidth; ++target) {
+        float value = rhs[row * kLd + target];
+#pragma unroll 4
+        for (int k = 0; k < target; ++k) {
+          value = fmaf(
+              -rhs[row * kLd + k],
+              tile[target * kLd + k], value);
+        }
+        rhs[row * kLd + target] =
+            value * inverse_diagonal[target];
+      }
+    }
+    __syncthreads();
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kWidth * kWidth; linear += 128) {
+      const int row = linear / kWidth;
+      const int column = linear % kWidth;
+      store_global(
+          matrix + (row_begin + row) * kN + begin + column,
+          rhs[row * kLd + column]);
+    }
+  }
+}
+
 template <int SolveMode, int RootMode>
 __global__ void solve_kernel(
     float* __restrict__ output, int panel, int remaining) {
@@ -829,6 +948,74 @@ void fp32_update_kernel(
   }
 }
 
+__device__ __forceinline__ void decode_update32_tile(
+    int task, int tile_count, int& row_tile, int& column_tile) {
+  int cursor = task;
+  for (int column = 0; column < tile_count; ++column) {
+    const int count = tile_count - column;
+    if (cursor < count) {
+      column_tile = column;
+      row_tile = column + cursor;
+      return;
+    }
+    cursor -= count;
+  }
+  row_tile = -1;
+  column_tile = -1;
+}
+
+__global__ __launch_bounds__(128)
+void fp32_update32_kernel(
+    float* __restrict__ output, int begin,
+    int tile_count, int tasks) {
+  constexpr int kWidth = 32;
+  __shared__ __align__(128) float a_panel[kWidth * kLd];
+  __shared__ __align__(128) float b_panel[kWidth * kLd];
+  const int matrix_index =
+      static_cast<int>(blockIdx.x) / tasks;
+  const int task = static_cast<int>(blockIdx.x) % tasks;
+  int row_tile;
+  int column_tile;
+  decode_update32_tile(
+      task, tile_count, row_tile, column_tile);
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  const int trailing_begin = begin + kWidth;
+  const int row_begin = trailing_begin + row_tile * kWidth;
+  const int column_begin =
+      trailing_begin + column_tile * kWidth;
+
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kWidth * kWidth; linear += 128) {
+    const int row = linear / kWidth;
+    const int column = linear % kWidth;
+    a_panel[row * kLd + column] = load_global(
+        matrix + (row_begin + row) * kN + begin + column);
+    b_panel[row * kLd + column] = load_global(
+        matrix + (column_begin + row) * kN + begin + column);
+  }
+  __syncthreads();
+
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kWidth * kWidth; linear += 128) {
+    const int row = linear / kWidth;
+    const int column = linear % kWidth;
+    if (row_tile != column_tile || column <= row) {
+      float* destination =
+          matrix + (row_begin + row) * kN +
+          column_begin + column;
+      float value = load_global(destination);
+#pragma unroll 4
+      for (int k = 0; k < kWidth; ++k) {
+        value = fmaf(
+            -a_panel[row * kLd + k],
+            b_panel[column * kLd + k], value);
+      }
+      store_global(destination, value);
+    }
+  }
+}
+
 void check_input(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda(), "input must be CUDA");
   TORCH_CHECK(
@@ -880,7 +1067,24 @@ void reject_large_local_frame(
 template <int Id>
 void configure_one() {
   using V = Variant<Id>;
-  if constexpr (Id == 2) {
+  if constexpr (V::adaptive) {
+    prefer_shared(factor_solve_kernel<V::root, V::factor>);
+    prefer_shared(factor_solve32_kernel<V::root>);
+    prefer_shared(
+        fp32_update_kernel<V::update_threads, V::update>);
+    prefer_shared(fp32_update32_kernel);
+    reject_large_local_frame(
+        factor_solve_kernel<V::root, V::factor>,
+        Id, "factor_solve64");
+    reject_large_local_frame(
+        factor_solve32_kernel<V::root>,
+        Id, "factor_solve32");
+    reject_large_local_frame(
+        fp32_update_kernel<V::update_threads, V::update>,
+        Id, "update64");
+    reject_large_local_frame(
+        fp32_update32_kernel, Id, "update32");
+  } else if constexpr (Id == 2) {
     prefer_shared(factor_solve_kernel<V::root, V::factor>);
     reject_large_local_frame(
         factor_solve_kernel<V::root, V::factor>,
@@ -893,11 +1097,13 @@ void configure_one() {
     reject_large_local_frame(
         solve_kernel<V::solve, V::root>, Id, "solve");
   }
-  prefer_shared(
-      fp32_update_kernel<V::update_threads, V::update>);
-  reject_large_local_frame(
-      fp32_update_kernel<V::update_threads, V::update>,
-      Id, "update");
+  if constexpr (!V::adaptive) {
+    prefer_shared(
+        fp32_update_kernel<V::update_threads, V::update>);
+    reject_large_local_frame(
+        fp32_update_kernel<V::update_threads, V::update>,
+        Id, "update");
+  }
 }
 
 template <typename Kernel>
@@ -968,6 +1174,61 @@ void launch_one(float* output, const float* input) {
   }
 }
 
+template <int Id>
+void launch_adaptive(float* output, const float* input) {
+  using V = Variant<Id>;
+  static_assert(V::adaptive);
+  launch_copy(input, output);
+  int begin = 0;
+  while (begin < kN) {
+    const int remaining = kN - begin;
+    if (remaining > V::tail_cutoff) {
+      const int panel = begin / kTile;
+      const int row_tiles = remaining / kTile;
+      cudaLaunchConfig_t fuse_config{};
+      fuse_config.gridDim = dim3(kBatch, row_tiles, 1);
+      fuse_config.blockDim = dim3(128, 1, 1);
+      cudaLaunchKernelEx(
+          &fuse_config,
+          factor_solve_kernel<V::root, V::factor>,
+          output, panel);
+      const int trailing = row_tiles - 1;
+      if (trailing > 0) {
+        const int tasks = trailing * (trailing + 1) / 2;
+        cudaLaunchConfig_t update_config{};
+        update_config.gridDim = dim3(kBatch * tasks, 1, 1);
+        update_config.blockDim =
+            dim3(V::update_threads, 1, 1);
+        cudaLaunchKernelEx(
+            &update_config,
+            fp32_update_kernel<V::update_threads, V::update>,
+            output, panel, tasks);
+      }
+      begin += kTile;
+    } else {
+      constexpr int kWidth = 32;
+      const int row_tiles = remaining / kWidth;
+      cudaLaunchConfig_t fuse_config{};
+      fuse_config.gridDim = dim3(kBatch, row_tiles, 1);
+      fuse_config.blockDim = dim3(128, 1, 1);
+      cudaLaunchKernelEx(
+          &fuse_config, factor_solve32_kernel<V::root>,
+          output, begin);
+      const int trailing = row_tiles - 1;
+      if (trailing > 0) {
+        const int tasks = trailing * (trailing + 1) / 2;
+        cudaLaunchConfig_t update_config{};
+        update_config.gridDim = dim3(kBatch * tasks, 1, 1);
+        update_config.blockDim = dim3(128, 1, 1);
+        cudaLaunchKernelEx(
+            &update_config, fp32_update32_kernel,
+            output, begin, trailing, tasks);
+      }
+      begin += kWidth;
+    }
+  }
+}
+
 void configure_variant(int variant) {
   switch (variant) {
     case 0: configure_one<0>(); break;
@@ -977,8 +1238,10 @@ void configure_variant(int variant) {
     case 4: configure_one<4>(); break;
     case 5: configure_one<5>(); break;
     case 6: configure_one<6>(); break;
+    case 7: configure_one<7>(); break;
+    case 8: configure_one<8>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 6]");
+      TORCH_CHECK(false, "native variant must be in [0, 8]");
   }
 }
 
@@ -992,8 +1255,10 @@ void launch_variant(
     case 4: launch_one<4>(output, input); break;
     case 5: launch_one<5>(output, input); break;
     case 6: launch_one<6>(output, input); break;
+    case 7: launch_adaptive<7>(output, input); break;
+    case 8: launch_adaptive<8>(output, input); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 6]");
+      TORCH_CHECK(false, "native variant must be in [0, 8]");
   }
 }
 
@@ -1002,7 +1267,12 @@ void write_metadata(int64_t* rows) {
   using V = Variant<Id>;
   cudaFuncAttributes factor{};
   cudaFuncAttributes solve{};
-  if constexpr (Id == 2) {
+  cudaFuncAttributes update{};
+  if constexpr (V::adaptive) {
+    factor = attributes_for(factor_solve32_kernel<V::root>);
+    solve = factor;
+    update = attributes_for(fp32_update32_kernel);
+  } else if constexpr (Id == 2) {
     factor =
         attributes_for(factor_solve_kernel<V::root, V::factor>);
     solve = factor;
@@ -1010,14 +1280,20 @@ void write_metadata(int64_t* rows) {
     factor = attributes_for(factor_kernel<V::root, V::factor>);
     solve = attributes_for(solve_kernel<V::solve, V::root>);
   }
-  const cudaFuncAttributes update = attributes_for(
-      fp32_update_kernel<V::update_threads, V::update>);
+  if constexpr (!V::adaptive) {
+    update = attributes_for(
+        fp32_update_kernel<V::update_threads, V::update>);
+  }
+  const int potrf64 = V::adaptive
+      ? (kN - V::tail_cutoff) / 64 : 8;
+  const int potrf32 = V::adaptive
+      ? V::tail_cutoff / 32 : 0;
   int64_t* row =
       rows + static_cast<int64_t>(Id) * kMetadataColumns;
   row[0] = Id;
   row[1] = 128;
   row[2] = V::solve_threads;
-  row[3] = V::update_threads;
+  row[3] = V::adaptive ? 128 : V::update_threads;
   row[4] = factor.numRegs;
   row[5] = solve.numRegs;
   row[6] = update.numRegs;
@@ -1031,8 +1307,18 @@ void write_metadata(int64_t* rows) {
   row[14] = V::root;
   row[15] = V::solve;
   row[16] = V::factor;
-  row[17] = kTile;
-  row[18] = Id == 2 ? 16 : 23;
+  row[17] = V::adaptive ? 32 : kTile;
+  row[18] = V::adaptive
+      ? 2 * (potrf64 + potrf32) : (Id == 2 ? 16 : 23);
+  row[19] = V::tail_policy;
+  row[20] = 0;
+  row[21] = potrf64;
+  row[22] = potrf32;
+  row[23] = 0;
+  row[24] = V::adaptive
+      ? (potrf32 > 0 ? potrf64 : potrf64 - 1)
+      : potrf64 - 1;
+  row[25] = potrf32 > 0 ? potrf32 - 1 : 0;
 }
 
 }  // namespace
@@ -1040,7 +1326,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b16n512_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 6]");
+      "native variant must be in [0, 8]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -1050,7 +1336,7 @@ void cholesky_b16n512_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 6]");
+      "native variant must be in [0, 8]");
   c10::cuda::CUDAGuard device_guard(data.device());
   launch_variant(
       data.data_ptr<float>(), output.data_ptr<float>(),
@@ -1080,6 +1366,8 @@ at::Tensor cholesky_b16n512_metadata() {
   write_metadata<4>(rows);
   write_metadata<5>(rows);
   write_metadata<6>(rows);
+  write_metadata<7>(rows);
+  write_metadata<8>(rows);
   return result;
 }
 """

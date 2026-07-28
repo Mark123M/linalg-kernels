@@ -136,3 +136,53 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+VeloQ measured essentially every inverse-building POTRF128 launch near
+83 us in the warmed default timeline. The report exposes kernels, runtime,
+synchronization, and NVTX data but no GPU metrics, so this fixed cost is a
+direct timeline result rather than a counter-based diagnosis.
+
+NB remains 1024 in all new variants:
+
+| ID | Width schedule for remaining `R` | POTRF 128/64/32 | TRSM 128/64/32 |
+|---:|---|---:|---:|
+| 4 | 128 to `R=2048`, then 64 | 112 / 32 / 0 | 112 / 31 / 0 |
+| 5 | 128 to `R=4096`, then 64 | 96 / 64 / 0 | 96 / 63 / 0 |
+| 6 | 128/64/32 at `R=4096` and `R=1024` | 96 / 48 / 32 | 96 / 48 / 31 |
+
+The appended 64- and 32-wide factors use precise POTF2-32 arithmetic.
+Width 64 performs a compile-time 32-row solve/update before its second
+direct factor. Both widths build an exact-zero-upper dense inverse of the
+lower factor. Inner history GEMMs, inverse-apply GEMMs, and float4
+copy-backs are specialized by width; the established width-128 path is
+unchanged.
+
+Every cutover is on an NB=1024 boundary. Therefore an outer history GEMM
+always updates one whole 1024-column panel, and all micro steps within that
+panel share one width. The inverse identity preserves the triangular solve,
+and the final NB-wedge cleanup is unchanged.
+
+All three variants passed the Modal B200 preflight. Their scaled
+reconstruction residual was `0.128921`, below the preflight limit of 16.
+VeloQ confirmed that the factor specializations occur in `128 -> 64` order
+for IDs 4/5 and `128 -> 64 -> 32` order for ID 6. Median factor durations
+were 82.752 us, 66.848 us, and 30.560 us in ID 6, reductions of 19.2% and
+54.3% at the width transitions. Matching width-specialized copy-back
+medians fell from 3.104 us at width 128 to 1.728 us at width 64 and
+1.344 us at width 32. The history/apply calls also selected multiple
+dimension-specific cuBLAS kernel families.
+
+| ID | W128/W64/W32 factor p50 (us) | Kernel trace span (ms) | Delta from default |
+|---:|---:|---:|---:|
+| 0 | 82.8 / - / - | 15.405 | baseline |
+| 4 | 82.8 / 66.9 / - | 16.937 | +9.9% |
+| 5 | 83.0 / 67.2 / - | 17.081 | +10.9% |
+| 6 | 82.8 / 66.8 / 30.6 | 17.124 | +11.2% |
+
+The smaller solver kernels satisfy the stepwise duration goal, but doubling
+the number of micro steps costs more than it saves at this shape. Per the
+timeline screen, none advanced to the authoritative autotune. Variant 0
+remains the default and no final-default capture was needed. Static
+validation and the case-insensitive rejected-token scan passed.

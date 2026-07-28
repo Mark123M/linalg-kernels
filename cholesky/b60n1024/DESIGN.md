@@ -329,8 +329,9 @@ The shape-local Modal launcher profiles one warmed factorization on B200:
 .venv/bin/python -m modal run cholesky/b60n1024/cholesky_b60n1024_modal.py --variant 6
 ```
 
-`--variant -1` selects the tracked default, currently variant 6. Its staged
-cuBLAS-TF32 schedule has 24 algorithm launches per factorization. Input
+`--variant -1` selects the tracked default, now variant 9. The former
+variant-6 staged cuBLAS-TF32 schedule has 24 algorithm launches per
+factorization. Input
 generation, extension compilation, preparation, warmup, and correctness
 validation are outside the capture; the NVTX range contains exactly one
 out-parameter factorization.
@@ -341,3 +342,51 @@ timeline, `kernel-exec-trace.csv` separates API, queue, and execution time,
 and `kernel-summary.csv` aggregates duration by kernel name. The SQLite
 export, human-readable statistics, command, profiler version, environment,
 preflight, stdout, and stderr are retained with the report.
+
+## 2026-07-28 trailing-size adaptation
+
+VeloQ measured each variant-6 128-wide POTRF at approximately 146-150 us
+while the corresponding solves fell from roughly 136 us toward 42 us.
+The report contains timeline/runtime, synchronization, kernel, and NVTX
+records but no GPU metrics, so no kernel-internal cause is inferred.
+
+Variants 8 and 9 append precise width-specialized stages:
+
+| ID | Width schedule for remaining `R` | POTRF 128/64/32 | TRSM 128/64/32 |
+|---:|---|---:|---:|
+| 8 | 128 when `R > 512`, otherwise 64 | 4 / 8 / 0 | 4 / 7 / 0 |
+| 9 | 128 when `R > 512`, 64 when `R > 128`, otherwise 32 | 4 / 6 / 4 | 4 / 6 / 3 |
+
+The 64- and 32-wide factors reuse POTF2-32, with the 64-wide path adding
+one local solve/update and a second direct factor. Matching compile-time
+solve kernels use 64- or 32-row tiles. Large trailing matrices continue
+through handle-based TF32 strided-batched GEMM. Once the post-panel
+remainder is at most 128, rank-specialized custom kernels update only the
+lower 64x64 or 32x32 tiles.
+
+Each cutover is width-aligned. Panel solves complete before their trailing
+update, diagonal update tasks suppress strict-upper stores, and the final
+upper-zero kernel remains authoritative. Thus the adaptive schedule changes
+only the factorization partition, not the block Cholesky dependencies.
+
+Both variants passed the Modal B200 preflight; their scaled reconstruction
+residuals were `0.658807` and `0.658804`. VeloQ confirmed the requested
+width ordering. In ID 9, factor medians fell from 149.440 us to 54.400 us
+and 22.463 us, solve medians from 118.271 us to 25.440 us and 10.624 us,
+and custom lower-update medians from 22.016 us to 6.816 us. These are
+64%, 59%, and 69% reductions at the relevant transitions.
+
+| ID | Kernel trace span | Delta from ID 6 | Autotune median target mean |
+|---:|---:|---:|---:|
+| 6 | 2.417 ms | baseline | 2.245 ms |
+| 8 | 2.210 ms | -8.6% | 2.201 ms |
+| 9 | 2.203 ms | -8.9% | 2.200 ms |
+
+All public rows and the target row passed in all three alternating rounds.
+ID 9 improved the authoritative target median by 2.0%, passed the 0.5%
+gate, and is now the tracked default. Official test submission 920853
+passed all 17 cases. The final capture measured factor medians
+149.503/54.367/22.464 us, solve medians
+119.200/25.472/10.624 us, custom lower-update medians 21.984/6.816 us,
+and a 2.206 ms kernel span, 8.7% below the old default. Static validation
+and the case-insensitive rejected-token scan passed.

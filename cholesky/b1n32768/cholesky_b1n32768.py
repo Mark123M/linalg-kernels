@@ -25,6 +25,9 @@ _VARIANT_NAMES = (
     "ll_nb1024_rank8w_tf32",
     "ll_nb1024_microfused_tf32",
     "ll_nb1024_invgemm_tf32",
+    "ll_nb1024_m128_to_m64_at_r4096_tf32",
+    "ll_nb1024_m128_to_m64_at_r8192_tf32",
+    "ll_nb1024_m128_m64_m32_at_r8192_r1024_tf32",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -56,6 +59,13 @@ _METADATA_COLUMNS = (
     "implemented",
     "factor_mode",
     "apply_mode",
+    "tail_policy",
+    "potrf128_count",
+    "potrf64_count",
+    "potrf32_count",
+    "trsm128_count",
+    "trsm64_count",
+    "trsm32_count",
 )
 
 _CPP_SOURCE = r"""
@@ -96,8 +106,8 @@ constexpr int kN = 32768;
 constexpr int kMicro = 128;
 constexpr int kTileLd = kMicro + 1;
 constexpr int kPanelLd = 9;
-constexpr int kVariantCount = 15;
-constexpr int kMetadataColumns = 26;
+constexpr int kVariantCount = 18;
+constexpr int kMetadataColumns = 33;
 
 // Shared-memory layout of the factor kernel:
 //   [tile kMicro x kTileLd][inverse_diagonal kMicro]
@@ -193,6 +203,8 @@ constexpr int factor_threads_of(int factor_mode) {
     static constexpr bool light_apply = APPLY == kApplyLight;        \
     static constexpr bool fused_micro = TRSM == kTrsmFusedMicro;     \
     static constexpr bool gemm_apply = TRSM == kTrsmGemm;            \
+    static constexpr bool adaptive = false;                          \
+    static constexpr int tail_policy = 0;                            \
   }
 
 SPEC(0, 1024, kLeftLook, kTrsmLibrary, kMathFp32, kMathFp32,
@@ -227,6 +239,32 @@ SPEC(14, 1024, kLeftLook, kTrsmGemm, kMathTf32, kMathTf32,
      kGuardDefault, kFactorWide, kApplyShared, true);
 
 #undef SPEC
+
+#define ADAPTIVE_SPEC(ID, POLICY)                                    \
+  template <> struct Variant<ID> {                                   \
+    static constexpr int nb = 1024;                                  \
+    static constexpr int schedule = kLeftLook;                       \
+    static constexpr int trsm_mode = kTrsmGemm;                      \
+    static constexpr int math_big = kMathTf32;                       \
+    static constexpr int math_inner = kMathTf32;                     \
+    static constexpr int guard_mode = kGuardDefault;                 \
+    static constexpr int factor_mode = kFactorWide;                  \
+    static constexpr int apply_mode = kApplyShared;                  \
+    static constexpr bool implemented = true;                        \
+    static constexpr bool build_inverse = true;                      \
+    static constexpr bool flat_factor = false;                       \
+    static constexpr bool light_apply = false;                       \
+    static constexpr bool fused_micro = false;                       \
+    static constexpr bool gemm_apply = true;                         \
+    static constexpr bool adaptive = true;                           \
+    static constexpr int tail_policy = POLICY;                       \
+  }
+
+ADAPTIVE_SPEC(15, 1);
+ADAPTIVE_SPEC(16, 2);
+ADAPTIVE_SPEC(17, 3);
+
+#undef ADAPTIVE_SPEC
 
 template <int... Ids>
 constexpr std::array<bool, sizeof...(Ids)> flags_usage_of(
@@ -822,6 +860,234 @@ void factor128_kernel(
   __syncthreads();
 }
 
+template <int Width>
+struct AdaptiveTile {
+  static_assert(Width == 64 || Width == 32);
+  static constexpr int ld = Width + 1;
+  static constexpr int threads = Width == 64 ? 256 : 128;
+  static constexpr int mid = Width == 64 ? 32 * 32 : 0;
+  static constexpr int factor_bytes =
+      static_cast<int>(sizeof(float)) *
+      (2 * Width * ld + Width + mid);
+};
+
+template <int Width>
+__device__ __forceinline__ float& adaptive_at(
+    float* tile, int row, int column) {
+  return tile[row * AdaptiveTile<Width>::ld + column];
+}
+
+template <int Width>
+__device__ __forceinline__ void adaptive_potf2_32(
+    float* tile, float* inverse_diagonal, int begin) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (static_cast<int>(threadIdx.x) < 32) {
+#pragma unroll 1
+    for (int local_column = 0;
+         local_column < 32; ++local_column) {
+      const int column = begin + local_column;
+      float inverse = 0.0f;
+      if (lane == local_column) {
+        const float diagonal = __fsqrt_rn(
+            adaptive_at<Width>(tile, column, column));
+        adaptive_at<Width>(tile, column, column) = diagonal;
+        inverse = __fdiv_rn(1.0f, diagonal);
+        inverse_diagonal[column] = inverse;
+      }
+      inverse = __shfl_sync(
+          0xffffffffu, inverse, local_column);
+      if (lane > local_column) {
+        const int row = begin + lane;
+        adaptive_at<Width>(tile, row, column) *= inverse;
+      }
+      __syncwarp();
+      if (lane > local_column) {
+        const int row = begin + lane;
+        const float left =
+            adaptive_at<Width>(tile, row, column);
+        for (int target_local = local_column + 1;
+             target_local <= lane; ++target_local) {
+          const int target = begin + target_local;
+          adaptive_at<Width>(tile, row, target) = fmaf(
+              -left,
+              adaptive_at<Width>(tile, target, column),
+              adaptive_at<Width>(tile, row, target));
+        }
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+}
+
+template <int Width>
+__device__ __forceinline__ void adaptive_factor_local(
+    float* tile, float* inverse_diagonal) {
+  adaptive_potf2_32<Width>(
+      tile, inverse_diagonal, 0);
+  if constexpr (Width == 64) {
+    const int lane = static_cast<int>(threadIdx.x) & 3;
+    const int row_index = static_cast<int>(threadIdx.x) >> 2;
+    if (row_index < 32) {
+      const int row = 32 + row_index;
+#pragma unroll 1
+      for (int column = 0; column < 32; ++column) {
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int k = lane; k < column; k += 4) {
+          partial = fmaf(
+              adaptive_at<Width>(tile, row, k),
+              adaptive_at<Width>(tile, column, k), partial);
+        }
+        partial += __shfl_down_sync(
+            0xffffffffu, partial, 2, 4);
+        partial += __shfl_down_sync(
+            0xffffffffu, partial, 1, 4);
+        if (lane == 0) {
+          adaptive_at<Width>(tile, row, column) =
+              (adaptive_at<Width>(tile, row, column) - partial) *
+              inverse_diagonal[column];
+        }
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < 32 * 32;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 5;
+      const int column = linear & 31;
+      if (column <= row) {
+        float value =
+            adaptive_at<Width>(tile, 32 + row, 32 + column);
+#pragma unroll 4
+        for (int k = 0; k < 32; ++k) {
+          value = fmaf(
+              -adaptive_at<Width>(tile, 32 + row, k),
+              adaptive_at<Width>(tile, 32 + column, k),
+              value);
+        }
+        adaptive_at<Width>(
+            tile, 32 + row, 32 + column) = value;
+      }
+    }
+    __syncthreads();
+    adaptive_potf2_32<Width>(
+        tile, inverse_diagonal, 32);
+  }
+}
+
+template <int Width>
+__device__ __forceinline__ void adaptive_build_inverse(
+    const float* tile, const float* inverse_diagonal,
+    float* tinv, float* mid) {
+  constexpr int kLd = AdaptiveTile<Width>::ld;
+  const int thread = static_cast<int>(threadIdx.x);
+  for (int linear = thread; linear < Width * kLd;
+       linear += static_cast<int>(blockDim.x)) {
+    tinv[linear] = 0.0f;
+  }
+  __syncthreads();
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  if (warp < Width / 32) {
+    const int base = warp * 32;
+    const int column = base + lane;
+    tinv[column * kLd + column] = inverse_diagonal[column];
+    for (int row = lane + 1; row < 32; ++row) {
+      const int target = base + row;
+      float partial = 0.0f;
+      for (int k = lane; k < row; ++k) {
+        partial = fmaf(
+            tile[target * kLd + base + k],
+            tinv[(base + k) * kLd + column], partial);
+      }
+      tinv[target * kLd + column] =
+          -partial * inverse_diagonal[target];
+    }
+  }
+  __syncthreads();
+  if constexpr (Width == 64) {
+    for (int linear = thread; linear < 32 * 32;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 5;
+      const int column = linear & 31;
+      float partial = 0.0f;
+#pragma unroll 4
+      for (int k = column; k < 32; ++k) {
+        partial = fmaf(
+            tile[(32 + row) * kLd + k],
+            tinv[k * kLd + column], partial);
+      }
+      mid[row * 32 + column] = partial;
+    }
+    __syncthreads();
+    for (int linear = thread; linear < 32 * 32;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear >> 5;
+      const int column = linear & 31;
+      float partial = 0.0f;
+#pragma unroll 4
+      for (int k = 0; k <= row; ++k) {
+        partial = fmaf(
+            tinv[(32 + row) * kLd + 32 + k],
+            mid[k * 32 + column], partial);
+      }
+      tinv[(32 + row) * kLd + column] = -partial;
+    }
+    __syncthreads();
+  }
+}
+
+template <int Width>
+__global__ __launch_bounds__(AdaptiveTile<Width>::threads)
+void adaptive_factor_kernel(
+    float* __restrict__ output, int begin,
+    float* __restrict__ t_inv) {
+  constexpr int kLd = AdaptiveTile<Width>::ld;
+  extern __shared__ __align__(16) float dynamic_floats[];
+  float* tile = dynamic_floats;
+  float* inverse_diagonal = tile + Width * kLd;
+  float* tinv = inverse_diagonal + Width;
+  float* mid = tinv + Width * kLd;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear & (Width - 1);
+    adaptive_at<Width>(tile, row, column) =
+        column <= row
+            ? load_global(
+                  output + matrix_index(begin + row, begin + column))
+            : 0.0f;
+  }
+  __syncthreads();
+  adaptive_factor_local<Width>(tile, inverse_diagonal);
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear & (Width - 1);
+    if (column <= row) {
+      store_global(
+          output + matrix_index(begin + row, begin + column),
+          adaptive_at<Width>(tile, row, column));
+    }
+  }
+  if (begin + Width < kN) {
+    adaptive_build_inverse<Width>(
+        tile, inverse_diagonal, tinv, mid);
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < Width * Width;
+         linear += static_cast<int>(blockDim.x)) {
+      const int row = linear / Width;
+      const int column = linear & (Width - 1);
+      store_global(
+          t_inv + linear, tinv[row * kLd + column]);
+    }
+  }
+}
+
 // Applies X := X * T^T for one 128x128 tile of the sub-column below
 // the diagonal block at `begin`, where T is the dense inverse of the
 // lower factor (strict upper exactly zero). Each thread accumulates
@@ -1171,6 +1437,34 @@ void copy_back_kernel(
   }
 }
 
+template <int Width>
+__global__ __launch_bounds__(256)
+void adaptive_copy_back_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ scratch, int begin) {
+  constexpr int kQuadsPerRow = Width / 4;
+  const int rows = kN - begin - Width;
+  const int64_t quads =
+      static_cast<int64_t>(rows) * kQuadsPerRow;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / kQuadsPerRow);
+    const int column =
+        static_cast<int>(quad % kQuadsPerRow) * 4;
+    const float4 value = __ldcg(
+        reinterpret_cast<const float4*>(
+            scratch + static_cast<int64_t>(row) * Width + column));
+    __stcg(
+        reinterpret_cast<float4*>(
+            output +
+            matrix_index(begin + Width + row, begin + column)),
+        value);
+  }
+}
+
 // Restores exact zeros in the strict upper wedge of each nb x nb
 // diagonal block (the only region library GEMMs overwrite).
 __global__ __launch_bounds__(256)
@@ -1359,6 +1653,52 @@ void gemm_apply_column(
       "apply GEMM");
 }
 
+template <int Width>
+void adaptive_gemm_inner(
+    cublasHandle_t handle, float* output, int64_t panel_begin,
+    int64_t micro_begin) {
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+  const int columns = static_cast<int>(kN - micro_begin);
+  const int history = static_cast<int>(micro_begin - panel_begin);
+  const float* micro_rows =
+      output + micro_begin * kN + panel_begin;
+  float* destination = output + micro_begin * kN + micro_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          Width, columns, history,
+          &alpha,
+          micro_rows, CUDA_R_32F, kN,
+          micro_rows, CUDA_R_32F, kN,
+          &beta,
+          destination, CUDA_R_32F, kN,
+          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+      "adaptive micro history GEMM");
+}
+
+template <int Width>
+void adaptive_gemm_apply_column(
+    cublasHandle_t handle, float* output, const float* t_inv,
+    float* scratch, int64_t micro_begin) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const int rows = static_cast<int>(kN - micro_begin - Width);
+  const float* x_rows =
+      output + (micro_begin + Width) * kN + micro_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          Width, rows, Width,
+          &alpha,
+          t_inv, CUDA_R_32F, Width,
+          x_rows, CUDA_R_32F, kN,
+          &beta,
+          scratch, CUDA_R_32F, Width,
+          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+      "adaptive apply GEMM");
+}
+
 // Row-major right-side solve X := X inv(L11)^T maps to a col-major
 // left-side solve with the transposed upper view of L11.
 void strsm_column(
@@ -1410,6 +1750,20 @@ void launch_factor(float* output, int begin, float* t_inv) {
       factor_bytes_of(BuildInverse, FactorMode);
   cudaLaunchKernelEx(
       &config, factor128_kernel<BuildInverse, FactorMode>,
+      output, begin, t_inv);
+}
+
+template <int Width>
+void launch_adaptive_factor(
+    float* output, int begin, float* t_inv) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim =
+      dim3(AdaptiveTile<Width>::threads, 1, 1);
+  config.dynamicSmemBytes =
+      AdaptiveTile<Width>::factor_bytes;
+  cudaLaunchKernelEx(
+      &config, adaptive_factor_kernel<Width>,
       output, begin, t_inv);
 }
 
@@ -1476,6 +1830,17 @@ void launch_copy_back(float* output, const float* scratch, int begin) {
       &config, copy_back_kernel, output, scratch, begin);
 }
 
+template <int Width>
+void launch_adaptive_copy_back(
+    float* output, const float* scratch, int begin) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(256, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &config, adaptive_copy_back_kernel<Width>,
+      output, scratch, begin);
+}
+
 void launch_wedges(float* output, int nb) {
   cudaLaunchConfig_t config{};
   config.gridDim = dim3((kN / nb) * 8, 1, 1);
@@ -1524,6 +1889,75 @@ void launch_staged(
     }
     if (V::schedule == kRightLook && panel + V::nb < kN) {
       ssyrk_trailing(handle, output, panel, V::nb);
+    }
+  }
+  launch_wedges(output, V::nb);
+}
+
+template <int Id>
+void launch_adaptive_staged(
+    float* output, const float* input, float* t_inv,
+    float* scratch) {
+  using V = Variant<Id>;
+  static_assert(V::adaptive);
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  CublasStateGuard guard(handle, V::guard_mode);
+  launch_copy(input, output);
+  for (int64_t panel = 0; panel < kN; panel += V::nb) {
+    if (panel > 0) {
+      gemm_history(
+          handle, output, panel, V::nb, kMathTf32);
+    }
+    int64_t micro = panel;
+    while (micro < panel + V::nb) {
+      const int remaining = static_cast<int>(kN - micro);
+      int width = 128;
+      if (Id == 15 && remaining <= 4096) {
+        width = 64;
+      } else if ((Id == 16 || Id == 17) && remaining <= 8192) {
+        width = Id == 17 && remaining <= 1024 ? 32 : 64;
+      }
+      if (width == 128) {
+        if (micro > panel) {
+          gemm_inner(
+              handle, output, panel, micro, kMathTf32);
+        }
+        launch_factor<true, kFactorWide>(
+            output, static_cast<int>(micro), t_inv);
+        if (micro + 128 < kN) {
+          gemm_apply_column(
+              handle, output, t_inv, scratch, micro, kMathTf32);
+          launch_copy_back(
+              output, scratch, static_cast<int>(micro));
+        }
+      } else if (width == 64) {
+        if (micro > panel) {
+          adaptive_gemm_inner<64>(
+              handle, output, panel, micro);
+        }
+        launch_adaptive_factor<64>(
+            output, static_cast<int>(micro), t_inv);
+        if (micro + 64 < kN) {
+          adaptive_gemm_apply_column<64>(
+              handle, output, t_inv, scratch, micro);
+          launch_adaptive_copy_back<64>(
+              output, scratch, static_cast<int>(micro));
+        }
+      } else {
+        if (micro > panel) {
+          adaptive_gemm_inner<32>(
+              handle, output, panel, micro);
+        }
+        launch_adaptive_factor<32>(
+            output, static_cast<int>(micro), t_inv);
+        if (micro + 32 < kN) {
+          adaptive_gemm_apply_column<32>(
+              handle, output, t_inv, scratch, micro);
+          launch_adaptive_copy_back<32>(
+              output, scratch, static_cast<int>(micro));
+        }
+      }
+      micro += width;
     }
   }
   launch_wedges(output, V::nb);
@@ -1599,6 +2033,16 @@ void configure_one() {
         V::light_apply ? kApplyLightBytes : kApplyBytes);
     checked_attributes(factor128_kernel<true, V::factor_mode>);
     checked_attributes(trsm_apply_kernel<V::light_apply>);
+    if constexpr (V::adaptive) {
+      configure_dynamic(
+          adaptive_factor_kernel<64>,
+          AdaptiveTile<64>::factor_bytes);
+      configure_dynamic(
+          adaptive_factor_kernel<32>,
+          AdaptiveTile<32>::factor_bytes);
+      checked_attributes(adaptive_factor_kernel<64>);
+      checked_attributes(adaptive_factor_kernel<32>);
+    }
   } else {
     configure_dynamic(
         factor128_kernel<false, V::factor_mode>,
@@ -1624,8 +2068,11 @@ void configure_variant(int variant) {
     case 12: configure_one<12>(); break;
     case 13: configure_one<13>(); break;
     case 14: configure_one<14>(); break;
+    case 15: configure_one<15>(); break;
+    case 16: configure_one<16>(); break;
+    case 17: configure_one<17>(); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 14]");
+      TORCH_CHECK(false, "native variant must be in [0, 17]");
   }
 }
 
@@ -1651,8 +2098,14 @@ void launch_variant(
     case 12: launch_staged<12>(output, input, t_inv, flags, scratch); break;
     case 13: launch_staged<13>(output, input, t_inv, flags, scratch); break;
     case 14: launch_staged<14>(output, input, t_inv, flags, scratch); break;
+    case 15: launch_adaptive_staged<15>(
+        output, input, t_inv, scratch); break;
+    case 16: launch_adaptive_staged<16>(
+        output, input, t_inv, scratch); break;
+    case 17: launch_adaptive_staged<17>(
+        output, input, t_inv, scratch); break;
     default:
-      TORCH_CHECK(false, "native variant must be in [0, 14]");
+      TORCH_CHECK(false, "native variant must be in [0, 17]");
   }
 }
 
@@ -1680,7 +2133,8 @@ void write_metadata(int64_t* rows) {
   row[4] = V::math_big;
   row[5] = V::math_inner;
   row[20] = kHasEmulation ? 1 : 0;
-  row[21] = kMicro;
+  row[21] = V::adaptive
+      ? (Id == 17 ? 32 : 64) : kMicro;
   row[22] = V::guard_mode;
   row[23] = V::implemented ? 1 : 0;
   row[24] = V::factor_mode;
@@ -1735,8 +2189,13 @@ void write_metadata(int64_t* rows) {
   const cudaFuncAttributes wedges =
       checked_attributes(zero_wedges_kernel);
   const int panels = kN / V::nb;
-  const int micros = kN / kMicro;
-  const int inner = panels * (V::nb / kMicro - 1);
+  const int potrf128 =
+      !V::adaptive ? kN / 128 : (Id == 15 ? 224 : 192);
+  const int potrf64 =
+      !V::adaptive ? 0 : (Id == 15 ? 64 : (Id == 16 ? 128 : 112));
+  const int potrf32 = V::adaptive && Id == 17 ? 32 : 0;
+  const int micros = potrf128 + potrf64 + potrf32;
+  const int inner = micros - panels;
   const int big =
       V::schedule == kLeftLook ? panels - 1 : 0;
   const int syrk =
@@ -1760,6 +2219,15 @@ void write_metadata(int64_t* rows) {
   row[17] = factor_active;
   row[18] = apply_active;
   row[19] = 2 + big + syrk + inner + micros + applies + flag_fill;
+  row[26] = V::tail_policy;
+  row[27] = potrf128;
+  row[28] = potrf64;
+  row[29] = potrf32;
+  row[30] = potrf128 > 0 && potrf64 == 0 && potrf32 == 0
+      ? potrf128 - 1 : potrf128;
+  row[31] = potrf64 > 0 && potrf32 == 0
+      ? potrf64 - 1 : potrf64;
+  row[32] = potrf32 > 0 ? potrf32 - 1 : 0;
 }
 
 }  // namespace
@@ -1767,7 +2235,7 @@ void write_metadata(int64_t* rows) {
 void cholesky_b1n32768_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 14]");
+      "native variant must be in [0, 17]");
   configure_variant(static_cast<int>(variant));
 }
 
@@ -1777,7 +2245,7 @@ void cholesky_b1n32768_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 0 && variant < kVariantCount,
-      "native variant must be in [0, 14]");
+      "native variant must be in [0, 17]");
   c10::cuda::CUDAGuard device_guard(data.device());
   at::Tensor t_inv = at::empty(
       {kMicro, kMicro}, data.options());
@@ -1831,6 +2299,9 @@ at::Tensor cholesky_b1n32768_metadata() {
   write_metadata<12>(rows);
   write_metadata<13>(rows);
   write_metadata<14>(rows);
+  write_metadata<15>(rows);
+  write_metadata<16>(rows);
+  write_metadata<17>(rows);
   return result;
 }
 """
