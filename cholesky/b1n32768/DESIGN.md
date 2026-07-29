@@ -733,3 +733,15 @@ ordering, so these are B200-specific experiments. No B200 correctness,
 no-hang, or timing result exists yet, and variant 18 remains the default.
 Promotion requires exact-shape property checks, 100 repeated launches, and
 the existing 0.5% three-round gate.
+
+## Integrated submission build reuse
+
+The integrated `cholesky/cholesky.py` dispatcher now returns the same loaded
+n=16384/n=32768 extension for this shape. The shared CUDA source already
+instantiates both sizes and prepares both factor specializations. Removing
+the second, kernel-renamed compilation changes build latency only; the
+variant-18 schedule and arithmetic are unchanged.
+
+Popcorn submission 928863 passed public and secret test, benchmark, and
+leaderboard evaluation. Its public geomean was 893.371 us and its secret
+geomean was 893.050 us.

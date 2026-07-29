@@ -208,3 +208,15 @@ native metadata table.
 If NCU shows GEMMs above 30% of target time and the kernel/SASS evidence does
 not identify an SM100 Tensor Core path, the next candidate is a CUTLASS 3.x
 SM100 TF32 TMA/TMEM GEMM. It is not added without that evidence.
+
+## Integrated submission build reuse
+
+The integrated `cholesky/cholesky.py` submission shares the native Xpotrf
+extension with `(1,4096,4096)`. Its entry point accepts only batch counts 1
+and 2 and retains the same per-matrix copy and Xpotrf loop used by variant
+12. This is a build-latency change: it removes a duplicate CUDA compilation
+but does not alter the factorization or timing path.
+
+Popcorn submission 928863 passed public and secret test, benchmark, and
+leaderboard evaluation. Its public geomean was 893.371 us and its secret
+geomean was 893.050 us.

@@ -69,7 +69,6 @@ torch.linalg.cholesky_ex(..., check_errors=False).L.
 
 import hashlib
 import os
-import re
 from functools import lru_cache
 
 import torch
@@ -4264,7 +4263,6 @@ _CUDA_SOURCE_XPOTRF4096 = r"""
 
 namespace {
 
-constexpr int kBatch = __KBATCH__;
 constexpr int kN = 4096;
 constexpr int64_t kMatrixStride = static_cast<int64_t>(kN) * kN;
 
@@ -4309,11 +4307,12 @@ void copy_xpotrf_kernel(
   }
 }
 
-void launch_xpotrf_copy(const float* input, float* output) {
+void launch_xpotrf_copy(
+    const float* input, float* output, int batch_count) {
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(512, 1, 1);
   config.blockDim = dim3(256, 1, 1);
-  for (int batch = 0; batch < kBatch; ++batch) {
+  for (int batch = 0; batch < batch_count; ++batch) {
     cudaLaunchKernelEx(
         &config, copy_xpotrf_kernel,
         input + static_cast<int64_t>(batch) * kMatrixStride,
@@ -4363,8 +4362,8 @@ void ensure_xpotrf_state(
 
 void launch_xpotrf(
     const float* input, float* output,
-    const at::Tensor& like) {
-  launch_xpotrf_copy(input, output);
+    const at::Tensor& like, int batch_count) {
+  launch_xpotrf_copy(input, output, batch_count);
   ensure_xpotrf_state(like, output);
   void* device_workspace =
       gXpotrfDeviceBytes == 0
@@ -4374,7 +4373,7 @@ void launch_xpotrf(
       gXpotrfHostBytes == 0
           ? nullptr
           : gXpotrfHostWorkspace.data();
-  for (int batch = 0; batch < kBatch; ++batch) {
+  for (int batch = 0; batch < batch_count; ++batch) {
     float* matrix =
         output + static_cast<int64_t>(batch) * kMatrixStride;
     check_cusolver(
@@ -4402,14 +4401,16 @@ at::Tensor cholesky_xpotrf4096(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda() && data.is_contiguous() &&
                   data.scalar_type() == at::kFloat,
               "input must be a contiguous float32 CUDA tensor");
-  TORCH_CHECK(data.dim() == 3 && data.size(0) == kBatch &&
+  TORCH_CHECK(data.dim() == 3 &&
+                  (data.size(0) == 1 || data.size(0) == 2) &&
                   data.size(1) == kN && data.size(2) == kN,
               "Xpotrf path shape mismatch");
   c10::cuda::CUDAGuard device_guard(data.device());
+  const int batch_count = static_cast<int>(data.size(0));
   auto output = at::empty_strided(
-      {kBatch, kN, kN}, {kMatrixStride, 1, kN}, data.options());
+      {batch_count, kN, kN}, {kMatrixStride, 1, kN}, data.options());
   launch_xpotrf(
-      data.data_ptr<float>(), output.data_ptr<float>(), data);
+      data.data_ptr<float>(), output.data_ptr<float>(), data, batch_count);
   const cudaError_t status = cudaPeekAtLastError();
   TORCH_CHECK(
       status == cudaSuccess,
@@ -4419,24 +4420,23 @@ at::Tensor cholesky_xpotrf4096(const at::Tensor& data) {
 """
 
 
-def _build_xpotrf4096(name, batch):
+@lru_cache(maxsize=1)
+def _module_xpotrf4096():
     module = _build(
-        name, _CPP_SOURCE_XPOTRF4096,
-        _CUDA_SOURCE_XPOTRF4096.replace("__KBATCH__", str(batch)),
+        "cholesky_b1n4096_b2n4096", _CPP_SOURCE_XPOTRF4096,
+        _CUDA_SOURCE_XPOTRF4096,
         extra_cuda_flags=("-DNDEBUG", "--restrict"),
         extra_ldflags=("-lcublas", "-lcusolver"))
     module.prepare()
     return module
 
 
-@lru_cache(maxsize=1)
 def _module_b1n4096():
-    return _build_xpotrf4096("cholesky_b1n4096", 1)
+    return _module_xpotrf4096()
 
 
-@lru_cache(maxsize=1)
 def _module_b2n4096():
-    return _build_xpotrf4096("cholesky_b2n4096", 2)
+    return _module_xpotrf4096()
 
 
 # ---------------------------------------------------------------------------
@@ -5803,11 +5803,6 @@ at::Tensor cholesky_b1n16384_b1n32768(const at::Tensor& data) {
 """
 
 
-_CUTLASS_KERNEL_RE_B1N32768 = re.compile(
-    r"\b((?:factor128|copy_back|copy_lower|zero_wedges)"
-    r"_kernel_b1n16384_b1n32768)\b")
-
-
 @lru_cache(maxsize=1)
 def _module_b1n16384():
     module = _build(
@@ -5820,18 +5815,8 @@ def _module_b1n16384():
     return module
 
 
-@lru_cache(maxsize=1)
 def _module_b1n32768():
-    module = _build(
-        "cholesky_b1n32768",
-        _CPP_SOURCE_B1N16384_B1N32768,
-        _CUTLASS_KERNEL_RE_B1N32768.sub(
-            lambda match: f"cutlass_{match.group(1)}",
-            _CUDA_SOURCE_B1N16384_B1N32768),
-        extra_cuda_flags=("-DNDEBUG", "--restrict"),
-        extra_ldflags=("-lcublas",))
-    module.prepare()
-    return module
+    return _module_b1n16384()
 
 
 # ---------------------------------------------------------------------------

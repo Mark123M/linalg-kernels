@@ -804,3 +804,16 @@ Variant 16 is now the promotion reference. Variant 17 or 18 may replace it
 only after official correctness and a three-round median at or below
 `0.995 x` its contemporaneous variant-16 median. No persistent
 implementation is ported to `b2n4096` before that gate is met.
+
+## Integrated submission build reuse
+
+The integrated `cholesky/cholesky.py` submission now builds one 4096
+extension for both batch-one and batch-two inputs. The CUDA entry point reads
+the runtime batch count (restricted to 1 or 2), while the copy kernel,
+per-matrix Xpotrf loop, output layout, and variant-16 math are unchanged.
+This removes one redundant JIT compilation from the ranked job without
+changing the measured kernel path.
+
+Popcorn submission 928863 passed public and secret test, benchmark, and
+leaderboard evaluation. Its public geomean was 893.371 us and its secret
+geomean was 893.050 us.

@@ -219,3 +219,15 @@ ordering, so these are B200-specific experiments. No B200 correctness,
 no-hang, or timing result exists yet, and variant 0 remains the default.
 Promotion requires exact-shape property checks, 100 repeated launches, and
 the existing 0.5% three-round gate.
+
+## Integrated submission build reuse
+
+The existing native source already instantiates and prepares both n=16384
+and n=32768. The integrated `cholesky/cholesky.py` dispatcher now reuses that
+single loaded extension for both shapes instead of compiling the same source
+twice under different module names. Variant-0 kernels and runtime dispatch
+are unchanged.
+
+Popcorn submission 928863 passed public and secret test, benchmark, and
+leaderboard evaluation. Its public geomean was 893.371 us and its secret
+geomean was 893.050 us.
