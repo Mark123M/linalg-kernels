@@ -9,8 +9,8 @@ from torch.utils.cpp_extension import load_inline
 
 
 # The tuner replaces this exact line in retained candidate copies. Variant 2
-# is the tracked default: the fastest screened path at this shape. See
-# DESIGN.md for the variant registry and measurement record.
+# 11 is the tracked default: it avoids cuSOLVER's pathological large-matrix
+# batched dispatch. See DESIGN.md for the registry and measurement record.
 _DEFAULT_VARIANT = 11  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "torch_cusolver",

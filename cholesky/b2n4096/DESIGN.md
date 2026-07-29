@@ -2,11 +2,12 @@
 
 ## Status
 
-The tracked default is variant 2 (`ll_nb512_m64_inverse_gemm_tf32`), set on
-2026-07-28. It is the fastest variant at this shape: 4.955 ms against an
-11.177 ms Torch/cuSOLVER baseline, 2.26x the baseline and 1.74x variant 7.
-It passes `--mode benchmark` (`check: pass`, 15/15 entries) and `--mode test`
-(17/17, submission 921947).
+The tracked default is variant 11 (`torch_per_matrix_loop`). Variant 2 remains
+the fastest previously submitted native path at 4.955 ms against an 11.177 ms
+Torch/cuSOLVER batched baseline. Variant 11 is now confirmed by NSys to use
+two copies of cuSOLVER's batch-one fused Xpotrf kernel; its profiling range is
+3.630 ms, including the profiler/output adapter copies. It still requires an
+official Popcorn timing gate before its default is considered final.
 
 Variant 7 (`direct_adaptive_m128_m64_m32_fp32`) is the next-fastest variant
 that also clears the exact-shape stress families, at 8.605 ms.
@@ -46,16 +47,31 @@ single torch-only benchmark run
 | [11] | batch 2, n 4096 | 11.177 ms |
 
 Twice the work costs 7.32x the time. At batch 1 the dispatch takes the
-single-matrix `Xpotrf` path instead, which is blocked and cuBLAS-heavy.
+single-matrix `Xpotrf` path instead, which is a fused tiled wavefront kernel.
 
-Variant 11 factors each matrix separately so both calls take that path.
-Two single-matrix factorizations project to about 3.06 ms plus per-call
-overhead — under variant 2's measured 4.955 ms — and it inherits the
-single-matrix path's numerics, which passed 6/6 stress families as variant 0.
-**This projection is arithmetic from entry [10], not a measurement.** The
-loop also writes each factor through a slice assignment, costing roughly
-40 us per matrix; if variant 11 wins, that copy is removable via the
-`out=(L, info)` form.
+The variant-0 NSys trace is retained at
+`artifacts/nsys/b2_n4096_20260729T075049Z/v0_torch_cusolver/`. It confirms
+PyTorch's `potrfBatched` dispatch:
+
+| Kernel family | Count | Total |
+|---|---:|---:|
+| `potrf_cta_lower_batch<...,16>` | 256 | 1.466 ms |
+| `potrfBatch_trsm_lower<...,16>` | 255 | 0.601 ms |
+| `potrf_syrk_T16_nc_kernel` | 192 | 5.968 ms |
+| `potrf_syrk_nc_kernel` | 63 | 2.571 ms |
+
+Those 769 solver kernels total 10.607 ms. With setup, copying, cleanup, and
+launch gaps, the captured range spans 11.550 ms.
+
+Variant 11 factors each matrix separately so both calls take the batch-one
+path. Its NSys trace is retained at
+`artifacts/nsys/b2_n4096_20260729T075335Z/v11_torch_per_matrix_loop/`.
+The two Xpotrf kernels take 1.394 and 1.382 ms, or 2.776 ms total. The full
+captured range is 3.630 ms. It includes four approximately 73 us copy
+kernels: two input clones plus two slice assignments into the profiler's
+preallocated output. The normal return path still performs the two slice
+assignments, so a native Xpotrf wrapper with direct column-major output
+remains the preferred follow-up.
 
 Entry [8] (`batch 2, n 2048`, 3.149 ms) shows the same signature: it costs
 more than the 1.528 ms `batch 1, n 4096` factorization despite having a
@@ -184,10 +200,10 @@ python cholesky/b2n4096/cholesky_b2n4096_runner.py submit --mode test
 python cholesky/b2n4096/cholesky_b2n4096_runner.py submit --mode leaderboard
 ```
 
-Nsight Systems capture is pending because the authorized remote execution
-request reached its tool usage limit. Nsight Compute is independently blocked
-because neither `POPCORN_BREV_PROFILER_URL` nor `BREV_PROFILER_URL` is
-configured. No metric substitution was made.
+Nsight Systems now confirms both the 772-kernel batched baseline and the
+two-kernel Xpotrf control. The profiler preflight was also corrected to emit
+metadata for Python-orchestrated variant 11 instead of indexing beyond the
+native metadata table.
 
 If NCU shows GEMMs above 30% of target time and the kernel/SASS evidence does
 not identify an SM100 Tensor Core path, the next candidate is a CUTLASS 3.x

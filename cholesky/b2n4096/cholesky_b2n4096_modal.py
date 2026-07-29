@@ -374,7 +374,17 @@ def _environment() -> dict[str, Any]:
 
 def _metadata(solution, variant: int) -> dict[str, int]:
     columns = tuple(str(value) for value in solution._METADATA_COLUMNS)
-    values = solution._variant_metadata()[variant].tolist()
+    rows = solution._variant_metadata()
+    if variant >= rows.size(0):
+        return {
+            column: (
+                variant if column == "variant"
+                else 1 if column == "implemented"
+                else 0
+            )
+            for column in columns
+        }
+    values = rows[variant].tolist()
     if len(columns) != len(values):
         raise RuntimeError("variant metadata columns and values differ in length")
     return {column: int(value) for column, value in zip(columns, values)}

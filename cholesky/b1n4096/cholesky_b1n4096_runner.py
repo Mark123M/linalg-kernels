@@ -42,6 +42,11 @@ VARIANT_NAMES = (
     "hybrid_cpu_potrf64_aten",
     "hybrid_cpu_potrf64_compile",
     "hybrid_cpu_potrf128_aten",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_trsm",
+    "ll_nb512_rec256_fused_ll_ib32_lb8_trsm",
+    "ll_nb256_leaf256_fused_ll_ib32_lb8_trsm",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_inverse_gemm",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_fp32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

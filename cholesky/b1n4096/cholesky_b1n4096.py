@@ -23,10 +23,37 @@ _VARIANT_NAMES = (
     "hybrid_cpu_potrf64_aten",
     "hybrid_cpu_potrf64_compile",
     "hybrid_cpu_potrf128_aten",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_trsm",
+    "ll_nb512_rec256_fused_ll_ib32_lb8_trsm",
+    "ll_nb256_leaf256_fused_ll_ib32_lb8_trsm",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_inverse_gemm",
+    "ll_nb512_rec128_fused_ll_ib32_lb32_fp32",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
-_NATIVE_VARIANTS = (1, 2, 3, 4, 5, 6, 7, 8, 10)
+_NATIVE_VARIANTS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15)
+_LEAF_CONFIGS = tuple(
+    (m, ib, lb, threads)
+    for m in (64, 128, 256)
+    for ib in (8, 16, 24, 32)
+    for lb in (8, 16, 32)
+    for threads in (128, 256)
+)
+# sm_100a ptxas reports a 16-byte stack frame for these configurations.
+# This is informational tuning data, never a rejection criterion.
+_LEAF_PTXAS_STACK_CONFIGS = (1, 13, 25, 37, 48, 60, 61)
+_LEAF_METADATA_COLUMNS = (
+    "config",
+    "m",
+    "ib",
+    "lb",
+    "threads",
+    "registers",
+    "shared_bytes",
+    "local_bytes",
+    "dynamic_bytes",
+    "active_blocks",
+)
 
 _METADATA_COLUMNS = (
     "variant",
@@ -81,6 +108,12 @@ void cholesky_b1n4096_hybrid_stage(
 void cholesky_b1n4096_hybrid_finish(
     at::Tensor out, const at::Tensor& host_factor,
     int64_t begin, int64_t width);
+void cholesky_b1n4096_leaf_prepare(int64_t config);
+void cholesky_b1n4096_leaf_out(
+    const at::Tensor& data, at::Tensor out, int64_t config);
+void cholesky_b1n4096_leaf_factor(
+    at::Tensor out, int64_t config);
+at::Tensor cholesky_b1n4096_leaf_metadata();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare", &cholesky_b1n4096_prepare,
@@ -98,6 +131,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Run a hybrid diagonal and history phase");
   m.def("hybrid_finish", &cholesky_b1n4096_hybrid_finish,
         "Return a CPU panel and solve it on the GPU");
+  m.def("leaf_prepare", &cholesky_b1n4096_leaf_prepare,
+        "Configure one fused left-looking leaf");
+  m.def("leaf_out", &cholesky_b1n4096_leaf_out,
+        "Run one isolated fused left-looking leaf");
+  m.def("leaf_factor", &cholesky_b1n4096_leaf_factor,
+        "Factor one initialized fused left-looking leaf");
+  m.def("leaf_metadata", &cholesky_b1n4096_leaf_metadata,
+        "Fused left-looking leaf resource metadata");
 }
 """
 
@@ -124,8 +165,9 @@ namespace {
 
 constexpr int kN = 4096;
 constexpr int kPanelLd = 9;
-constexpr int kVariantCount = 11;
+constexpr int kVariantCount = 16;
 constexpr int kMetadataColumns = 33;
+constexpr int kLeafConfigCount = 72;
 
 constexpr int kLeftLook = 0;
 constexpr int kTrsmFusedMicro = 3;
@@ -137,6 +179,10 @@ constexpr int kApplyWhole = 0;
 constexpr int kApplySplit2 = 1;
 constexpr int kDirectLook = 1;
 constexpr int kHybridLook = 2;
+constexpr int kRecursiveLook = 3;
+constexpr int kFactorFusedLl = 6;
+constexpr int kApplyCublasTrsm = 4;
+constexpr int kApplyInverseGemm = 5;
 
 bool gProfileRanges = false;
 cudaEvent_t gPanelReady = nullptr;
@@ -242,6 +288,11 @@ SPEC(7, 128, 128, kTrsmFusedMicro, 1);
 SPEC(8, 64, 64, kTrsmGemm, 1);
 SPEC(9, 64, 64, kTrsmGemm, 1);
 SPEC(10, 128, 128, kTrsmGemm, 1);
+SPEC(11, 512, 128, kTrsmGemm, 1);
+SPEC(12, 512, 256, kTrsmGemm, 1);
+SPEC(13, 256, 256, kTrsmGemm, 1);
+SPEC(14, 512, 128, kTrsmGemm, 1);
+SPEC(15, 512, 128, kTrsmGemm, 1);
 
 #undef SPEC
 
@@ -572,6 +623,281 @@ __device__ __forceinline__ void factor_compact(
       }
     }
     __syncthreads();
+  }
+}
+
+// Algorithm 3 from ICL-UTK-987-2017, specialized for one square leaf.
+// One CTA retains the outer i loop. At each step it forms only the current
+// (M-i)-by-IB panel from the already factored columns, factors its small
+// diagonal block, and solves the rows below. No update is pushed into a
+// future panel.
+template <int M, int IB, int LB, int Threads>
+__global__ __launch_bounds__(Threads)
+void fused_ll_potf2(
+    float* __restrict__ matrix, int lda, int begin) {
+  static_assert(M == 64 || M == 128 || M == 256);
+  static_assert(IB == 8 || IB == 16 || IB == 24 || IB == 32);
+  static_assert(LB == 8 || LB == 16 || LB == 32);
+  static_assert(Threads == 128 || Threads == 256);
+  constexpr int kRowsPerThread = (M + Threads - 1) / Threads;
+  constexpr int kPivotLd = IB + 1;
+  constexpr int kUpdatedLd = M + 1;
+  __shared__ float pivot[2][LB][kPivotLd];
+  __shared__ float updated[IB][kUpdatedLd];
+  __shared__ float panel_inverse;
+  const int thread = static_cast<int>(threadIdx.x);
+
+#pragma unroll 1
+  for (int panel_begin = 0; panel_begin < M; panel_begin += IB) {
+    const int panel_width =
+        panel_begin + IB <= M ? IB : M - panel_begin;
+    float value[kRowsPerThread][IB];
+#pragma unroll
+    for (int slot = 0; slot < kRowsPerThread; ++slot) {
+      const int row = thread + slot * Threads;
+#pragma unroll
+      for (int column = 0; column < IB; ++column) {
+        value[slot][column] =
+            row >= panel_begin && row < M &&
+                    column < panel_width &&
+                    panel_begin + column <= row
+                ? load_global(
+                      matrix +
+                      static_cast<int64_t>(begin + row) * lda +
+                      begin + panel_begin + column)
+                : 0.0f;
+      }
+    }
+
+    if (panel_begin > 0) {
+      float left0[kRowsPerThread][LB];
+      float left1[kRowsPerThread][LB];
+      int history_begin = 0;
+      int history_width =
+          panel_begin < LB ? panel_begin : LB;
+#pragma unroll
+      for (int slot = 0; slot < kRowsPerThread; ++slot) {
+        const int row = thread + slot * Threads;
+#pragma unroll
+        for (int k = 0; k < LB; ++k) {
+          left0[slot][k] =
+              row >= panel_begin && row < M && k < history_width
+                  ? load_global(
+                        matrix +
+                        static_cast<int64_t>(begin + row) * lda +
+                        begin + k)
+                  : 0.0f;
+        }
+      }
+      // MAGMA derives this transpose from row-owner registers because its
+      // input is column-major. Here the tensor is row-major, so enumerate k
+      // within each pivot row to keep the global loads contiguous.
+      for (int linear = thread; linear < LB * IB;
+           linear += Threads) {
+        const int column = linear / LB;
+        const int k = linear - column * LB;
+        pivot[0][k][column] =
+            k < history_width && column < panel_width
+                ? load_global(
+                      matrix +
+                      static_cast<int64_t>(
+                          begin + panel_begin + column) * lda +
+                      begin + k)
+                : 0.0f;
+      }
+      __syncthreads();
+
+      int current = 0;
+#pragma unroll 1
+      while (history_begin < panel_begin) {
+        const int next_begin = history_begin + history_width;
+        const int next_width =
+            next_begin < panel_begin
+                ? ((panel_begin - next_begin) < LB
+                       ? panel_begin - next_begin
+                       : LB)
+                : 0;
+        if (next_width > 0) {
+          if (current == 0) {
+#pragma unroll
+            for (int slot = 0; slot < kRowsPerThread; ++slot) {
+              const int row = thread + slot * Threads;
+#pragma unroll
+              for (int k = 0; k < LB; ++k) {
+                left1[slot][k] =
+                    row >= panel_begin && row < M &&
+                            k < next_width
+                        ? load_global(
+                              matrix +
+                              static_cast<int64_t>(begin + row) *
+                                  lda +
+                              begin + next_begin + k)
+                        : 0.0f;
+              }
+            }
+          } else {
+#pragma unroll
+            for (int slot = 0; slot < kRowsPerThread; ++slot) {
+              const int row = thread + slot * Threads;
+#pragma unroll
+              for (int k = 0; k < LB; ++k) {
+                left0[slot][k] =
+                    row >= panel_begin && row < M &&
+                            k < next_width
+                        ? load_global(
+                              matrix +
+                              static_cast<int64_t>(begin + row) *
+                                  lda +
+                              begin + next_begin + k)
+                        : 0.0f;
+              }
+            }
+          }
+          const int next = current ^ 1;
+          for (int linear = thread; linear < LB * IB;
+               linear += Threads) {
+            const int column = linear / LB;
+            const int k = linear - column * LB;
+            pivot[next][k][column] =
+                k < next_width && column < panel_width
+                    ? load_global(
+                          matrix +
+                          static_cast<int64_t>(
+                              begin + panel_begin + column) * lda +
+                          begin + next_begin + k)
+                    : 0.0f;
+          }
+        }
+
+#pragma unroll
+        for (int slot = 0; slot < kRowsPerThread; ++slot) {
+          const int row = thread + slot * Threads;
+          if (row >= panel_begin && row < M) {
+#pragma unroll
+            for (int k = 0; k < LB; ++k) {
+              if (k < history_width) {
+                const float left =
+                    current == 0
+                        ? left0[slot][k]
+                        : left1[slot][k];
+#pragma unroll
+                for (int column = 0; column < IB; ++column) {
+                  if (column < panel_width &&
+                      panel_begin + column <= row) {
+                    value[slot][column] = fmaf(
+                        -left, pivot[current][k][column],
+                        value[slot][column]);
+                  }
+                }
+              }
+            }
+          }
+        }
+        __syncthreads();
+        history_begin = next_begin;
+        history_width = next_width;
+        current ^= 1;
+      }
+    }
+
+#pragma unroll
+    for (int slot = 0; slot < kRowsPerThread; ++slot) {
+      const int row = thread + slot * Threads;
+      if (row >= panel_begin && row < M) {
+        const int local_row = row - panel_begin;
+#pragma unroll
+        for (int column = 0; column < IB; ++column) {
+          if (column < panel_width && column <= local_row) {
+            updated[column][local_row] =
+                value[slot][column];
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // MAGMA's fused POTF2 factors and solves the complete updated panel
+    // column-by-column. This interleaves the diagonal factorization with
+    // all row solves instead of completing the corner and then giving
+    // every row a dependent forward-substitution chain.
+#pragma unroll 1
+    for (int column = 0; column < IB; ++column) {
+      if (column < panel_width && thread == 0) {
+        const float root =
+            __fsqrt_rn(updated[column][column]);
+        updated[column][column] = root;
+        panel_inverse = __fdiv_rn(1.0f, root);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int slot = 0; slot < kRowsPerThread; ++slot) {
+        const int row = thread + slot * Threads;
+        const int local_row = row - panel_begin;
+        if (row >= panel_begin && row < M &&
+            local_row > column && column < panel_width) {
+          updated[column][local_row] *= panel_inverse;
+        }
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int slot = 0; slot < kRowsPerThread; ++slot) {
+        const int row = thread + slot * Threads;
+        const int local_row = row - panel_begin;
+        if (row >= panel_begin && row < M &&
+            local_row > column && column < panel_width) {
+          const float left = updated[column][local_row];
+#pragma unroll
+          for (int target = column + 1;
+               target < IB; ++target) {
+            if (target < panel_width &&
+                target <= local_row) {
+              updated[target][local_row] = fmaf(
+                  -left, updated[column][target],
+                  updated[target][local_row]);
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int slot = 0; slot < kRowsPerThread; ++slot) {
+      const int row = thread + slot * Threads;
+      if (row >= panel_begin && row < M) {
+        const int local_row = row - panel_begin;
+#pragma unroll
+        for (int column = 0; column < IB; ++column) {
+          if (column < panel_width &&
+              column <= local_row) {
+            store_global(
+                matrix +
+                    static_cast<int64_t>(begin + row) * lda +
+                    begin + panel_begin + column,
+                updated[column][local_row]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int M>
+__global__ __launch_bounds__(256)
+void copy_leaf_lower(
+    const float* __restrict__ input,
+    float* __restrict__ output) {
+  for (int linear = static_cast<int>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+       linear < M * M;
+       linear += static_cast<int>(gridDim.x) * blockDim.x) {
+    const int row = linear / M;
+    const int column = linear - row * M;
+    output[linear] =
+        column <= row ? load_global(input + linear) : 0.0f;
   }
 }
 
@@ -1193,6 +1519,138 @@ void gemm_inner(
       "micro history GEMM");
 }
 
+void gemm_recursive_update(
+    cublasHandle_t handle, float* output,
+    int tile_begin, int leaf_begin, int tile_end,
+    int leaf_width, bool fast_tf32) {
+  const int history = leaf_begin - tile_begin;
+  const int rows = tile_end - leaf_begin;
+  if (history == 0 || rows == 0) {
+    return;
+  }
+  const float alpha = -1.0f;
+  const float beta = 1.0f;
+  const float* leaf_rows =
+      output + static_cast<int64_t>(leaf_begin) * kN + tile_begin;
+  float* destination =
+      output + static_cast<int64_t>(leaf_begin) * kN + leaf_begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          leaf_width, rows, history,
+          &alpha,
+          leaf_rows, CUDA_R_32F, kN,
+          leaf_rows, CUDA_R_32F, kN,
+          &beta,
+          destination, CUDA_R_32F, kN,
+          fast_tf32
+              ? CUBLAS_COMPUTE_32F_FAST_TF32
+              : CUBLAS_COMPUTE_32F,
+          CUBLAS_GEMM_DEFAULT),
+      "recursive leaf update");
+}
+
+void trsm_below(
+    cublasHandle_t handle, float* output,
+    int begin, int width, int rows) {
+  if (rows <= 0) {
+    return;
+  }
+  const float alpha = 1.0f;
+  check_cublas(
+      cublasStrsm(
+          handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+          CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
+          width, rows, &alpha,
+          output + static_cast<int64_t>(begin) * kN + begin,
+          kN,
+          output + static_cast<int64_t>(begin + width) * kN +
+              begin,
+          kN),
+      "completed panel triangular solve");
+}
+
+template <int Width>
+__global__ __launch_bounds__(256)
+void identity_kernel(float* __restrict__ inverse) {
+  for (int linear = static_cast<int>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+       linear < Width * Width;
+       linear += static_cast<int>(gridDim.x) * blockDim.x) {
+    const int row = linear / Width;
+    const int column = linear - row * Width;
+    inverse[linear] = row == column ? 1.0f : 0.0f;
+  }
+}
+
+template <int Width>
+__global__ __launch_bounds__(256)
+void copy_recursive_apply(
+    float* __restrict__ output,
+    const float* __restrict__ scratch, int begin) {
+  const int rows = kN - begin - Width;
+  const int64_t elements = static_cast<int64_t>(rows) * Width;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t linear =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x +
+           threadIdx.x;
+       linear < elements; linear += stride) {
+    const int row = static_cast<int>(linear / Width);
+    const int column =
+        static_cast<int>(linear - static_cast<int64_t>(row) * Width);
+    store_global(
+        output +
+            matrix_index(begin + Width + row, begin + column),
+        load_global(scratch + linear));
+  }
+}
+
+template <int Width>
+void inverse_gemm_below(
+    cublasHandle_t handle, float* output,
+    float* inverse, float* scratch, int begin) {
+  const int rows = kN - begin - Width;
+  if (rows <= 0) {
+    return;
+  }
+  cudaLaunchConfig_t identity_config{};
+  identity_config.gridDim = dim3(128, 1, 1);
+  identity_config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &identity_config, identity_kernel<Width>, inverse);
+  const float alpha = 1.0f;
+  check_cublas(
+      cublasStrsm(
+          handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+          CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+          Width, Width, &alpha,
+          output + static_cast<int64_t>(begin) * kN + begin,
+          kN, inverse, Width),
+      "completed panel inverse");
+  const float beta = 0.0f;
+  const float* below =
+      output + static_cast<int64_t>(begin + Width) * kN + begin;
+  check_cublas(
+      cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          Width, rows, Width,
+          &alpha,
+          inverse, CUDA_R_32F, Width,
+          below, CUDA_R_32F, kN,
+          &beta,
+          scratch, CUDA_R_32F, Width,
+          CUBLAS_COMPUTE_32F_FAST_TF32,
+          CUBLAS_GEMM_DEFAULT),
+      "completed panel inverse GEMM");
+  cudaLaunchConfig_t copy_config{};
+  copy_config.gridDim = dim3(256, 1, 1);
+  copy_config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(
+      &copy_config, copy_recursive_apply<Width>,
+      output, scratch, begin);
+}
+
 template <int Micro>
 void gemm_apply_column(
     cublasHandle_t handle, float* output, const float* t_inv,
@@ -1297,6 +1755,99 @@ void launch_wedges(float* output, int nb) {
   config.gridDim = dim3((kN / nb) * 8, 1, 1);
   config.blockDim = dim3(256, 1, 1);
   cudaLaunchKernelEx(&config, zero_wedges_kernel, output, nb);
+}
+
+template <typename Action>
+void dispatch_leaf(int config, Action action) {
+#define LEAF_ONE(ID, M, IB, LB, THREADS) \
+  case ID:                               \
+    action.template operator()<M, IB, LB, THREADS>(); \
+    break
+#define LEAF_IB(BASE, M, IB)                  \
+  LEAF_ONE(BASE, M, IB, 8, 128);              \
+  LEAF_ONE((BASE) + 1, M, IB, 8, 256);        \
+  LEAF_ONE((BASE) + 2, M, IB, 16, 128);       \
+  LEAF_ONE((BASE) + 3, M, IB, 16, 256);       \
+  LEAF_ONE((BASE) + 4, M, IB, 32, 128);       \
+  LEAF_ONE((BASE) + 5, M, IB, 32, 256)
+#define LEAF_M(BASE, M)              \
+  LEAF_IB(BASE, M, 8);               \
+  LEAF_IB((BASE) + 6, M, 16);        \
+  LEAF_IB((BASE) + 12, M, 24);       \
+  LEAF_IB((BASE) + 18, M, 32)
+  switch (config) {
+    LEAF_M(0, 64);
+    LEAF_M(24, 128);
+    LEAF_M(48, 256);
+    default:
+      TORCH_CHECK(
+          false, "leaf config must be in [0, ",
+          kLeafConfigCount - 1, "]");
+  }
+#undef LEAF_M
+#undef LEAF_IB
+#undef LEAF_ONE
+}
+
+template <int M, int IB, int LB, int Threads>
+void launch_leaf(float* output, int lda, int begin) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(Threads, 1, 1);
+  cudaLaunchKernelEx(
+      &config, fused_ll_potf2<M, IB, LB, Threads>,
+      output, lda, begin);
+}
+
+template <int Id>
+void launch_recursive(
+    float* output, const float* input,
+    float* inverse, float* scratch) {
+  using V = Variant<Id>;
+  static_assert(Id >= 11 && Id <= 15);
+  constexpr int NB = V::nb;
+  constexpr int Leaf = V::micro;
+  constexpr int Threads = Leaf == 128 ? 128 : 256;
+  constexpr bool FastTf32 = Id != 15;
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  CublasStateGuard guard(handle);
+  launch_copy(input, output);
+  for (int panel = 0; panel < kN; panel += NB) {
+    if (panel > 0) {
+      gemm_history(
+          handle, output, panel, NB, FastTf32);
+    }
+    const int tile_end = panel + NB;
+    for (int leaf_begin = panel;
+         leaf_begin < tile_end; leaf_begin += Leaf) {
+      if (leaf_begin > panel) {
+        gemm_recursive_update(
+            handle, output, panel, leaf_begin, tile_end,
+            Leaf, FastTf32);
+      }
+      if constexpr (Leaf == 128) {
+        launch_leaf<128, 32, 32, 128>(
+            output, kN, leaf_begin);
+      } else {
+        launch_leaf<256, 32, 8, 256>(
+            output, kN, leaf_begin);
+      }
+      const int internal_rows = tile_end - leaf_begin - Leaf;
+      trsm_below(
+          handle, output, leaf_begin, Leaf, internal_rows);
+    }
+    const int outer_rows = kN - panel - NB;
+    if (outer_rows > 0) {
+      if constexpr (Id == 14) {
+        inverse_gemm_below<NB>(
+            handle, output, inverse, scratch, panel);
+      } else {
+        trsm_below(
+            handle, output, panel, NB, outer_rows);
+      }
+    }
+  }
+  launch_wedges(output, NB);
 }
 
 template <int Id>
@@ -1648,6 +2199,28 @@ void configure_direct() {
       "direct fused kernels need a consumer CTA");
 }
 
+template <int Leaf>
+void configure_recursive_leaf() {
+  constexpr int Threads = Leaf == 128 ? 128 : 256;
+  if constexpr (Leaf == 128) {
+    checked_attributes(
+        fused_ll_potf2<128, 32, 32, 128>);
+    TORCH_CHECK(
+        active_blocks(
+            fused_ll_potf2<128, 32, 32, 128>,
+            128, 0) >= 1,
+        "fused left-looking leaf has no active CTA");
+  } else {
+    checked_attributes(
+        fused_ll_potf2<256, 32, 8, 256>);
+    TORCH_CHECK(
+        active_blocks(
+            fused_ll_potf2<256, 32, 8, 256>,
+            256, 0) >= 1,
+        "fused left-looking leaf has no active CTA");
+  }
+}
+
 void configure_variant(int variant) {
   switch (variant) {
     case 1: configure_one<1>(); break;
@@ -1663,8 +2236,17 @@ void configure_variant(int variant) {
     case 9:
     case 10:
       break;
+    case 11:
+    case 14:
+    case 15:
+      configure_recursive_leaf<128>();
+      break;
+    case 12:
+    case 13:
+      configure_recursive_leaf<256>();
+      break;
     default:
-      TORCH_CHECK(false, "native variant must be in [1, 10]");
+      TORCH_CHECK(false, "native variant must be in [1, 15]");
   }
 }
 
@@ -1686,8 +2268,18 @@ void launch_variant(
         output, input, t_inv, flags); break;
     case 7: launch_direct<7>(
         output, input, t_inv, flags); break;
+    case 11: launch_recursive<11>(
+        output, input, t_inv, scratch); break;
+    case 12: launch_recursive<12>(
+        output, input, t_inv, scratch); break;
+    case 13: launch_recursive<13>(
+        output, input, t_inv, scratch); break;
+    case 14: launch_recursive<14>(
+        output, input, t_inv, scratch); break;
+    case 15: launch_recursive<15>(
+        output, input, t_inv, scratch); break;
     default:
-      TORCH_CHECK(false, "GPU variant must be in [1, 7]");
+      TORCH_CHECK(false, "GPU variant must be in [1, 7] or [11, 15]");
   }
 }
 
@@ -1805,6 +2397,69 @@ void write_hybrid_metadata(int64_t* rows, int id, int width) {
   row[31] = row[28] > 0 ? row[28] - 1 : 0;
 }
 
+template <int Id>
+void write_recursive_metadata(int64_t* rows) {
+  using V = Variant<Id>;
+  constexpr int Leaf = V::micro;
+  constexpr int Threads = Leaf == 128 ? 128 : 256;
+  const cudaFuncAttributes factor =
+      Leaf == 128
+          ? checked_attributes(
+                fused_ll_potf2<128, 32, 32, 128>)
+          : checked_attributes(
+                fused_ll_potf2<256, 32, 8, 256>);
+  const cudaFuncAttributes copy =
+      checked_attributes(copy_lower_kernel);
+  const cudaFuncAttributes wedges =
+      checked_attributes(zero_wedges_kernel);
+  int64_t* row =
+      rows + static_cast<int64_t>(Id) * kMetadataColumns;
+  const int outer_panels = kN / V::nb;
+  const int leaves_per_panel = V::nb / Leaf;
+  const int leaves = outer_panels * leaves_per_panel;
+  const int recursive_updates =
+      outer_panels * (leaves_per_panel - 1);
+  const int internal_solves = recursive_updates;
+  const int outer_solves = outer_panels - 1;
+  row[0] = Id;
+  row[1] = kRecursiveLook;
+  row[2] = V::nb;
+  row[3] = Id == 14 ? kApplyInverseGemm : kApplyCublasTrsm;
+  row[4] = Id == 15 ? kMathFp32 : kMathTf32;
+  row[5] = Id == 15 ? kMathFp32 : kMathTf32;
+  row[6] = Threads;
+  row[7] = factor.numRegs;
+  row[8] = factor.sharedSizeBytes;
+  row[9] = factor.localSizeBytes;
+  row[10] = 0;
+  row[15] = copy.numRegs;
+  row[16] = wedges.numRegs;
+  row[17] =
+      Leaf == 128
+          ? active_blocks(
+                fused_ll_potf2<128, 32, 32, 128>,
+                128, 0)
+          : active_blocks(
+                fused_ll_potf2<256, 32, 8, 256>,
+                256, 0);
+  row[19] =
+      2 + (outer_panels - 1) + recursive_updates + leaves +
+      internal_solves + outer_solves * (Id == 14 ? 4 : 1);
+  row[20] = 0;
+  row[21] = Leaf;
+  row[22] = 0;
+  row[23] = 1;
+  row[24] = kFactorFusedLl;
+  row[25] = Id == 14 ? kApplyInverseGemm : kApplyCublasTrsm;
+  row[26] = Leaf;
+  row[27] = Leaf == 128 ? leaves : 0;
+  row[28] = 0;
+  row[29] = 0;
+  row[30] = 0;
+  row[31] = 0;
+  row[32] = 0;
+}
+
 }  // namespace
 
 void cholesky_b1n4096_profile(bool enabled) {
@@ -1856,10 +2511,137 @@ void cholesky_b1n4096_hybrid_finish(
       static_cast<int>(begin), static_cast<int>(width));
 }
 
+void cholesky_b1n4096_leaf_prepare(int64_t config) {
+  TORCH_CHECK(
+      config >= 0 && config < kLeafConfigCount,
+      "leaf config must be in [0, ", kLeafConfigCount - 1, "]");
+  dispatch_leaf(
+      static_cast<int>(config),
+      [&]<int M, int IB, int LB, int Threads>() {
+        const cudaFuncAttributes attributes = checked_attributes(
+            fused_ll_potf2<M, IB, LB, Threads>);
+        TORCH_CHECK(
+            active_blocks(
+                fused_ll_potf2<M, IB, LB, Threads>,
+                Threads, 0) >= 1,
+            "leaf config has no active CTA");
+        TORCH_CHECK(
+            attributes.maxThreadsPerBlock >= Threads,
+            "leaf config exceeds its compiled thread limit");
+      });
+}
+
+void cholesky_b1n4096_leaf_out(
+    const at::Tensor& data, at::Tensor output, int64_t config) {
+  TORCH_CHECK(data.is_cuda(), "leaf input must be CUDA");
+  TORCH_CHECK(output.is_cuda(), "leaf output must be CUDA");
+  TORCH_CHECK(
+      data.scalar_type() == at::kFloat &&
+          output.scalar_type() == at::kFloat,
+      "leaf tensors must be float32");
+  TORCH_CHECK(
+      data.is_contiguous() && output.is_contiguous(),
+      "leaf tensors must be contiguous");
+  TORCH_CHECK(
+      data.sizes() == output.sizes(),
+      "leaf output shape mismatch");
+  TORCH_CHECK(
+      data.device() == output.device(),
+      "leaf output device mismatch");
+  TORCH_CHECK(
+      config >= 0 && config < kLeafConfigCount,
+      "leaf config must be in [0, ", kLeafConfigCount - 1, "]");
+  const int m_index = static_cast<int>(config) / 24;
+  const int m = m_index == 0 ? 64 : (m_index == 1 ? 128 : 256);
+  TORCH_CHECK(
+      data.dim() == 3 && data.size(0) == 1 &&
+          data.size(1) == m && data.size(2) == m,
+      "leaf tensor shape does not match config");
+  c10::cuda::CUDAGuard device_guard(data.device());
+  cudaLaunchConfig_t copy_config{};
+  copy_config.gridDim = dim3(32, 1, 1);
+  copy_config.blockDim = dim3(256, 1, 1);
+  dispatch_leaf(
+      static_cast<int>(config),
+      [&]<int M, int IB, int LB, int Threads>() {
+        cudaLaunchKernelEx(
+            &copy_config, copy_leaf_lower<M>,
+            data.data_ptr<float>(), output.data_ptr<float>());
+        launch_leaf<M, IB, LB, Threads>(
+            output.data_ptr<float>(), M, 0);
+      });
+  const cudaError_t status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "leaf launch failed: ", cudaGetErrorString(status));
+}
+
+void cholesky_b1n4096_leaf_factor(
+    at::Tensor output, int64_t config) {
+  TORCH_CHECK(output.is_cuda(), "leaf output must be CUDA");
+  TORCH_CHECK(
+      output.scalar_type() == at::kFloat,
+      "leaf output must be float32");
+  TORCH_CHECK(
+      output.is_contiguous(),
+      "leaf output must be contiguous");
+  TORCH_CHECK(
+      config >= 0 && config < kLeafConfigCount,
+      "leaf config must be in [0, ", kLeafConfigCount - 1, "]");
+  const int m_index = static_cast<int>(config) / 24;
+  const int m = m_index == 0 ? 64 : (m_index == 1 ? 128 : 256);
+  TORCH_CHECK(
+      output.dim() == 3 && output.size(0) == 1 &&
+          output.size(1) == m && output.size(2) == m,
+      "leaf tensor shape does not match config");
+  c10::cuda::CUDAGuard device_guard(output.device());
+  dispatch_leaf(
+      static_cast<int>(config),
+      [&]<int M, int IB, int LB, int Threads>() {
+        launch_leaf<M, IB, LB, Threads>(
+            output.data_ptr<float>(), M, 0);
+      });
+  const cudaError_t status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "leaf launch failed: ", cudaGetErrorString(status));
+}
+
+at::Tensor cholesky_b1n4096_leaf_metadata() {
+  constexpr int kColumns = 10;
+  auto result = at::zeros(
+      {kLeafConfigCount, kColumns},
+      at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  int64_t* rows = result.data_ptr<int64_t>();
+  for (int config = 0; config < kLeafConfigCount; ++config) {
+    dispatch_leaf(
+        config,
+        [&]<int M, int IB, int LB, int Threads>() {
+          const cudaFuncAttributes attributes = checked_attributes(
+              fused_ll_potf2<M, IB, LB, Threads>);
+          int64_t* row =
+              rows + static_cast<int64_t>(config) * kColumns;
+          row[0] = config;
+          row[1] = M;
+          row[2] = IB;
+          row[3] = LB;
+          row[4] = Threads;
+          row[5] = attributes.numRegs;
+          row[6] = attributes.sharedSizeBytes;
+          row[7] = attributes.localSizeBytes;
+          row[8] = 0;
+          row[9] = active_blocks(
+              fused_ll_potf2<M, IB, LB, Threads>,
+              Threads, 0);
+        });
+  }
+  return result;
+}
+
 void cholesky_b1n4096_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 10]");
+      "native variant must be in [1, 15]");
   if (variant >= 8) {
     ensure_hybrid_state();
   }
@@ -1872,7 +2654,7 @@ void cholesky_b1n4096_out(
   check_output(data, output);
   TORCH_CHECK(
       variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 10]");
+      "native variant must be in [1, 15]");
   c10::cuda::CUDAGuard device_guard(data.device());
   const int selected = static_cast<int>(variant);
   if (selected == 8 || selected == 10) {
@@ -1885,7 +2667,9 @@ void cholesky_b1n4096_out(
       selected != 9,
       "variant 9 is driven by the compiled CPU phase helpers");
   const int micro =
-      selected >= 4 ? 128 : kVariantMicro[selected];
+      selected >= 11
+          ? 512
+          : (selected >= 4 ? 128 : kVariantMicro[selected]);
   const int min_micro =
       selected >= 4 ? 32 : kVariantMinMicro[selected];
   at::Tensor t_inv = at::empty(
@@ -1899,7 +2683,9 @@ void cholesky_b1n4096_out(
   }
   at::Tensor scratch;
   float* scratch_pointer = nullptr;
-  if (kVariantUsesScratch[selected]) {
+  if (
+      (selected <= 10 && kVariantUsesScratch[selected]) ||
+      selected == 14) {
     scratch = at::empty(
         {static_cast<int64_t>(kN - micro) * micro},
         data.options());
@@ -1937,6 +2723,11 @@ at::Tensor cholesky_b1n4096_metadata() {
   write_hybrid_metadata(rows, 8, 64);
   write_hybrid_metadata(rows, 9, 64);
   write_hybrid_metadata(rows, 10, 128);
+  write_recursive_metadata<11>(rows);
+  write_recursive_metadata<12>(rows);
+  write_recursive_metadata<13>(rows);
+  write_recursive_metadata<14>(rows);
+  write_recursive_metadata<15>(rows);
   return result;
 }
 """
@@ -2081,6 +2872,61 @@ def _run_variant(
 
 def _variant_metadata() -> torch.Tensor:
     return _native_module().metadata()
+
+
+def _run_leaf(
+    data: torch.Tensor,
+    config: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if not 0 <= config < len(_LEAF_CONFIGS):
+        raise ValueError(
+            f"leaf config must be in [0, {len(_LEAF_CONFIGS) - 1}], "
+            f"got {config}"
+        )
+    m, _, _, _ = _LEAF_CONFIGS[config]
+    if (
+        not data.is_cuda
+        or data.dtype != torch.float32
+        or not data.is_contiguous()
+        or tuple(data.shape) != (1, m, m)
+    ):
+        raise ValueError(
+            f"leaf config {config} requires a contiguous CUDA float32 "
+            f"tensor with shape (1, {m}, {m})"
+        )
+    output = torch.empty_like(data) if out is None else out
+    module = _native_module()
+    module.leaf_prepare(config)
+    module.leaf_out(data, output, config)
+    return output
+
+
+def _leaf_metadata() -> torch.Tensor:
+    return _native_module().leaf_metadata()
+
+
+def _factor_leaf(data: torch.Tensor, config: int) -> torch.Tensor:
+    if not 0 <= config < len(_LEAF_CONFIGS):
+        raise ValueError(
+            f"leaf config must be in [0, {len(_LEAF_CONFIGS) - 1}], "
+            f"got {config}"
+        )
+    m, _, _, _ = _LEAF_CONFIGS[config]
+    if (
+        not data.is_cuda
+        or data.dtype != torch.float32
+        or not data.is_contiguous()
+        or tuple(data.shape) != (1, m, m)
+    ):
+        raise ValueError(
+            f"leaf config {config} requires an initialized contiguous "
+            f"CUDA float32 tensor with shape (1, {m}, {m})"
+        )
+    module = _native_module()
+    module.leaf_prepare(config)
+    module.leaf_factor(data, config)
+    return data
 
 
 def custom_kernel(data: input_t) -> output_t:
