@@ -583,3 +583,55 @@ use a `cutlass_` prefix.
 The 2026-07-28 runner autotune retained variant 21. Median mean time was
 2.886979 ms for variant 21 versus 2.890986 ms for variant 23; the
 cutlass-named clone did not beat the default.
+
+## Persistent CPU--GPU lookahead experiment
+
+Variants 24 and 25 are append-only hybrid candidates; variant 21 remains the
+tracked default. The 2026-07-29 variant-21 Systems trace has a 2.902 ms
+kernel span with no kernel overlap. Factor work totals 0.925 ms, and the two
+width-128 factor launches total 0.668 ms. Their 66,560-byte shared-memory
+footprint admits a target of three resident blocks per B200 SM, or 444
+matrices in one wave. The hybrid split therefore assigns matrices 0--443 to
+GPU POTRF and matrices 444--639 to CPU POTRF.
+
+One 256-thread cooperative kernel owns the complete factorization. Its
+444-block grid is constrained to three resident blocks on each of 148 B200
+SMs. It reuses the precise width-128 factor and solve routines, performs
+rank-128 updates with warp-level `mma.sync.m16n8k8` TF32 inputs and FP32
+accumulators, and keeps the four width-64 tail stages on GPU. Avoiding
+TCGen05 is required here because its SM-wide virtual-resource attribute
+would limit the complete persistent entry to one resident CTA. The three
+lower 64x64 tiles of the next diagonal are updated first. The 196 CPU tiles
+are then packed into mapped pinned storage and published while the GPU
+factors its 444 matrices and processes the remaining lower trailing tiles.
+CPU and GPU factors join only before the dependent triangular solve.
+
+Ready, completed, abort, and final generations occupy separate cache lines.
+The GPU uses system-scope PTX acquire/release loads and stores; the CPU uses
+matching C++ acquire/release operations. No atomic read-modify-write is used.
+The wait binding releases the GIL, has a 30-second failure bound, and the
+abort generation lets every cooperative block leave the scheduler before
+exit. Panel and factor buffers are cacheable pinned tensors of shape
+`(196,128,128)`.
+
+Variant 24 compiles fixed-shape `cholesky_ex`; variant 25 compiles a
+four-step blocked-32 recurrence containing batched POTRF, triangular solve,
+and matrix-product updates. Both use full-graph static Inductor
+`max-autotune`, warm before timing, and use at most 196 CPUs from the process
+affinity. Profiling emits separate CPU wait, POTRF, and publish NVTX ranges
+for both outer panels.
+
+The native and cutlass-renamed extensions compiled locally for `sm_100a` on
+2026-07-29. Binary resource inspection reports 80 registers per thread,
+zero stack, and zero local memory for the persistent kernel. Its cubin entry
+does not contain `EIATTR_TCGEN05_1CTA_USED`. At 256 threads, the register
+allocation admits three blocks, and three copies of the 66,560-byte dynamic
+shared allocation plus static reservation fit within the B200 SM budget.
+Both compiled CPU backends ran at their fixed shape, and an independent
+blocked recurrence check produced a `1.17e-7` relative reconstruction
+residual with zero `info`. Python parsing and the rejected-token scan also
+passed. No B200 execution or performance claim has been made yet. Required
+next evidence is the Modal preflight and Systems report for variants 24 and
+25, followed by three alternating runner rounds against variants 21 and 23.
+Promotion still requires every public row to pass and at least a 0.5%
+median-mean gain.

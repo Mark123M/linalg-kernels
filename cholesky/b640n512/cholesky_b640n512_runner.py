@@ -30,7 +30,6 @@ PROMOTION_RATIO = decimal.Decimal("0.995")
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
-VARIANT_COUNT = 24
 VARIANT_NAMES = (
     "p64_raw_scalar_m4x4_t256",
     "p64_nr_scalar_m4x4_t256",
@@ -56,7 +55,10 @@ VARIANT_NAMES = (
     "staged_p128_to_p64_at_r256_tf32",
     "staged_p128_p64_p32_at_r256_r64_tf32",
     "fused_stage3_regrow_cutlass_names",
+    "hybrid_persistent_p128_cpu196_lapack",
+    "hybrid_persistent_p128_cpu196_blocked32",
 )
+VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
     r"^_DEFAULT_VARIANT = \d+  # POPCORN_VARIANT$", re.MULTILINE
 )
@@ -125,7 +127,7 @@ def _variant_source(source: str, variant: int) -> str:
         )
     ast.parse(rendered)
     rejected = "stream"
-    if rejected in rendered:
+    if rejected in rendered.casefold():
         raise RuntimeError(
             f"rendered submission contains rejected token: {rejected}"
         )

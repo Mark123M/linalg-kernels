@@ -2,10 +2,10 @@
 
 ## Status
 
-The tracked default remains variant 0 (`torch.linalg.cholesky_ex`). The first
-B200 gate completed on 2026-07-28 and retained it: the only fully passing
-native candidate was substantially slower. The historical 1.53 ms baseline
-was confirmed by the contemporaneous three-round median.
+The tracked default is variant 16 (`native_xpotrf_lower_fused_copy`). Its
+three-round B200 median was 1.413225 ms, versus 1.532546 ms for the
+contemporaneous Torch/cuSOLVER baseline. It passed the official Popcorn
+property checks and cleared the required 0.995 promotion ratio.
 
 Variants 11--15 are a second-generation redesign based directly on Algorithm
 3 of ICL-UTK-987-2017. They are implemented and compile for `sm_100a`. Their
@@ -13,6 +13,17 @@ isolated leaves reconstruct correctly, but the final variant-11 NSys duration
 is 6.095 ms, including 4.112 ms in 32 serial M128 leaf calls. This is
 decisively slower than the approximately 1.53 ms library baseline, so none is
 promoted and no version is ported to `b2n4096`.
+
+Variant 17 began as the static 148-worker persistent experiment. Its first
+Popcorn benchmark passed correctness but measured 4.765932 ms, 3.38 times
+variant 16. History-load remapping reduced it to 2.314259 ms and task-wave
+scheduling reached 2.245847 ms. It is now retained as the two-CTA-per-SM
+296-worker occupancy experiment.
+
+Variant 18 is the one-CTA-per-SM successor. Each CTA multiplexes eight
+partially accumulated tiles in shared memory and skips blocked tiles instead
+of holding the worker at the first unavailable dependency. B200 compilation,
+correctness, and timing are pending; variant 16 remains the default.
 
 The shape file is self-contained and routes only contiguous CUDA FP32 tensors
 with shape `(1, 4096, 4096)` to a selected specialized variant. Every other
@@ -38,6 +49,9 @@ input retains the Torch/cuSOLVER path.
 | 13 | NB256, direct leaf256, fused LL IB32/LB8, cuBLAS TRSM |
 | 14 | NB512, recursive leaf128, fused LL IB32/LB32, inverse GEMM |
 | 15 | variant 11 schedule with FP32 history/update GEMMs |
+| 16 | native `cusolverDnXpotrf`, fused physical-triangle copy |
+| 17 | static 296-worker, two-CTA-per-SM persistent FP32 wavefront |
+| 18 | static 148-worker, eight-slot shared-accumulator persistent FP32 wavefront |
 
 ## Paper-faithful fused left-looking leaf
 
@@ -259,6 +273,354 @@ cleanup while retaining the 1.411 ms factor kernel. For batch two, the
 PyTorch dispatch distinction creates much larger potential headroom and must
 be verified with its own NSys trace before implementation.
 
+## Native Xpotrf variant
+
+Variant 16 is the promoted thin wrapper around `cusolverDnXpotrf`. The input
+is symmetric, so the copy kernel writes its physical upper triangle into a
+column-major-strided output and zeros the physical lower triangle. The solver
+then factors that allocation with `CUBLAS_FILL_MODE_LOWER`. Returning the
+same allocation with strides `(4096*4096, 1, 4096)` exposes the physical
+column-major factor as the required logical row-major lower triangle.
+
+`prepare` creates the Xpotrf handle and parameters, queries both workspaces,
+and preallocates device info and workspace storage before measurement. The
+measured path is one vectorized 512-CTA copy followed by one Xpotrf call; it
+does not run Torch's later triangle-cleanup operation.
+
+The promotion report is
+`artifacts/tuning/b1n4096_20260729T083054Z/summary.json`:
+
+| Variant | Three-round median target mean |
+|---:|---:|
+| 0 | 1.532546 ms |
+| 16 | 1.413225 ms |
+
+Variant 16 passed the official property checker and improved the baseline by
+7.79%, so it became the tracked default.
+
+## Static persistent 64-square wavefront
+
+Variant 17 assigns the complete 2,080-tile lower triangle to 148 persistent
+workers. The column-major task number is
+
+```text
+task(i,j) = j*(129-j)/2 + (i-j),  0 <= j <= i < 64.
+```
+
+Every history tile `(i,k)`, pivot tile `(j,k)`, and diagonal tile `(j,j)`
+needed by `(i,j)` has a smaller task number. The initial table pinned the
+first 148 tasks one per worker, processed remaining tasks in decreasing task
+order, assigned weight `j+1` to the least-loaded worker, and finally sorted
+each worker list. Consequently a worker could not wait on one of its own
+later tasks and the inter-worker wait graph followed strictly decreasing task
+numbers. Its estimated worker weights were 308--311.
+
+The kernel uses one cooperative grid of 148 CTAs, 256 threads per CTA, and
+120 KiB dynamic shared memory. Runtime checks require CC 10.0, exactly 148
+SMs, cooperative-launch support, and one measured resident CTA per SM. Each
+worker loads its target tile, immediately consumes every published history
+pair, factors a diagonal tile or solves an off-diagonal tile, stores it, and
+release-publishes its completion. Tile owners also zero the corresponding
+upper output, so no cleanup launch follows. The only preceding operation is
+an 8,320-byte flag reset.
+
+The first Popcorn round passed and measured:
+
+| Variant | Target mean |
+|---:|---:|
+| 0 | 1.533019 ms |
+| 16 | 1.411205 ms |
+| 17 | 4.765932 ms |
+
+NSys at
+`artifacts/nsys/b1_n4096_20260729T100829Z/` confirms one 0.928 us flag reset
+and one 4.757400 ms persistent factorization kernel, with no cuBLAS or
+cuSOLVER work in the factorization. The reset and host synchronization are
+negligible; the kernel itself is the regression.
+
+The full NCU report is
+`artifacts/ncu/b1_n4096_variant_ncu_20260729T101047Z/`. The reproducible
+comparison helper is
+`artifacts/helpers/ncu/compare_persistent_v17.py`. Key measurements against
+the retained cuSOLVER tile-wavefront report are:
+
+| Metric | Initial v17 | cuSOLVER |
+|---|---:|---:|
+| NCU duration | 4.764896 ms | 1.417856 ms |
+| theoretical occupancy | 12.50% | 12.50% |
+| issued instructions / scheduler cycle | 0.1263 | 0.4193 |
+| eligible warps / scheduler cycle | 0.1746 | 0.6578 |
+| elapsed FP32 FMA-pipe utilization | 6.80% | 22.86% |
+| shared-load bank conflicts | 628,914,688 | 521,216 |
+| local loads / stores | 682,752 / 2,368 | 0 / 0 |
+| maximum SM active-cycle excess | 9.16% | 14.11% |
+
+The schedule is therefore not the principal regression: its measured SM
+imbalance is smaller than cuSOLVER's. The initial history mapping causes an
+average 4.3-way conflict over 190,450,240 shared-load requests; 76.23% of
+shared-load wavefronts are excessive. DRAM read utilization is only 0.094%,
+while L1/TEX reaches 60.95%, so this is on-chip addressing/issue pressure,
+not HBM bandwidth. Warp sampling attributes 2,471,750 of 4,911,341 samples
+(50.3%) to LG throttle, concentrated on the two history loads. Only 6.3% of
+samples are selected/issuing.
+
+SASS explains both effects. The fully unrolled history update contains 512
+generic `LD.E` instructions rather than statically addressed `LDS`
+instructions. Their `0x110` row offsets equal `68*sizeof(float)`. Separately,
+the dynamically indexed `float* history[2][2]` table creates the 32-byte
+local frame and its measured local traffic. The old 16-by-16 thread-block
+mapping also makes consecutive four-column register blocks alias banks when
+the shared leading dimension is 68. This is a measured arithmetic/load
+mapping defect, not a reason to reject the kernel for spilling.
+
+The revised source keeps the schedule unchanged and makes one targeted
+microkernel correction:
+
+- eliminate the dynamic pointer table and derive each of the four history
+  addresses directly from one shared base;
+- map each warp to four row blocks by eight column blocks, covering the
+  complete 16-by-16 grid of 4-by-4 thread tiles across eight warps;
+- stage each 16-byte history chunk at
+  `physical_group = logical_group XOR (row >> 2)`;
+- invert that swizzle at use sites and issue explicit `ld.shared.f32`
+  instructions from precomputed 32-bit shared addresses.
+
+For every history `k`, this mapping gives one distinct shared bank per
+distinct address for both operands; repeated addresses within a warp are
+broadcasts. The diagonal tile remains in the unswizzled layout expected by
+the POTRF64/TRSM control.
+
+The revised B200 NSys capture is
+`artifacts/nsys/b1_n4096_20260729T104741Z/`. It passes the dense preflight
+with the same 0.001912 scaled reconstruction residual. The persistent kernel
+now takes 2.314259 ms, a 51.35% improvement over the initial 4.757400 ms
+capture. Compiled resources fell from 246 to 168 registers per thread and
+from 32 to zero reported local bytes. The flag reset is 1.344 us, so the
+remaining gap is still entirely inside the factorization kernel. At
+approximately 1.64 times the 1.411 ms variant-16 result, variant 17 remains
+well outside the promotion gate. A new NCU capture is required to determine
+whether the remaining cost is arithmetic issue rate, shared traffic, or
+dependency waiting; NSys alone cannot distinguish them. Register and
+local-memory results remain diagnostics and never serve as acceptance gates.
+
+The corresponding revised NCU report is
+`artifacts/ncu/b1_n4096_variant_ncu_20260729T105405Z/`. It confirms that the
+load-mapping repair addressed the original kernel defect:
+
+| Metric | Revised v17 | cuSOLVER |
+|---|---:|---:|
+| NCU duration | 2.316384 ms | 1.417856 ms |
+| registers per thread | 168 | 200 |
+| local loads / stores | 0 / 0 | 0 / 0 |
+| issued instructions / scheduler cycle | 0.2293 | 0.4193 |
+| eligible warps / scheduler cycle | 0.3510 | 0.6578 |
+| elapsed FP32 FMA-pipe utilization | 14.12% | 22.86% |
+| shared-load bank conflicts | 2,718,208 | 521,216 |
+| shared-store bank conflicts | 3,051,037 | 260,300 |
+
+The revised SASS contains 1,322 static `FFMA.FTZ` and 525 explicit `LDS`
+instructions, with no local-memory instructions. The remaining gap is
+primarily a scheduling defect. VeloQ reports 1,165,873 barrier-state samples,
+52.45% of all 2,222,692 samples. Source correlation attributes 806,980
+samples to the history-dependency wait before staging the next published
+tile pair and another 178,795 to the diagonal-dependency wait before TRSM.
+Together these actual publication waits account for 84.55% of barrier-state
+samples. The nonblocking readiness-check rendezvous accounts for only 94,216
+samples. Thus ordinary CTA synchronization is not the dominant observation:
+workers are arriving at unavailable DAG nodes and holding their fixed worker
+slot. The measured maximum SM active-cycle excess also rose to 14.95%, nearly
+the cuSOLVER result, despite the table's nearly equal arithmetic weights.
+
+`artifacts/helpers/ncu/simulate_persistent_schedule.py` reproduces this
+head-of-line effect with a phase-level model that lets each target consume a
+history pair as soon as that pair is published. Across history-heavy,
+balanced, and leaf-heavy cost assumptions, the prescribed weight-balanced
+table has a modeled makespan of 422.6--883.6 units. Plain task-ID
+round-robin takes 363.6--852.6 units and reduces accumulated dependency wait
+by 1.10--7.13 times. A dependency-aware greedy assignment does not improve
+the modeled critical-path makespan beyond round-robin and is much more
+sensitive to assumed leaf costs.
+
+The next v17 table therefore uses `owner(task) = task mod 148`. This preserves
+the first wave, strict increasing task order within each worker, and the
+acyclic proof while keeping consecutive global task waves aligned across
+workers. It deliberately accepts wider estimated arithmetic weights,
+281--345, to reduce publication head-of-line blocking. This is a profiler-led
+schedule correction; it does not alter the repaired history microkernel.
+
+NSys at `artifacts/nsys/b1_n4096_20260729T110614Z/` measures this task-wave
+table:
+
+| Schedule | Persistent kernel |
+|---|---:|
+| weight-balanced static table | 2.314259 ms |
+| task-ID round-robin | 2.245847 ms |
+
+Round-robin improves the kernel by 68.412 us, or 2.96%, while retaining the
+same 168 registers, zero local bytes, 120 KiB dynamic shared memory, and
+148-by-256 cooperative launch. The dense preflight again passes with a
+0.001912 scaled reconstruction residual. The trace contains exactly one
+8,320-byte, 1.216 us flag reset and one factorization kernel; there are no
+library factorization or update calls. The schedule correction is therefore
+real but far smaller than the simple dependency model predicted. At 1.637
+times the 1.371975 ms Xpotrf solver kernel in the retained variant-16 NSys
+capture, v17 is still not promotable. A round-robin NCU capture is needed to
+measure how much publication waiting actually changed and to separate the
+remaining dependency floor from shared-tile and POTRF/TRSM work.
+
+The round-robin NCU capture is
+`artifacts/ncu/b1_n4096_variant_ncu_20260729T111249Z/`:
+
+| Metric | Weight-balanced | Round-robin | Change |
+|---|---:|---:|---:|
+| NCU duration | 2.316384 ms | 2.250720 ms | -2.84% |
+| issued instructions / scheduler cycle | 0.2293 | 0.2377 | +3.67% |
+| eligible warps / scheduler cycle | 0.3510 | 0.3641 | +3.72% |
+| elapsed FP32 FMA-pipe utilization | 14.12% | 14.51% | +2.77% |
+| all barrier-state samples | 1,165,873 | 1,089,008 | -6.59% |
+| history-publication barrier samples | 806,980 | 604,405 | -25.10% |
+| diagonal-publication barrier samples | 178,795 | 303,279 | +69.62% |
+
+The two publication waits total 907,684 samples under round-robin versus
+985,775 under the weight-balanced table, a 7.92% reduction. Round-robin
+therefore does align history waves better, but it delays some diagonal owners
+and moves much of the saved wait to the TRSM diagonal dependency. The
+nonblocking readiness-check rendezvous is unchanged at 94,518 samples.
+Publication waiting still represents 83.35% of all barrier-state samples and
+42.47% of all timed warp samples. SM active-cycle imbalance also remains
+material at +15.64%/-10.16%. The static persistent schedule is approaching a
+dependency-wait floor rather than an arithmetic-load-balance optimum.
+A dedicated diagonal worker was rejected in the schedule model: diagonal
+tiles still perform all `j` history updates, so that worker carries weight
+2,080 versus 271--345 elsewhere and raises the modeled makespan by
+2.6--5.8 times rather than accelerating the diagonal chain.
+
+The actual tile work still has an independent measured defect. NCU reports
+only 6.562 useful bytes per 32-byte sector for global loads and 26,075,136
+excessive sectors, 33% of the total. This comes from loading each thread's
+aligned 4-by-4 register tile with sixteen scalar operations while a warp is
+split across four matrix rows. An experiment loaded each local row as one
+aligned `float4`, reducing sixteen scalar target loads per thread to four
+vector loads without changing ownership or arithmetic.
+
+The experiment's NCU report is
+`artifacts/ncu/b1_n4096_variant_ncu_20260729T112837Z/`. SASS confirms the
+intended change from sixteen `LDG.E` instructions to four `LDG.E.128`
+instructions. Dynamic global-load instructions fell from 2,657,218 to
+2,432,752, global-load sectors fell from 56,360,309 to 53,172,909, and useful
+bytes per sector improved from 6.562 to 12.691. This traffic reduction had no
+performance value: NCU duration changed only from 2.250720 to 2.249600 ms,
+while eligible warps fell 1.92%, publication-wait samples rose 1.80%, and
+short-scoreboard samples rose 7.22%. The user's NSys capture measured
+approximately 2.37 ms versus the preceding 2.245847 ms. Because the intended
+memory effect is verified but produces no repeatable latency gain, the
+`float4` target-load experiment is rejected and the scalar loads are
+restored. This also demonstrates that the NCU source rule's theoretical
+8.25% sector opportunity was not on the critical path.
+
+The aggregate shared-store counter remains 3,051,025 conflicts over
+1,411,200 requests, with a 3.2-way average conflict. VeloQ correctly rejects
+the aggregate bank-conflict metrics as `not-a-source-counter`. The derived
+global and shared excessive-transaction metrics exist, but all 40 global and
+955 shared SASS instances are unattributed to source lines in this NCU 2026.2
+report despite line information. No source-line substitution is made; the
+target-load attribution above is an inference from its exact warp mapping and
+the otherwise coalesced output stores. Shared-layout changes are deferred
+until they can address a measured critical path rather than aggregate
+transaction counts alone.
+
+Nsight Compute 2026.2 again does not expose the requested direct metric
+`smsp__sass_thread_inst_executed_op_ffma_pred_on.sum`. It exposes derived
+`*_x2` aliases and per-cycle FFMA rates; none is substituted as a direct
+executed-instruction count. All other metrics used in the comparison helper
+were present under their expected names.
+
+### Two-resident-CTA experiment
+
+The next variant-17 experiment increases the cooperative grid from 148 to
+296 workers, exactly two 256-thread CTAs per each of the target B200's 148
+SMs. CUDA does not define an SM assignment order for ordinary blocks, so the
+kernel still uses a cooperative launch and requires the occupancy API to
+report exactly two active blocks per SM before it may run. This doubles the
+resident warps from 8 to 16 per SM and raises theoretical warp occupancy from
+12.5% to 25%. The goal is to let a second worker execute when the first is
+polling an unpublished tile.
+
+Dynamic shared memory falls from 120 KiB to 96 KiB per CTA. The kernel's
+actual shared layout occupies 88,836 bytes, so this does not change its
+algorithm or staging buffers; two blocks consume approximately 194 KiB
+including static allocations, below the CC 10.0 limit. Registers are the
+binding constraint. The previous 168 registers per thread cannot admit two
+256-thread blocks in a 65,536-register SM, so the kernel now declares
+`__launch_bounds__(256, 2)`. This asks ptxas to cap allocation at 128
+registers per thread. Any resulting local-memory traffic is recorded as a
+performance diagnostic and does not reject the variant.
+
+With 296 workers, the original reverse-greedy static algorithm assigns the
+first 296 task IDs one per worker, assigns the remaining tasks in descending
+task order to the least-loaded worker using weight `j+1`, and then sorts each
+worker's task list. Every dependency still has a smaller task ID, so no CTA
+can wait on its own later work. The resulting estimated weights are 154--159
+and each CTA owns 7--8 tiles. The variant remains ID 17 and variant 16
+remains the default until official correctness and the promotion timing gate
+pass.
+
+### Eight-slot shared-accumulator scheduler
+
+Variant 18 returns to one cooperative 256-thread CTA per each of 148 B200
+SMs, but exposes eight logical tile workers inside every CTA. The static
+148-worker table uses the original reverse-greedy weighted assignment, has
+14--15 tasks per CTA, and retains estimated arithmetic weights of 308--311.
+Every per-worker list is sorted by the existing column-major task ID, which
+is exactly lexicographic `(j,i)` order.
+
+The dynamic shared-memory request is 208 KiB. Its fixed layout is:
+
+| Storage | Bytes |
+|---|---:|
+| Two pairs of swizzled 64-by-68 history tiles | 69,632 |
+| Eight padded 64-by-65 FP32 accumulators | 133,120 |
+| Inverse diagonal and POTRF panel | 2,560 |
+| Slot state and scheduler control | 180 |
+| Total used | 205,492 |
+
+The request selects the SM100 228 KiB carveout while leaving explicit
+alignment headroom. Runtime preparation requires CC 10.0, 148 SMs,
+cooperative-launch support, sufficient per-block opt-in shared memory, and
+exactly one active block per SM from the occupancy API.
+
+Each slot stores a task ID, `(i,j)`, `next_k`, a fresh/parked state, and its
+partial accumulator. `next_k` is the first history column not yet applied:
+
+```text
+T(i,j) = A(i,j) - sum over k < next_k of L(i,k) @ L(j,k).T
+```
+
+Thread zero scans all eight slots and selects the smallest column-major task
+whose next dependency pair is published. Blocked slots are skipped. The CTA
+loads the selected accumulator into the existing 4-by-4-per-thread register
+mapping, applies every consecutively ready `k` update using the existing
+double-buffered history microkernel, and keeps the accumulator in registers
+through that burst. It writes the tile back to its padded shared slot only
+when the next dependency is absent. Completed history on a diagonal tile
+runs POTRF64 immediately; an off-diagonal tile becomes selectable when
+`L(j,j)` is published, then runs TRSM64. Only final `L(i,j)` is
+release-published.
+
+The eight-slot prefix cannot deadlock despite each CTA owning more than
+eight tasks. Completed slots immediately admit the next task in that
+worker's sorted list. Consider the globally smallest unfinished task: all
+earlier same-worker tasks have completed, so it must be in the active prefix;
+all of its dependencies have smaller task IDs, so they are complete.
+Therefore at least one active task is ready until all 2,080 tasks finish.
+Static ownership also guarantees one writer per accumulator, so no tile
+claim atomic or global accumulator is required.
+
+Column-major priority is the initial policy requested for variant 18.
+Row-frontier `(i,j)` priority remains a separate future comparison rather
+than being mixed into this experiment. Register spills and local-memory
+traffic remain profiler diagnostics, never correctness rejection criteria.
+
 ## Hybrid CPU–GPU recurrence
 
 Variants 8–10 follow the lower-path recurrence in
@@ -294,7 +656,12 @@ The extension targets `sm_100a` and uses:
 The local CUDA 13.1 compilation completed. `cuobjdump --dump-resource-usage`
 reported `LOCAL:0` for all emitted production kernels (copy, factor,
 fused 128/64/32, inverse copy-back, and wedge cleanup). This is a compilation
-check only; the local machine cannot execute `sm_100a`.
+check only; the local machine cannot execute `sm_100a`. The initial
+persistent kernel was compiled later by CUDA 13.3 on B200 and reported 246
+registers, 120 KiB dynamic shared memory, and 32 local bytes. Its spills are
+recorded as diagnostic evidence only. The revised swizzled history mapping
+compiled on the same B200 with 168 registers, 120 KiB dynamic shared memory,
+and zero reported local bytes.
 
 ## CPU alternatives
 
@@ -433,6 +800,7 @@ cases; variant 15 passes all six. These labels never reject a submission.
 Only an official Popcorn check decides submission correctness, including
 when it disagrees with the local diagnostic.
 
-Only a fully passing variant at or below `0.995 x` its contemporaneous
-variant-0 median may become the default. No b2n4096 port is made until that
-winner is known.
+Variant 16 is now the promotion reference. Variant 17 or 18 may replace it
+only after official correctness and a three-round median at or below
+`0.995 x` its contemporaneous variant-16 median. No persistent
+implementation is ported to `b2n4096` before that gate is met.

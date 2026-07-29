@@ -248,6 +248,7 @@ def _environment() -> dict[str, Any]:
 
     properties = torch.cuda.get_device_properties(0)
     nvcc = subprocess.run(["nvcc", "--version"], capture_output=True, text=True)
+    cpu = subprocess.run(["lscpu"], capture_output=True, text=True)
     smi = subprocess.run(
         [
             "nvidia-smi",
@@ -264,6 +265,9 @@ def _environment() -> dict[str, Any]:
         "capability": list(torch.cuda.get_device_capability()),
         "multiprocessor_count": properties.multi_processor_count,
         "total_memory": properties.total_memory,
+        "cpu": cpu.stdout.strip() or cpu.stderr.strip(),
+        "cpu_affinity_count": len(os.sched_getaffinity(0)),
+        "torch_cpu_threads": torch.get_num_threads(),
         "nvcc": nvcc.stdout.strip() or nvcc.stderr.strip(),
     }
 
@@ -273,7 +277,18 @@ def _metadata(solution, variant: int) -> dict[str, int]:
     values = solution._variant_metadata()[variant].tolist()
     if len(columns) != len(values):
         raise RuntimeError("variant metadata columns and values differ in length")
-    return {column: int(value) for column, value in zip(columns, values)}
+    result = {
+        column: int(value) for column, value in zip(columns, values)
+    }
+    if variant in solution._HYBRID_VARIANTS:
+        hybrid = solution._native_module().hybrid_info().tolist()
+        result["active_persistent_blocks_per_sm"] = int(hybrid[0])
+        result["persistent_blocks"] = int(hybrid[1])
+        result["persistent_registers"] = int(hybrid[2])
+        result["persistent_local_bytes"] = int(hybrid[3])
+        result["mapped_host_memory"] = int(hybrid[4])
+        result["host_native_atomic"] = int(hybrid[5])
+    return result
 
 
 def _worker_preflight(requested: int) -> None:
@@ -315,6 +330,7 @@ def _worker_profile(requested: int) -> None:
     solution._run_variant(data, variant, output)
     torch.cuda.synchronize()
 
+    os.environ["CHOLESKY_PROFILE_NVTX"] = "1"
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push(f"b{BATCH}_n{N}_v{variant}_{name}")
     solution._run_variant(data, variant, output)

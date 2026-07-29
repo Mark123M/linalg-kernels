@@ -1,6 +1,7 @@
 import hashlib
 import os
 import re
+import threading
 from functools import lru_cache
 
 import torch
@@ -24,6 +25,9 @@ _VARIANT_NAMES = (
     "staged_p128_to_p64_at_r512_tf32",
     "staged_p128_p64_p32_at_r512_r128_tf32",
     "staged_p128_p64_p32_at_r512_r128_tf32_cutlass_names",
+    "hybrid_persistent_p128_cpu_lapack",
+    "hybrid_persistent_p128_cpu_blocked32",
+    "hybrid_persistent_p128_cpu_mkl_outer",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
@@ -64,16 +68,86 @@ _METADATA_COLUMNS = (
     "trsm128_count",
     "trsm64_count",
     "trsm32_count",
+    "cpu_batch",
+    "cpu_backend",
+    "persistent_blocks",
+    "cpu_panel_width",
+    "mapped_host_memory",
+    "host_native_atomic",
 )
 
 _CPP_SOURCE = r"""
+#include <ATen/Parallel.h>
+#include <ATen/native/BatchLinearAlgebra.h>
 #include <torch/extension.h>
+
+#include <atomic>
+#include <cstring>
+
+extern "C" int MKL_Set_Num_Threads_Local(int nth);
 
 void cholesky_b60n1024_prepare(int64_t variant);
 at::Tensor cholesky_b60n1024(const at::Tensor& data, int64_t variant);
 void cholesky_b60n1024_out(
     const at::Tensor& data, at::Tensor out, int64_t variant);
 at::Tensor cholesky_b60n1024_metadata();
+at::Tensor cholesky_b60n1024_hybrid_info();
+void cholesky_b60n1024_hybrid_prepare();
+void cholesky_b60n1024_hybrid_begin(
+    const at::Tensor& data, at::Tensor out,
+    const at::Tensor& panel, const at::Tensor& factor,
+    const at::Tensor& control, const at::Tensor& scratch);
+void cholesky_b60n1024_hybrid_wait(
+    const at::Tensor& control, int64_t slot, int64_t generation);
+void cholesky_b60n1024_hybrid_publish(
+    const at::Tensor& control, int64_t generation, bool abort);
+
+int64_t cholesky_b60n1024_hybrid_cpu_potrf(
+    const at::Tensor& panel, at::Tensor factor) {
+  constexpr int64_t kCpuBatch = 60;
+  constexpr int64_t kCpuPanel = 128;
+  constexpr int64_t kMatrixElements = kCpuPanel * kCpuPanel;
+  TORCH_CHECK(
+      panel.device().is_cpu() && panel.scalar_type() == at::kFloat &&
+      panel.is_contiguous() && panel.dim() == 3 &&
+      panel.size(0) == kCpuBatch &&
+      panel.size(1) == kCpuPanel &&
+      panel.size(2) == kCpuPanel,
+      "hybrid CPU panel must be contiguous float32 [60, 128, 128]");
+  TORCH_CHECK(
+      factor.device().is_cpu() && factor.scalar_type() == at::kFloat &&
+      factor.is_contiguous() && factor.sizes() == panel.sizes(),
+      "hybrid CPU factor must match the panel");
+  TORCH_CHECK(
+      panel.data_ptr<float>() != factor.data_ptr<float>(),
+      "hybrid CPU panel and factor must not alias");
+
+  const float* source = panel.data_ptr<float>();
+  float* destination = factor.data_ptr<float>();
+  std::atomic<int64_t> first_failure{0};
+  at::parallel_for(
+      0, kCpuBatch, 1,
+      [&](int64_t begin, int64_t end) {
+        const int previous_threads = MKL_Set_Num_Threads_Local(1);
+        for (int64_t batch = begin; batch < end; ++batch) {
+          float* matrix = destination + batch * kMatrixElements;
+          std::memcpy(
+              matrix, source + batch * kMatrixElements,
+              kMatrixElements * sizeof(float));
+          int info = 0;
+          at::native::lapackCholesky<float>(
+              'U', static_cast<int>(kCpuPanel), matrix,
+              static_cast<int>(kCpuPanel), &info);
+          if (info != 0) {
+            int64_t expected = 0;
+            first_failure.compare_exchange_strong(
+                expected, batch + 1, std::memory_order_relaxed);
+          }
+        }
+        MKL_Set_Num_Threads_Local(previous_threads);
+      });
+  return first_failure.load(std::memory_order_relaxed);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare", &cholesky_b60n1024_prepare,
@@ -83,6 +157,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Batched 60x1024 Cholesky out");
   m.def("metadata", &cholesky_b60n1024_metadata,
         "B200 kernel resource metadata");
+  m.def("hybrid_info", &cholesky_b60n1024_hybrid_info,
+        "Hybrid scheduler resource metadata");
+  m.def("hybrid_prepare", &cholesky_b60n1024_hybrid_prepare,
+        "Configure the hybrid persistent scheduler");
+  m.def("hybrid_begin", &cholesky_b60n1024_hybrid_begin,
+        "Launch the hybrid persistent scheduler");
+  m.def(
+      "hybrid_wait", &cholesky_b60n1024_hybrid_wait,
+      pybind11::call_guard<pybind11::gil_scoped_release>(),
+      "Wait for one hybrid generation");
+  m.def("hybrid_publish", &cholesky_b60n1024_hybrid_publish,
+        "Publish one CPU factor generation");
+  m.def(
+      "hybrid_cpu_potrf", &cholesky_b60n1024_hybrid_cpu_potrf,
+      pybind11::call_guard<pybind11::gil_scoped_release>(),
+      "Factor 60 CPU panels in parallel with one MKL thread each");
 }
 """
 
@@ -95,7 +185,10 @@ _CUDA_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 namespace cg = cooperative_groups;
 
@@ -125,6 +218,17 @@ constexpr int kPhaseSlot = 1902;
 constexpr int kBarrierByte = 7936;
 constexpr int kTmemColumns = 128;
 constexpr uint32_t kTmemDp = 1u << 16;
+constexpr int kHybridCpuBatch = 60;
+constexpr int kHybridPanel = 128;
+constexpr int kHybridOuterPanels = 4;
+constexpr int kHybridBlocksPerSm = 2;
+constexpr int kHybridSmCount = 148;
+constexpr int kHybridBlocks =
+    kHybridBlocksPerSm * kHybridSmCount;
+constexpr int kHybridReadySlot = 0;
+constexpr int kHybridDoneSlot = 16;
+constexpr int kHybridAbortSlot = 32;
+constexpr int kHybridFinalSlot = 48;
 
 constexpr int kPreciseRoot = 0;
 constexpr int kRefinedRoot = 1;
@@ -1330,6 +1434,615 @@ void tc_update_kernel(
   tmem_relinquish();
 }
 
+__device__ __forceinline__ uint32_t hybrid_load_acquire(
+    const int32_t* address) {
+  uint32_t value;
+  asm volatile(
+      "ld.global.acquire.sys.u32 %0, [%1];"
+      : "=r"(value) : "l"(address) : "memory");
+  return value;
+}
+
+__device__ __forceinline__ void hybrid_store_release(
+    int32_t* address, uint32_t value) {
+  asm volatile(
+      "st.global.release.sys.u32 [%0], %1;"
+      :: "l"(address), "r"(value) : "memory");
+}
+
+__device__ __forceinline__ bool hybrid_take_task(
+    int32_t* counter, int limit, int* shared_task) {
+  if (threadIdx.x == 0) {
+    *shared_task = atomicAdd(counter, 1);
+  }
+  __syncthreads();
+  return *shared_task < limit;
+}
+
+__device__ __forceinline__ void hybrid_reset_queue(
+    cg::grid_group grid, int32_t* counter) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *counter = 0;
+  }
+  grid.sync();
+}
+
+__device__ __forceinline__ void hybrid_block_acquire(
+    const int32_t* address, int* shared_word) {
+  if (threadIdx.x == 0) {
+    *shared_word = static_cast<int>(hybrid_load_acquire(address));
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void hybrid_copy_task(
+    const float* input, float* output, int task) {
+  constexpr int kRanks = 16;
+  const int matrix_index = task / kRanks;
+  const int rank = task % kRanks;
+  const int64_t base =
+      static_cast<int64_t>(matrix_index) * kN * kN;
+  for (int linear = rank * static_cast<int>(blockDim.x) +
+                    static_cast<int>(threadIdx.x);
+       linear < kN * kN;
+       linear += kRanks * static_cast<int>(blockDim.x)) {
+    store_global(output + base + linear, input[base + linear]);
+  }
+}
+
+__device__ __forceinline__ void hybrid_zero_task(
+    float* output, int task) {
+  constexpr int kRanks = 8;
+  const int matrix_index = task / kRanks;
+  const int rank = task % kRanks;
+  const int64_t base =
+      static_cast<int64_t>(matrix_index) * kN * kN;
+  for (int linear = rank * static_cast<int>(blockDim.x) +
+                    static_cast<int>(threadIdx.x);
+       linear < kN * kN;
+       linear += kRanks * static_cast<int>(blockDim.x)) {
+    const int row = linear / kN;
+    const int column = linear % kN;
+    if (column > row) {
+      store_global(output + base + linear, 0.0f);
+    }
+  }
+}
+
+__device__ __forceinline__ void hybrid_pack_panel(
+    const float* output, float* panel, int begin, int matrix_index) {
+  const float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  float* destination =
+      panel + static_cast<int64_t>(matrix_index) *
+                  kHybridPanel * kHybridPanel;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kHybridPanel * kHybridPanel;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kHybridPanel;
+    const int column = linear % kHybridPanel;
+    destination[linear] =
+        column <= row
+            ? load_global(
+                  matrix + (begin + row) * kN + begin + column)
+            : 0.0f;
+  }
+}
+
+__device__ __forceinline__ void hybrid_scatter_panel(
+    float* output, const float* factor,
+    int begin, int matrix_index) {
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  const float* source =
+      factor + static_cast<int64_t>(matrix_index) *
+                   kHybridPanel * kHybridPanel;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kHybridPanel * kHybridPanel;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / kHybridPanel;
+    const int column = linear % kHybridPanel;
+    if (column <= row) {
+      store_global(
+          matrix + (begin + row) * kN + begin + column,
+          source[linear]);
+    }
+  }
+}
+
+template <int Width>
+__device__ __forceinline__ void hybrid_small_factor(
+    float* matrix, int begin, float* tile) {
+  float* inverse_diagonal =
+      tile + Width * (kOuter + 1);
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear % Width;
+    tile_at(tile, row, column) =
+        column <= row
+            ? load_global(
+                  matrix + (begin + row) * kN + begin + column)
+            : 0.0f;
+  }
+  __syncthreads();
+  potf2_32<kPreciseRoot>(tile, inverse_diagonal, 0);
+  if constexpr (Width == 64) {
+    local_trsm<32, 32, kSub4>(
+        tile, inverse_diagonal, 32, 0);
+    local_update<32, 32>(tile, 32, 0);
+    potf2_32<kPreciseRoot>(tile, inverse_diagonal, 32);
+  }
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear % Width;
+    if (column <= row) {
+      store_global(
+          matrix + (begin + row) * kN + begin + column,
+          tile_at(tile, row, column));
+    }
+  }
+  __syncthreads();
+}
+
+template <int Width>
+__device__ __forceinline__ void hybrid_small_solve(
+    float* matrix, int begin, int row_begin, float* work) {
+  constexpr int kDiagonalLd = Width + 1;
+  constexpr int kPanelLd = Width + kSub4;
+  float* diagonal = work;
+  float* panel = diagonal + Width * kDiagonalLd;
+  float* inverse_diagonal = panel + Width * kPanelLd;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear % Width;
+    diagonal[row * kDiagonalLd + column] =
+        column <= row
+            ? load_global(
+                  matrix + (begin + row) * kN + begin + column)
+            : 0.0f;
+    panel[row * kPanelLd + column] = load_global(
+        matrix + (row_begin + row) * kN + begin + column);
+  }
+  __syncthreads();
+  if (static_cast<int>(threadIdx.x) < Width) {
+    const int column = static_cast<int>(threadIdx.x);
+    inverse_diagonal[column] = __fdiv_rn(
+        1.0f, diagonal[column * kDiagonalLd + column]);
+  }
+  __syncthreads();
+  const int lane = static_cast<int>(threadIdx.x) & (kSub4 - 1);
+  const int row = static_cast<int>(threadIdx.x) / kSub4;
+  if (row < Width) {
+    for (int column = 0; column < Width; ++column) {
+      float partial = 0.0f;
+      for (int k = lane; k < column; k += kSub4) {
+        partial = fmaf(
+            panel[row * kPanelLd + k],
+            diagonal[column * kDiagonalLd + k], partial);
+      }
+      for (int offset = kSub4 / 2;
+           offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(
+            0xffffffffu, partial, offset, kSub4);
+      }
+      if (lane == 0) {
+        panel[row * kPanelLd + column] =
+            (panel[row * kPanelLd + column] - partial) *
+            inverse_diagonal[column];
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row_index = linear / Width;
+    const int column = linear % Width;
+    store_global(
+        matrix + (row_begin + row_index) * kN + begin + column,
+        panel[row_index * kPanelLd + column]);
+  }
+  __syncthreads();
+}
+
+template <int Width>
+__device__ __forceinline__ void hybrid_small_update(
+    float* matrix, int begin, int row_begin,
+    int column_begin, float* work) {
+  constexpr int kLd = Width + 1;
+  float* left = work;
+  float* right = left + Width * kLd;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear % Width;
+    left[row * kLd + column] = load_global(
+        matrix + (row_begin + row) * kN + begin + column);
+    right[row * kLd + column] = load_global(
+        matrix + (column_begin + row) * kN + begin + column);
+  }
+  __syncthreads();
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < Width * Width;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Width;
+    const int column = linear % Width;
+    if (row_begin != column_begin || column <= row) {
+      float* destination =
+          matrix + (row_begin + row) * kN + column_begin + column;
+      float value = load_global(destination);
+      for (int k = 0; k < Width; ++k) {
+        value = fmaf(
+            -left[row * kLd + k],
+            right[column * kLd + k], value);
+      }
+      store_global(destination, value);
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void hybrid_warp_mma(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, float* accumulator) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(accumulator[0]), "+f"(accumulator[1]),
+        "+f"(accumulator[2]), "+f"(accumulator[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+        "r"(b0), "r"(b1));
+}
+
+template <int Rank>
+__device__ __forceinline__ void hybrid_warp_tf32_update(
+    float* matrix, int row_begin, int column_begin,
+    int panel_begin, float* work) {
+  constexpr int kLd = Rank + 1;
+  uint32_t* left = reinterpret_cast<uint32_t*>(work);
+  uint32_t* right = left + kMicro * kLd;
+  const bool diagonal = row_begin == column_begin;
+  for (int linear = static_cast<int>(threadIdx.x);
+       linear < kMicro * Rank;
+       linear += static_cast<int>(blockDim.x)) {
+    const int row = linear / Rank;
+    const int column = linear % Rank;
+    left[row * kLd + column] = to_tf32(load_global(
+        matrix + (row_begin + row) * kN +
+        panel_begin + column));
+    if (!diagonal) {
+      right[row * kLd + column] = to_tf32(load_global(
+          matrix + (column_begin + row) * kN +
+          panel_begin + column));
+    }
+  }
+  __syncthreads();
+  const uint32_t* right_operand = diagonal ? left : right;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int group = lane >> 2;
+  const int thread_in_group = lane & 3;
+  const int row_base = (warp >> 1) * 16;
+  const int column_base = (warp & 1) * 32;
+  float accumulator[4][4] = {};
+#pragma unroll 1
+  for (int k = 0; k < Rank; k += 8) {
+    const uint32_t a0 =
+        left[(row_base + group) * kLd + k + thread_in_group];
+    const uint32_t a1 =
+        left[(row_base + group + 8) * kLd + k + thread_in_group];
+    const uint32_t a2 = left[
+        (row_base + group) * kLd + k + thread_in_group + 4];
+    const uint32_t a3 = left[
+        (row_base + group + 8) * kLd + k + thread_in_group + 4];
+#pragma unroll
+    for (int column_tile = 0; column_tile < 4; ++column_tile) {
+      const int column =
+          column_base + column_tile * 8 + group;
+      const uint32_t b0 =
+          right_operand[column * kLd + k + thread_in_group];
+      const uint32_t b1 = right_operand[
+          column * kLd + k + thread_in_group + 4];
+      hybrid_warp_mma(
+          a0, a1, a2, a3, b0, b1,
+          accumulator[column_tile]);
+    }
+  }
+#pragma unroll
+  for (int column_tile = 0; column_tile < 4; ++column_tile) {
+#pragma unroll
+    for (int element = 0; element < 4; ++element) {
+      const int row =
+          row_base + group + (element >= 2 ? 8 : 0);
+      const int column =
+          column_base + column_tile * 8 +
+          thread_in_group * 2 + (element & 1);
+      if (!diagonal || column <= row) {
+        float* destination =
+            matrix + (row_begin + row) * kN +
+            column_begin + column;
+        store_global(
+            destination,
+            load_global(destination) -
+                accumulator[column_tile][element]);
+      }
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void hybrid_tensor_update(
+    float* output, int panel, int task, int tasks,
+    float* work) {
+  const int matrix_index = task / tasks;
+  const int local_task = task % tasks;
+  int row;
+  int column;
+  decode_update_task(local_task, panel, row, column);
+  float* matrix =
+      output + static_cast<int64_t>(matrix_index) * kN * kN;
+  hybrid_warp_tf32_update<kOuter>(
+      matrix, row * kMicro, column * kMicro,
+      panel * kOuter, work);
+}
+
+template <int Width>
+__device__ void hybrid_run_small_stage(
+    cg::grid_group grid, float* output, int begin,
+    int32_t* counter, int* shared_task, float* work) {
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch, shared_task)) {
+    const int matrix_index = *shared_task;
+    float* matrix =
+        output + static_cast<int64_t>(matrix_index) * kN * kN;
+    hybrid_small_factor<Width>(matrix, begin, work);
+  }
+  grid.sync();
+
+  const int row_count = (kN - begin - Width) / Width;
+  if (row_count == 0) {
+    return;
+  }
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * row_count, shared_task)) {
+    const int task = *shared_task;
+    const int matrix_index = task / row_count;
+    const int row_index = task % row_count;
+    float* matrix =
+        output + static_cast<int64_t>(matrix_index) * kN * kN;
+    hybrid_small_solve<Width>(
+        matrix, begin, begin + Width + row_index * Width, work);
+  }
+  grid.sync();
+
+  const int tile_tasks = row_count * (row_count + 1) / 2;
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * tile_tasks, shared_task)) {
+    const int task = *shared_task;
+    const int matrix_index = task / tile_tasks;
+    const int local_task = task % tile_tasks;
+    int row_tile;
+    int column_tile;
+    decode_adaptive_update_task(
+        local_task, row_count, row_tile, column_tile);
+    float* matrix =
+        output + static_cast<int64_t>(matrix_index) * kN * kN;
+    hybrid_small_update<Width>(
+        matrix, begin,
+        begin + Width + row_tile * Width,
+        begin + Width + column_tile * Width, work);
+  }
+  grid.sync();
+}
+
+__global__ __maxnreg__(120)
+void hybrid_persistent_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    float* __restrict__ cpu_panel,
+    const float* __restrict__ cpu_factor,
+    int32_t* __restrict__ control,
+    int32_t* __restrict__ counter) {
+  extern __shared__ __align__(16) unsigned char dynamic_bytes[];
+  float* work =
+      reinterpret_cast<float*>(dynamic_bytes + kControlBytes);
+  __shared__ int shared_task;
+  cg::grid_group grid = cg::this_grid();
+
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * 16, &shared_task)) {
+    hybrid_copy_task(input, output, shared_task);
+  }
+  grid.sync();
+
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kHybridCpuBatch, &shared_task)) {
+    hybrid_pack_panel(output, cpu_panel, 0, shared_task);
+  }
+  grid.sync();
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    hybrid_store_release(
+        control + kHybridReadySlot, 1);
+    while (hybrid_load_acquire(
+               control + kHybridDoneSlot) < 1) {
+      __nanosleep(64);
+    }
+    counter[1] = static_cast<int32_t>(
+        hybrid_load_acquire(control + kHybridAbortSlot));
+  }
+  grid.sync();
+  if (counter[1] != 0) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      hybrid_store_release(control + kHybridFinalSlot, 1);
+    }
+    return;
+  }
+  hybrid_block_acquire(
+      control + kHybridDoneSlot, &shared_task);
+
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kHybridCpuBatch, &shared_task)) {
+    hybrid_scatter_panel(
+        output, cpu_factor, 0, shared_task);
+  }
+  grid.sync();
+
+  int current_panel = 0;
+  for (int next_panel = 1;
+       next_panel < kHybridOuterPanels; ++next_panel) {
+    const int remaining = kMicroCount - current_panel * 2 - 2;
+    hybrid_reset_queue(grid, counter);
+    while (hybrid_take_task(
+        counter, kBatch * remaining, &shared_task)) {
+      const int task = shared_task;
+      const int matrix_index = task / remaining;
+      const int row_index = task % remaining;
+      float* matrix =
+          output + static_cast<int64_t>(matrix_index) * kN * kN;
+      trsm_global<kSub4>(
+          matrix,
+          (current_panel * 2 + 2 + row_index) * kMicro,
+          current_panel * kOuter, work);
+    }
+    grid.sync();
+
+    const int tasks = remaining * (remaining + 1) / 2;
+    hybrid_reset_queue(grid, counter);
+    while (hybrid_take_task(
+        counter, kBatch * 3, &shared_task)) {
+      const int task = shared_task;
+      const int matrix_index = task / 3;
+      const int item = task % 3;
+      const int first = current_panel * 2 + 2;
+      const int row = first + (item != 0);
+      const int column = first + (item == 2);
+      float* matrix =
+          output + static_cast<int64_t>(matrix_index) * kN * kN;
+      hybrid_warp_tf32_update<kOuter>(
+          matrix, row * kMicro, column * kMicro,
+          current_panel * kOuter, work);
+    }
+    grid.sync();
+
+    hybrid_reset_queue(grid, counter);
+    while (hybrid_take_task(
+        counter, kHybridCpuBatch, &shared_task)) {
+      hybrid_pack_panel(
+          output, cpu_panel, next_panel * kOuter, shared_task);
+    }
+    grid.sync();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      hybrid_store_release(
+          control + kHybridReadySlot, next_panel + 1);
+    }
+
+    hybrid_reset_queue(grid, counter);
+    while (hybrid_take_task(
+        counter, kBatch * tasks, &shared_task)) {
+      const int task = shared_task;
+      const int local_task = task % tasks;
+      int row;
+      int column;
+      decode_update_task(
+          local_task, current_panel, row, column);
+      const int first = current_panel * 2 + 2;
+      const bool next_diagonal =
+          (row == first && column == first) ||
+          (row == first + 1 && column == first) ||
+          (row == first + 1 && column == first + 1);
+      if (!next_diagonal) {
+        hybrid_tensor_update(
+            output, current_panel, task, tasks, work);
+      }
+    }
+    grid.sync();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      while (hybrid_load_acquire(
+                 control + kHybridDoneSlot) < next_panel + 1) {
+        __nanosleep(64);
+      }
+      counter[1] = static_cast<int32_t>(
+          hybrid_load_acquire(control + kHybridAbortSlot));
+    }
+    grid.sync();
+    if (counter[1] != 0) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) {
+        hybrid_store_release(control + kHybridFinalSlot, 1);
+      }
+      return;
+    }
+    hybrid_block_acquire(
+        control + kHybridDoneSlot, &shared_task);
+    hybrid_reset_queue(grid, counter);
+    while (hybrid_take_task(
+        counter, kHybridCpuBatch, &shared_task)) {
+      hybrid_scatter_panel(
+          output, cpu_factor, next_panel * kOuter, shared_task);
+    }
+    grid.sync();
+    current_panel = next_panel;
+  }
+
+  const int remaining =
+      kMicroCount - current_panel * 2 - 2;
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * remaining, &shared_task)) {
+    const int task = shared_task;
+    const int matrix_index = task / remaining;
+    const int row_index = task % remaining;
+    float* matrix =
+        output + static_cast<int64_t>(matrix_index) * kN * kN;
+    trsm_global<kSub4>(
+        matrix,
+        (current_panel * 2 + 2 + row_index) * kMicro,
+        current_panel * kOuter, work);
+  }
+  grid.sync();
+  const int tasks = remaining * (remaining + 1) / 2;
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * tasks, &shared_task)) {
+    hybrid_tensor_update(
+        output, current_panel, shared_task, tasks, work);
+  }
+  grid.sync();
+
+  for (int begin = 512; begin < 896; begin += 64) {
+    hybrid_run_small_stage<64>(
+        grid, output, begin, counter, &shared_task, work);
+  }
+  for (int begin = 896; begin < kN; begin += 32) {
+    hybrid_run_small_stage<32>(
+        grid, output, begin, counter, &shared_task, work);
+  }
+
+  hybrid_reset_queue(grid, counter);
+  while (hybrid_take_task(
+      counter, kBatch * 8, &shared_task)) {
+    hybrid_zero_task(output, shared_task);
+  }
+  grid.sync();
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    hybrid_store_release(control + kHybridFinalSlot, 1);
+  }
+}
+
 __device__ __forceinline__ int graph_panel_base(int panel) {
   int result = 0;
   for (int p = 0; p < panel; ++p) {
@@ -2098,6 +2811,58 @@ void write_metadata(int64_t* rows) {
   row[34] = potrf32 > 0 ? potrf32 - 1 : 0;
 }
 
+cudaFuncAttributes configure_hybrid_kernel() {
+  configure_dynamic(hybrid_persistent_kernel, kFactorPlainBytes);
+  const cudaFuncAttributes attributes =
+      checked_attributes(hybrid_persistent_kernel);
+  TORCH_CHECK(
+      attributes.localSizeBytes <= 8,
+      "hybrid persistent kernel uses ",
+      attributes.localSizeBytes,
+      " local bytes, above the accepted 8-byte frame");
+  const int active = active_blocks(
+      hybrid_persistent_kernel, 256, kFactorPlainBytes);
+  TORCH_CHECK(
+      active == kHybridBlocksPerSm,
+      "hybrid persistent kernel requires ",
+      kHybridBlocksPerSm, " resident blocks per SM, got ", active);
+  int device = 0;
+  int sm_count = 0;
+  int can_map = 0;
+  const cudaError_t device_status = cudaGetDevice(&device);
+  TORCH_CHECK(
+      device_status == cudaSuccess,
+      "hybrid device query failed: ",
+      cudaGetErrorString(device_status));
+  const cudaError_t sm_status = cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, device);
+  TORCH_CHECK(
+      sm_status == cudaSuccess,
+      "hybrid SM query failed: ", cudaGetErrorString(sm_status));
+  const cudaError_t map_status = cudaDeviceGetAttribute(
+      &can_map, cudaDevAttrCanMapHostMemory, device);
+  TORCH_CHECK(
+      map_status == cudaSuccess,
+      "hybrid mapped-memory query failed: ",
+      cudaGetErrorString(map_status));
+  TORCH_CHECK(can_map == 1, "hybrid requires mapped host memory");
+  TORCH_CHECK(
+      sm_count == kHybridSmCount,
+      "hybrid requires ", kHybridSmCount,
+      " SMs, got ", sm_count);
+  return attributes;
+}
+
+void check_hybrid_cpu_tensor(
+    const at::Tensor& tensor, at::ScalarType dtype,
+    at::IntArrayRef sizes, const char* role) {
+  TORCH_CHECK(!tensor.is_cuda(), role, " must be on CPU");
+  TORCH_CHECK(tensor.is_pinned(), role, " must be pinned");
+  TORCH_CHECK(tensor.scalar_type() == dtype, role, " dtype mismatch");
+  TORCH_CHECK(tensor.is_contiguous(), role, " must be contiguous");
+  TORCH_CHECK(tensor.sizes() == sizes, role, " shape mismatch");
+}
+
 }  // namespace
 
 void cholesky_b60n1024_prepare(int64_t variant) {
@@ -2148,6 +2913,140 @@ at::Tensor cholesky_b60n1024_metadata() {
   write_metadata<9>(rows);
   return result;
 }
+
+void cholesky_b60n1024_hybrid_prepare() {
+  configure_hybrid_kernel();
+}
+
+at::Tensor cholesky_b60n1024_hybrid_info() {
+  const cudaFuncAttributes attributes = configure_hybrid_kernel();
+  int device = 0;
+  int can_map = 0;
+  int native_atomic = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(
+      &can_map, cudaDevAttrCanMapHostMemory, device);
+  cudaDeviceGetAttribute(
+      &native_atomic, cudaDevAttrHostNativeAtomicSupported, device);
+  const int active = active_blocks(
+      hybrid_persistent_kernel, 256, kFactorPlainBytes);
+  auto result = at::zeros(
+      {6}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  int64_t* values = result.data_ptr<int64_t>();
+  values[0] = active;
+  values[1] = kHybridBlocks;
+  values[2] = attributes.numRegs;
+  values[3] = attributes.localSizeBytes;
+  values[4] = can_map;
+  values[5] = native_atomic;
+  return result;
+}
+
+void cholesky_b60n1024_hybrid_begin(
+    const at::Tensor& data, at::Tensor output,
+    const at::Tensor& panel, const at::Tensor& factor,
+    const at::Tensor& control, const at::Tensor& scratch) {
+  check_input(data);
+  check_output(data, output);
+  check_hybrid_cpu_tensor(
+      panel, at::kFloat,
+      {kHybridCpuBatch, kHybridPanel, kHybridPanel},
+      "hybrid CPU panel");
+  check_hybrid_cpu_tensor(
+      factor, at::kFloat,
+      {kHybridCpuBatch, kHybridPanel, kHybridPanel},
+      "hybrid CPU factor");
+  check_hybrid_cpu_tensor(
+      control, at::kInt, {64}, "hybrid control");
+  TORCH_CHECK(
+      scratch.is_cuda() && scratch.scalar_type() == at::kInt &&
+      scratch.is_contiguous() && scratch.numel() >= 2,
+      "hybrid scratch must be a contiguous CUDA int32 tensor");
+  c10::cuda::CUDAGuard device_guard(data.device());
+  configure_hybrid_kernel();
+
+  int32_t* host_control = control.data_ptr<int32_t>();
+  std::atomic_ref<int32_t>(host_control[kHybridReadySlot])
+      .store(0, std::memory_order_relaxed);
+  std::atomic_ref<int32_t>(host_control[kHybridDoneSlot])
+      .store(0, std::memory_order_relaxed);
+  std::atomic_ref<int32_t>(host_control[kHybridAbortSlot])
+      .store(0, std::memory_order_relaxed);
+  std::atomic_ref<int32_t>(host_control[kHybridFinalSlot])
+      .store(0, std::memory_order_relaxed);
+
+  void* panel_alias = nullptr;
+  void* factor_alias = nullptr;
+  void* control_alias = nullptr;
+  const cudaError_t panel_status = cudaHostGetDevicePointer(
+      &panel_alias, panel.data_ptr<float>(), 0);
+  const cudaError_t factor_status = cudaHostGetDevicePointer(
+      &factor_alias, factor.data_ptr<float>(), 0);
+  const cudaError_t control_status = cudaHostGetDevicePointer(
+      &control_alias, host_control, 0);
+  TORCH_CHECK(
+      panel_status == cudaSuccess &&
+      factor_status == cudaSuccess &&
+      control_status == cudaSuccess,
+      "hybrid mapped-pointer query failed");
+
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeCooperative;
+  attribute.val.cooperative = 1;
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(kHybridBlocks, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  config.dynamicSmemBytes = kFactorPlainBytes;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  cudaLaunchKernelEx(
+      &config, hybrid_persistent_kernel,
+      data.data_ptr<float>(), output.data_ptr<float>(),
+      static_cast<float*>(panel_alias),
+      static_cast<const float*>(factor_alias),
+      static_cast<int32_t*>(control_alias),
+      scratch.data_ptr<int32_t>());
+  const cudaError_t status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "hybrid launch failed: ", cudaGetErrorString(status));
+}
+
+void cholesky_b60n1024_hybrid_wait(
+    const at::Tensor& control, int64_t slot, int64_t generation) {
+  check_hybrid_cpu_tensor(
+      control, at::kInt, {64}, "hybrid control");
+  TORCH_CHECK(
+      slot >= 0 && slot < 64, "hybrid control slot is invalid");
+  int32_t* values = control.data_ptr<int32_t>();
+  std::atomic_ref<int32_t> value(values[slot]);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  uint32_t spins = 0;
+  while (value.load(std::memory_order_acquire) < generation) {
+    TORCH_CHECK(
+        std::chrono::steady_clock::now() < deadline,
+        "hybrid mapped-memory wait timed out");
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if ((++spins & 4095u) == 0) {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void cholesky_b60n1024_hybrid_publish(
+    const at::Tensor& control, int64_t generation, bool abort) {
+  check_hybrid_cpu_tensor(
+      control, at::kInt, {64}, "hybrid control");
+  int32_t* values = control.data_ptr<int32_t>();
+  if (abort) {
+    std::atomic_ref<int32_t>(values[kHybridAbortSlot])
+        .store(1, std::memory_order_release);
+  }
+  std::atomic_ref<int32_t>(values[kHybridDoneSlot])
+      .store(static_cast<int32_t>(generation),
+             std::memory_order_release);
+}
 """
 
 
@@ -2192,6 +3091,7 @@ def _native_module():
                 "-O3",
                 "-DNDEBUG",
                 "-std=c++20",
+                "-fopenmp",
             ],
             extra_cuda_cflags=[
                 "-O3",
@@ -2205,7 +3105,7 @@ def _native_module():
                 "-gencode",
                 "arch=compute_100a,code=sm_100a",
             ],
-            extra_ldflags=["-lcublas"],
+            extra_ldflags=["-lcublas", "-fopenmp"],
             verbose=False,
         )
     finally:
@@ -2232,6 +3132,7 @@ def _cutlass_module():
                 "-O3",
                 "-DNDEBUG",
                 "-std=c++20",
+                "-fopenmp",
             ],
             extra_cuda_cflags=[
                 "-O3",
@@ -2245,7 +3146,7 @@ def _cutlass_module():
                 "-gencode",
                 "arch=compute_100a,code=sm_100a",
             ],
-            extra_ldflags=["-lcublas"],
+            extra_ldflags=["-lcublas", "-fopenmp"],
             verbose=False,
         )
     finally:
@@ -2256,6 +3157,204 @@ def _cutlass_module():
 
 
 _PREPARED_VARIANTS: set[tuple[str, int]] = set()
+_HYBRID_VARIANTS = (11, 12, 13)
+_HYBRID_CPU_BATCH = 60
+_HYBRID_PANEL = 128
+_HYBRID_PANEL_COUNT = 4
+_HYBRID_READY_SLOT = 0
+_HYBRID_FINAL_SLOT = 48
+_HYBRID_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _configure_hybrid_cpu_threads() -> int:
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+    threads = max(1, min(int(available), _HYBRID_CPU_BATCH))
+    torch.set_num_threads(threads)
+    return threads
+
+
+def _blocked_cpu_potrf(panel: torch.Tensor):
+    work = panel.clone()
+    factor = torch.zeros_like(panel)
+    infos = []
+    for begin in range(0, _HYBRID_PANEL, 32):
+        end = begin + 32
+        diagonal, info = torch.linalg.cholesky_ex(
+            work[:, begin:end, begin:end], check_errors=False
+        )
+        factor[:, begin:end, begin:end] = diagonal
+        infos.append(info)
+        if end < _HYBRID_PANEL:
+            right = work[:, end:, begin:end].transpose(-2, -1)
+            solved = torch.linalg.solve_triangular(
+                diagonal, right, upper=False, left=True
+            ).transpose(-2, -1)
+            factor[:, end:, begin:end] = solved
+            work[:, end:, end:] = (
+                work[:, end:, end:]
+                - solved @ solved.transpose(-2, -1)
+            )
+    return factor, torch.stack(infos)
+
+
+@lru_cache(maxsize=2)
+def _compiled_cpu_potrf(backend: int):
+    import torch._inductor.config as inductor_config
+
+    if backend not in (1, 2):
+        raise ValueError(f"compiled CPU backend must be 1 or 2, got {backend}")
+    _configure_hybrid_cpu_threads()
+
+    def lapack_cpu_potrf(panel: torch.Tensor):
+        return torch.linalg.cholesky_ex(panel, check_errors=False)
+
+    function = lapack_cpu_potrf if backend == 1 else _blocked_cpu_potrf
+    with inductor_config.patch(
+        {
+            "cpp.enable_unsafe_math_opt_flag": True,
+            "cpp.enable_floating_point_contract_flag": "fast",
+        }
+    ):
+        compiled = torch.compile(
+            function,
+            backend="inductor",
+            fullgraph=True,
+            dynamic=False,
+            mode="max-autotune",
+        )
+        warm = torch.eye(
+            _HYBRID_PANEL, dtype=torch.float32
+        ).expand(_HYBRID_CPU_BATCH, -1, -1).clone()
+        compiled(warm)
+    return compiled
+
+
+def _warm_native_cpu_potrf(
+    module,
+    panel: torch.Tensor,
+    factor: torch.Tensor,
+) -> None:
+    _configure_hybrid_cpu_threads()
+    panel.zero_()
+    panel.diagonal(dim1=-2, dim2=-1).fill_(1.0)
+    failed_batch = int(module.hybrid_cpu_potrf(panel, factor))
+    if failed_batch:
+        raise RuntimeError(
+            f"native CPU POTRF warmup failed for batch {failed_batch - 1}"
+        )
+
+
+@lru_cache(maxsize=None)
+def _hybrid_buffers(
+    device_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    panel = torch.empty(
+        (_HYBRID_CPU_BATCH, _HYBRID_PANEL, _HYBRID_PANEL),
+        dtype=torch.float32,
+        pin_memory=True,
+    )
+    factor = torch.empty_like(panel, pin_memory=True)
+    control = torch.zeros(64, dtype=torch.int32, pin_memory=True)
+    scratch = torch.empty(
+        2, dtype=torch.int32, device=f"cuda:{device_index}"
+    )
+    return panel, factor, control, scratch
+
+
+def _run_hybrid_variant_impl(
+    data: torch.Tensor,
+    variant: int,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    backend = {11: 1, 12: 2, 13: 3}[variant]
+    module = _native_module()
+    prepare_key = ("hybrid", variant)
+    device_index = data.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if prepare_key not in _PREPARED_VARIANTS:
+        module.hybrid_prepare()
+        buffers = _hybrid_buffers(device_index)
+        if backend == 3:
+            _warm_native_cpu_potrf(module, buffers[0], buffers[1])
+        else:
+            _compiled_cpu_potrf(backend)
+        _PREPARED_VARIANTS.add(prepare_key)
+
+    output = torch.empty_like(data) if out is None else out
+    panel, pinned_factor, control, scratch = _hybrid_buffers(device_index)
+    compiled = None if backend == 3 else _compiled_cpu_potrf(backend)
+    profiling = os.environ.get("CHOLESKY_PROFILE_NVTX") == "1"
+    module.hybrid_begin(
+        data, output, panel, pinned_factor, control, scratch
+    )
+    try:
+        for panel_index in range(_HYBRID_PANEL_COUNT):
+            begin = panel_index * _HYBRID_PANEL
+            if profiling:
+                torch.cuda.nvtx.range_push(
+                    f"hybrid_cpu_wait_p{begin:03d}"
+                )
+            module.hybrid_wait(
+                control, _HYBRID_READY_SLOT, panel_index + 1
+            )
+            if profiling:
+                torch.cuda.nvtx.range_pop()
+                role = {
+                    1: "lapack",
+                    2: "blocked",
+                    3: "mkl_outer",
+                }[backend]
+                torch.cuda.nvtx.range_push(
+                    f"hybrid_cpu_potrf_{role}_p{begin:03d}"
+                )
+            failed_batch = 0
+            if backend == 3:
+                failed_batch = int(
+                    module.hybrid_cpu_potrf(panel, pinned_factor)
+                )
+                failed = failed_batch != 0
+            else:
+                factor, info = compiled(panel)
+                pinned_factor.copy_(factor)
+                failed = bool(torch.any(info != 0).item())
+            if profiling:
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_push(
+                    f"hybrid_cpu_publish_p{begin:03d}"
+                )
+            module.hybrid_publish(control, panel_index + 1, failed)
+            if profiling:
+                torch.cuda.nvtx.range_pop()
+            if failed:
+                module.hybrid_wait(control, _HYBRID_FINAL_SLOT, 1)
+                detail = (
+                    f", CPU batch {failed_batch - 1}"
+                    if failed_batch
+                    else ""
+                )
+                raise RuntimeError(
+                    f"CPU panel factorization failed at {begin}{detail}"
+                )
+    except Exception:
+        module.hybrid_publish(control, _HYBRID_PANEL_COUNT, True)
+        module.hybrid_wait(control, _HYBRID_FINAL_SLOT, 1)
+        raise
+    module.hybrid_wait(control, _HYBRID_FINAL_SLOT, 1)
+    return output
+
+
+def _run_hybrid_variant(
+    data: torch.Tensor,
+    variant: int,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    with _HYBRID_LOCK:
+        return _run_hybrid_variant_impl(data, variant, out)
 
 
 def _run_variant(
@@ -2265,6 +3364,8 @@ def _run_variant(
 ) -> torch.Tensor:
     if variant not in _VARIANT_IDS:
         raise ValueError(f"variant must be in {_VARIANT_IDS}, got {variant}")
+    if variant in _HYBRID_VARIANTS:
+        return _run_hybrid_variant(data, variant, out)
     use_cutlass = variant == _CUTLASS_VARIANT
     selected = _CUTLASS_BASE_VARIANT if use_cutlass else variant
     module_kind = "cutlass" if use_cutlass else "native"
@@ -2281,9 +3382,30 @@ def _run_variant(
 
 def _variant_metadata() -> torch.Tensor:
     metadata = _native_module().metadata()
+    padding = torch.zeros(
+        (metadata.shape[0], 6), dtype=metadata.dtype
+    )
+    metadata = torch.cat((metadata, padding), dim=1)
     cutlass = metadata[_CUTLASS_BASE_VARIANT].clone().unsqueeze(0)
     cutlass[0, 0] = _CUTLASS_VARIANT
-    return torch.cat((metadata, cutlass), dim=0)
+    hybrid_rows = []
+    for variant, backend in ((11, 1), (12, 2), (13, 3)):
+        row = metadata[9].clone()
+        row[0] = variant
+        row[17] = 3
+        row[24] = 1
+        row[29] = 4
+        row[30] = 6
+        row[31] = 4
+        row[32] = 4
+        row[35] = _HYBRID_CPU_BATCH
+        row[36] = backend
+        row[37] = 296
+        row[38] = _HYBRID_PANEL
+        row[39] = 1
+        row[40] = 0
+        hybrid_rows.append(row.unsqueeze(0))
+    return torch.cat((metadata, cutlass, *hybrid_rows), dim=0)
 
 
 def custom_kernel(data: input_t) -> output_t:

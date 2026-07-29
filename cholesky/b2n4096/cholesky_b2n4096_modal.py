@@ -425,7 +425,16 @@ def _worker_profile(requested: int) -> None:
     variant = _resolve_variant(solution, requested)
     name = _variant_name(solution, variant)
     data = _make_input()
-    output = torch.empty_like(data)
+    output = (
+        torch.empty_strided(
+            data.shape,
+            (N * N, 1, N),
+            dtype=data.dtype,
+            device=data.device,
+        )
+        if name == "native_xpotrf_lower_fused_copy"
+        else torch.empty_like(data)
+    )
     solution._run_variant(data, variant, output)
     torch.cuda.synchronize()
 

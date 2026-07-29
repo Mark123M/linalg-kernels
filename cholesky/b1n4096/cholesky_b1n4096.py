@@ -10,7 +10,7 @@ from torch.utils.cpp_extension import load_inline
 
 # The tuner replaces this exact line in retained candidate copies. Variant
 # zero remains the tracked default until the B200 promotion gate passes.
-_DEFAULT_VARIANT = 0  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 16  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "torch_cusolver",
     "ll_nb512_m64_fused_split2_tf32",
@@ -28,10 +28,15 @@ _VARIANT_NAMES = (
     "ll_nb256_leaf256_fused_ll_ib32_lb8_trsm",
     "ll_nb512_rec128_fused_ll_ib32_lb32_inverse_gemm",
     "ll_nb512_rec128_fused_ll_ib32_lb32_fp32",
+    "native_xpotrf_lower_fused_copy",
+    "persistent_ll64_static296_fp32",
+    "persistent_ll64_slots8_colmajor_fp32",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
-_NATIVE_VARIANTS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15)
+_NATIVE_VARIANTS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18
+)
 _LEAF_CONFIGS = tuple(
     (m, ib, lb, threads)
     for m in (64, 128, 256)
@@ -89,6 +94,12 @@ _METADATA_COLUMNS = (
     "trsm128_count",
     "trsm64_count",
     "trsm32_count",
+    "worker_ctas",
+    "tile_tasks",
+    "cooperative_launch",
+    "schedule_table_bytes",
+    "estimated_weight_min",
+    "estimated_weight_max",
 )
 
 _CPP_SOURCE = r"""
@@ -142,6 +153,90 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+
+def _persistent_schedule_source() -> str:
+    tiles = [
+        (row, column, column + 1)
+        for column in range(64)
+        for row in range(column, 64)
+    ]
+
+    def declaration(name: str, values: list[int]) -> str:
+        lines = []
+        for begin in range(0, len(values), 16):
+            lines.append(
+                "    " + ", ".join(
+                    str(value) for value in values[begin:begin + 16]
+                )
+            )
+        body = ",\n".join(lines)
+        return (
+            f"__device__ __constant__ uint16_t {name}"
+            f"[{len(values)}] = {{\n{body}\n}};"
+        )
+
+    def schedule(
+        workers: int,
+        expected_min: int,
+        expected_max: int,
+        expected_task_min: int,
+        expected_task_max: int,
+        prefix: str,
+    ) -> str:
+        assignments = [[] for _ in range(workers)]
+        loads = [0 for _ in range(workers)]
+        for task in range(workers):
+            assignments[task].append(task)
+            loads[task] = tiles[task][2]
+        for task in range(len(tiles) - 1, workers - 1, -1):
+            owner = min(
+                range(workers),
+                key=lambda worker: (
+                    loads[worker],
+                    len(assignments[worker]),
+                    worker,
+                ),
+            )
+            assignments[owner].append(task)
+            loads[owner] += tiles[task][2]
+        for tasks in assignments:
+            tasks.sort()
+        offsets = [0]
+        ordered_tasks: list[int] = []
+        for tasks in assignments:
+            ordered_tasks.extend(tasks)
+            offsets.append(len(ordered_tasks))
+        task_counts = [len(tasks) for tasks in assignments]
+        if (
+            len(ordered_tasks) != 2080
+            or sorted(ordered_tasks) != list(range(2080))
+            or min(loads) != expected_min
+            or max(loads) != expected_max
+            or min(task_counts) != expected_task_min
+            or max(task_counts) != expected_task_max
+        ):
+            raise RuntimeError("invalid persistent worker schedule")
+        return "\n\n".join(
+            (
+                declaration(f"{prefix}Offsets", offsets),
+                declaration(f"{prefix}Tasks", ordered_tasks),
+            )
+        )
+
+    return "\n\n".join(
+        (
+            schedule(
+                296, 154, 159, 7, 8,
+                "kPersistentWorker",
+            ),
+            schedule(
+                148, 308, 311, 14, 15,
+                "kPersistentSlotWorker",
+            ),
+        )
+    )
+
+
 # Shape-specialized descendants of b1n32768 variants 13 and 14.
 # Both retain the left-looking TF32 update schedule and the wide
 # redundant-corner factor. The 64-wide family shortens the serial
@@ -153,6 +248,7 @@ _CUDA_SOURCE = r"""
 #include <ATen/ops/linalg_cholesky_ex.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 #include <torch/extension.h>
@@ -160,14 +256,30 @@ _CUDA_SOURCE = r"""
 #include <array>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace {
 
 constexpr int kN = 4096;
 constexpr int kPanelLd = 9;
-constexpr int kVariantCount = 16;
-constexpr int kMetadataColumns = 33;
+constexpr int kLegacyVariantCount = 16;
+constexpr int kVariantCount = 19;
+constexpr int kMetadataColumns = 39;
 constexpr int kLeafConfigCount = 72;
+constexpr int kPersistentTile = 64;
+constexpr int kPersistentTiles = kN / kPersistentTile;
+constexpr int kPersistentTasks =
+    kPersistentTiles * (kPersistentTiles + 1) / 2;
+constexpr int kPersistentSms = 148;
+constexpr int kPersistentBlocksPerSm = 2;
+constexpr int kPersistentWorkers =
+    kPersistentSms * kPersistentBlocksPerSm;
+constexpr int kPersistentThreads = 256;
+constexpr int kPersistentDynamicBytes = 96 * 1024;
+constexpr int kPersistentHistoryLd = 68;
+constexpr int kPersistentSlotWorkers = kPersistentSms;
+constexpr int kPersistentSlotCount = 8;
+constexpr int kPersistentSlotDynamicBytes = 208 * 1024;
 
 constexpr int kLeftLook = 0;
 constexpr int kTrsmFusedMicro = 3;
@@ -180,9 +292,14 @@ constexpr int kApplySplit2 = 1;
 constexpr int kDirectLook = 1;
 constexpr int kHybridLook = 2;
 constexpr int kRecursiveLook = 3;
+constexpr int kLibraryLook = 4;
+constexpr int kPersistentLook = 5;
 constexpr int kFactorFusedLl = 6;
+constexpr int kFactorCusolver = 7;
+constexpr int kFactorPersistent = 8;
 constexpr int kApplyCublasTrsm = 4;
 constexpr int kApplyInverseGemm = 5;
+constexpr int kApplyPersistentTrsm = 6;
 
 bool gProfileRanges = false;
 cudaEvent_t gPanelReady = nullptr;
@@ -192,6 +309,18 @@ at::Tensor gHostInfo64;
 at::Tensor gHostPanel128;
 at::Tensor gHostFactor128;
 at::Tensor gHostInfo128;
+cusolverDnHandle_t gXpotrfHandle = nullptr;
+cusolverDnParams_t gXpotrfParams = nullptr;
+at::Tensor gXpotrfDeviceWorkspace;
+at::Tensor gXpotrfInfo;
+std::vector<char> gXpotrfHostWorkspace;
+size_t gXpotrfDeviceBytes = 0;
+size_t gXpotrfHostBytes = 0;
+int gXpotrfDevice = -1;
+at::Tensor gPersistentFlags;
+int gPersistentDevice = -1;
+
+__PERSISTENT_SCHEDULE__
 
 class ProfileRange {
  public:
@@ -257,6 +386,15 @@ static_assert(Tile<64>::factor_bytes == 39936);
 static_assert(Tile<64>::apply_bytes == 33280);
 static_assert(Tile<128>::factor_bytes == 153600);
 static_assert(Tile<128>::apply_bytes == 132096);
+constexpr int kPersistentSlotStorageBytes =
+    static_cast<int>(sizeof(float)) *
+        (4 * kPersistentTile * kPersistentHistoryLd +
+         kPersistentSlotCount * kPersistentTile * Tile<64>::ld +
+         kPersistentTile + kPersistentTile * kPanelLd) +
+    static_cast<int>(sizeof(int)) *
+        (5 * kPersistentSlotCount + 5);
+static_assert(
+    kPersistentSlotStorageBytes <= kPersistentSlotDynamicBytes);
 
 template <int Id>
 struct Variant;
@@ -321,13 +459,13 @@ constexpr std::array<int, sizeof...(Ids)> min_micro_of(
 }
 
 constexpr auto kVariantUsesFlags =
-    flags_usage_of(std::make_integer_sequence<int, kVariantCount>{});
+    flags_usage_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantUsesScratch =
-    scratch_usage_of(std::make_integer_sequence<int, kVariantCount>{});
+    scratch_usage_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantMicro =
-    micro_of(std::make_integer_sequence<int, kVariantCount>{});
+    micro_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantMinMicro =
-    min_micro_of(std::make_integer_sequence<int, kVariantCount>{});
+    min_micro_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 
 __device__ __forceinline__ int64_t matrix_index(
     int row, int column) {
@@ -1065,6 +1203,799 @@ __device__ __forceinline__ void acquire_fence() {
   asm volatile("fence.acquire.gpu;" ::: "memory");
 }
 
+__device__ __forceinline__ uint32_t shared_address(
+    const void* pointer) {
+  return static_cast<uint32_t>(
+      __cvta_generic_to_shared(const_cast<void*>(pointer)));
+}
+
+__device__ __forceinline__ void copy_async_16(
+    void* destination, const void* source) {
+  const uint32_t address = shared_address(destination);
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;"
+      :: "r"(address), "l"(source) : "memory");
+}
+
+__device__ __forceinline__ void commit_async_copies() {
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void wait_async_copies() {
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+__device__ __forceinline__ int persistent_task_index(
+    int row, int column) {
+  return column * (129 - column) / 2 + row - column;
+}
+
+__device__ __forceinline__ void decode_persistent_task(
+    int task, int& row, int& column) {
+  int first = 0;
+  int count = kPersistentTiles;
+  column = 0;
+#pragma unroll 1
+  while (task >= first + count) {
+    first += count;
+    --count;
+    ++column;
+  }
+  row = column + task - first;
+}
+
+__device__ __forceinline__ void wait_for_persistent_tiles(
+    const int* flags, int first, int second) {
+  if (threadIdx.x == 0) {
+    while (
+        poll_flag(flags + first) == 0 ||
+        (second != first && poll_flag(flags + second) == 0)) {
+      __nanosleep(64);
+    }
+    acquire_fence();
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ bool persistent_tiles_ready(
+    const int* flags, int first, int second, int* result) {
+  if (threadIdx.x == 0) {
+    const bool ready =
+        poll_flag(flags + first) != 0 &&
+        (second == first || poll_flag(flags + second) != 0);
+    if (ready) {
+      acquire_fence();
+    }
+    *result = ready ? 1 : 0;
+  }
+  __syncthreads();
+  return *result != 0;
+}
+
+__device__ __forceinline__ void stage_persistent_tile(
+    float* destination, const float* source) {
+  constexpr int kChunksPerRow = kPersistentTile / 4;
+  constexpr int kChunks = kPersistentTile * kChunksPerRow;
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kPersistentThreads) {
+    const int row = chunk / kChunksPerRow;
+    const int column = (chunk - row * kChunksPerRow) * 4;
+    copy_async_16(
+        destination + row * kPersistentHistoryLd + column,
+        source + static_cast<int64_t>(row) * kN + column);
+  }
+}
+
+__device__ __forceinline__ void stage_persistent_history_tile(
+    float* destination, const float* source) {
+  constexpr int kChunksPerRow = kPersistentTile / 4;
+  constexpr int kChunks = kPersistentTile * kChunksPerRow;
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kPersistentThreads) {
+    const int row = chunk / kChunksPerRow;
+    const int logical_group = chunk - row * kChunksPerRow;
+    const int logical_column = logical_group * 4;
+    const int physical_group = logical_group ^ (row >> 2);
+    const int physical_column = physical_group * 4;
+    copy_async_16(
+        destination +
+            row * kPersistentHistoryLd + physical_column,
+        source +
+            static_cast<int64_t>(row) * kN +
+            logical_column);
+  }
+}
+
+__device__ __forceinline__ void stage_persistent_history(
+    float* first_tile, float* second_tile,
+    const float* output, int row, int column, int history) {
+  stage_persistent_history_tile(
+      first_tile,
+      output +
+          static_cast<int64_t>(
+              row * kPersistentTile) * kN +
+          history * kPersistentTile);
+  stage_persistent_history_tile(
+      second_tile,
+      output +
+          static_cast<int64_t>(
+              column * kPersistentTile) * kN +
+          history * kPersistentTile);
+  commit_async_copies();
+}
+
+__device__ __forceinline__ float load_persistent_shared(
+    uint32_t base, int index) {
+  float value;
+  const uint32_t address =
+      base + static_cast<uint32_t>(index * sizeof(float));
+  asm volatile(
+      "ld.shared.f32 %0, [%1];"
+      : "=f"(value) : "r"(address));
+  return value;
+}
+
+__device__ __forceinline__ int persistent_history_index(
+    int row, int column) {
+  const int physical_group =
+      (column >> 2) ^ (row >> 2);
+  return row * kPersistentHistoryLd +
+      physical_group * 4 + (column & 3);
+}
+
+__device__ __forceinline__ void update_persistent_accumulator(
+    float value[4][4],
+    const float* first_tile, const float* second_tile,
+    int row_base, int column_base) {
+  const uint32_t first_base = shared_address(first_tile);
+  const uint32_t second_base = shared_address(second_tile);
+#pragma unroll
+  for (int k = 0; k < kPersistentTile; ++k) {
+    float left[4];
+    float right[4];
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      left[item] = load_persistent_shared(
+          first_base,
+          persistent_history_index(row_base + item, k));
+      right[item] = load_persistent_shared(
+          second_base,
+          persistent_history_index(column_base + item, k));
+    }
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        value[local_row][local_column] = fmaf(
+            -left[local_row], right[local_column],
+            value[local_row][local_column]);
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ void persistent_trsm64(
+    float* tile, const float* diagonal,
+    float* inverse_diagonal) {
+  const int thread = static_cast<int>(threadIdx.x);
+  if (thread < kPersistentTile) {
+    inverse_diagonal[thread] = __fdiv_rn(
+        1.0f,
+        diagonal[
+            thread * kPersistentHistoryLd + thread]);
+  }
+  __syncthreads();
+#pragma unroll 1
+  for (int base = 0; base < kPersistentTile; base += 8) {
+    if (thread < kPersistentTile) {
+      const int row = thread;
+      float solved[8];
+#pragma unroll
+      for (int column = 0; column < 8; ++column) {
+        float current =
+            tile[row * Tile<64>::ld + base + column];
+#pragma unroll
+        for (int prior = 0; prior < column; ++prior) {
+          current = fmaf(
+              -solved[prior],
+              diagonal[
+                  (base + column) *
+                      kPersistentHistoryLd +
+                  base + prior],
+              current);
+        }
+        solved[column] =
+            current * inverse_diagonal[base + column];
+        tile[row * Tile<64>::ld + base + column] =
+            solved[column];
+      }
+    }
+    __syncthreads();
+
+    const int row = thread >> 2;
+    const int lane = thread & 3;
+    for (int target = base + 8 + lane;
+         target < kPersistentTile; target += 4) {
+      float current =
+          tile[row * Tile<64>::ld + target];
+#pragma unroll
+      for (int column = 0; column < 8; ++column) {
+        current = fmaf(
+            -tile[row * Tile<64>::ld + base + column],
+            diagonal[
+                target * kPersistentHistoryLd +
+                base + column],
+            current);
+      }
+      tile[row * Tile<64>::ld + target] = current;
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ void zero_persistent_mirror(
+    float* output, int row, int column) {
+  if (row == column) {
+    return;
+  }
+  constexpr int kChunksPerRow = kPersistentTile / 4;
+  constexpr int kChunks = kPersistentTile * kChunksPerRow;
+  const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kPersistentThreads) {
+    const int local_row = chunk / kChunksPerRow;
+    const int local_column =
+        (chunk - local_row * kChunksPerRow) * 4;
+    float4* destination = reinterpret_cast<float4*>(
+        output +
+        static_cast<int64_t>(
+            column * kPersistentTile + local_row) * kN +
+        row * kPersistentTile + local_column);
+    *destination = zero;
+  }
+}
+
+__global__ __launch_bounds__(
+    kPersistentThreads, kPersistentBlocksPerSm)
+void persistent_ll64_static_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int* __restrict__ flags) {
+  extern __shared__ __align__(16) unsigned char dynamic_bytes[];
+  constexpr int kPersistentHistoryElements =
+      kPersistentTile * kPersistentHistoryLd;
+  float* history_base =
+      reinterpret_cast<float*>(dynamic_bytes);
+  float* tile =
+      history_base + 4 * kPersistentHistoryElements;
+  float* inverse_diagonal =
+      tile + kPersistentTile * Tile<64>::ld;
+  float* panel = inverse_diagonal + kPersistentTile;
+  int* ready = reinterpret_cast<int*>(
+      panel + kPersistentTile * kPanelLd);
+
+  const int worker = static_cast<int>(blockIdx.x);
+  const int schedule_begin =
+      static_cast<int>(kPersistentWorkerOffsets[worker]);
+  const int schedule_end =
+      static_cast<int>(kPersistentWorkerOffsets[worker + 1]);
+#pragma unroll 1
+  for (int schedule_index = schedule_begin;
+       schedule_index < schedule_end; ++schedule_index) {
+    const int task = static_cast<int>(
+        kPersistentWorkerTasks[schedule_index]);
+    int tile_row;
+    int tile_column;
+    decode_persistent_task(task, tile_row, tile_column);
+    zero_persistent_mirror(output, tile_row, tile_column);
+
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread >> 5;
+    const int lane = thread & 31;
+    const int row_base =
+        ((warp >> 1) * 4 + (lane >> 3)) * 4;
+    const int column_base =
+        ((warp & 1) * 8 + (lane & 7)) * 4;
+    float value[4][4];
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        value[local_row][local_column] = load_global(
+            input +
+            static_cast<int64_t>(
+                tile_row * kPersistentTile +
+                row_base + local_row) * kN +
+            tile_column * kPersistentTile +
+            column_base + local_column);
+      }
+    }
+
+    int current_buffer = 0;
+    if (tile_column > 0) {
+      const int first_dependency =
+          persistent_task_index(tile_row, 0);
+      const int second_dependency =
+          persistent_task_index(tile_column, 0);
+      wait_for_persistent_tiles(
+          flags, first_dependency, second_dependency);
+      stage_persistent_history(
+          history_base,
+          history_base + kPersistentHistoryElements,
+          output,
+          tile_row, tile_column, 0);
+      wait_async_copies();
+      __syncthreads();
+    }
+
+#pragma unroll 1
+    for (int k = 0; k < tile_column; ++k) {
+      bool prefetched = false;
+      if (k + 1 < tile_column) {
+        const int first_dependency =
+            persistent_task_index(tile_row, k + 1);
+        const int second_dependency =
+            persistent_task_index(tile_column, k + 1);
+        prefetched = persistent_tiles_ready(
+            flags, first_dependency, second_dependency, ready);
+        if (prefetched) {
+          const int next_buffer = current_buffer ^ 1;
+          float* next_first =
+              history_base +
+              next_buffer * 2 * kPersistentHistoryElements;
+          stage_persistent_history(
+              next_first,
+              next_first + kPersistentHistoryElements,
+              output,
+              tile_row, tile_column, k + 1);
+        }
+      }
+
+      float* current_first =
+          history_base +
+          current_buffer * 2 * kPersistentHistoryElements;
+      update_persistent_accumulator(
+          value, current_first,
+          current_first + kPersistentHistoryElements,
+          row_base, column_base);
+      __syncthreads();
+
+      if (k + 1 < tile_column) {
+        const int first_dependency =
+            persistent_task_index(tile_row, k + 1);
+        const int second_dependency =
+            persistent_task_index(tile_column, k + 1);
+        const int next_buffer = current_buffer ^ 1;
+        if (!prefetched) {
+          wait_for_persistent_tiles(
+            flags, first_dependency, second_dependency);
+          stage_persistent_history(
+              history_base +
+                  next_buffer * 2 *
+                      kPersistentHistoryElements,
+              history_base +
+                  (next_buffer * 2 + 1) *
+                      kPersistentHistoryElements,
+              output,
+              tile_row, tile_column, k + 1);
+        }
+        wait_async_copies();
+        __syncthreads();
+        current_buffer = next_buffer;
+      }
+    }
+
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        tile[
+            (row_base + local_row) * Tile<64>::ld +
+            column_base + local_column] =
+            value[local_row][local_column];
+      }
+    }
+    __syncthreads();
+
+    if (tile_row == tile_column) {
+      factor_compact<64>(
+          tile, inverse_diagonal, panel);
+    } else {
+      const int diagonal_task =
+          persistent_task_index(tile_column, tile_column);
+      wait_for_persistent_tiles(
+          flags, diagonal_task, diagonal_task);
+      stage_persistent_tile(
+          history_base,
+          output +
+              static_cast<int64_t>(
+                  tile_column * kPersistentTile) * kN +
+              tile_column * kPersistentTile);
+      commit_async_copies();
+      wait_async_copies();
+      __syncthreads();
+      persistent_trsm64(
+          tile, history_base, inverse_diagonal);
+    }
+
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < kPersistentTile * kPersistentTile;
+         linear += kPersistentThreads) {
+      const int local_row = linear / kPersistentTile;
+      const int local_column =
+          linear - local_row * kPersistentTile;
+      const float result =
+          tile_row != tile_column ||
+                  local_column <= local_row
+              ? tile[
+                    local_row * Tile<64>::ld +
+                    local_column]
+              : 0.0f;
+      store_global(
+          output +
+              static_cast<int64_t>(
+                  tile_row * kPersistentTile + local_row) *
+                  kN +
+              tile_column * kPersistentTile + local_column,
+          result);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      publish_flag(flags + task);
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ void admit_persistent_slot(
+    int slot, int schedule_index,
+    int* slot_task, int* slot_row, int* slot_column,
+    int* slot_next, int* slot_state) {
+  const int task = static_cast<int>(
+      kPersistentSlotWorkerTasks[schedule_index]);
+  int row;
+  int column;
+  decode_persistent_task(task, row, column);
+  slot_task[slot] = task;
+  slot_row[slot] = row;
+  slot_column[slot] = column;
+  slot_next[slot] = 0;
+  slot_state[slot] = 1;
+}
+
+__global__ __launch_bounds__(kPersistentThreads, 1)
+void persistent_ll64_slots8_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int* __restrict__ flags) {
+  extern __shared__ __align__(16) unsigned char dynamic_bytes[];
+  constexpr int kHistoryElements =
+      kPersistentTile * kPersistentHistoryLd;
+  constexpr int kAccumulatorElements =
+      kPersistentTile * Tile<64>::ld;
+  constexpr int kSlotEmpty = 0;
+  constexpr int kSlotFresh = 1;
+  constexpr int kSlotParked = 2;
+  constexpr int kCursor = 0;
+  constexpr int kCompleted = 1;
+  constexpr int kSelected = 2;
+  constexpr int kTotal = 3;
+  constexpr int kReady = 4;
+
+  float* history_base =
+      reinterpret_cast<float*>(dynamic_bytes);
+  float* accumulator_base =
+      history_base + 4 * kHistoryElements;
+  float* inverse_diagonal =
+      accumulator_base +
+      kPersistentSlotCount * kAccumulatorElements;
+  float* panel = inverse_diagonal + kPersistentTile;
+  int* slot_task = reinterpret_cast<int*>(
+      panel + kPersistentTile * kPanelLd);
+  int* slot_row = slot_task + kPersistentSlotCount;
+  int* slot_column = slot_row + kPersistentSlotCount;
+  int* slot_next = slot_column + kPersistentSlotCount;
+  int* slot_state = slot_next + kPersistentSlotCount;
+  int* control = slot_state + kPersistentSlotCount;
+
+  const int worker = static_cast<int>(blockIdx.x);
+  const int schedule_begin = static_cast<int>(
+      kPersistentSlotWorkerOffsets[worker]);
+  const int schedule_end = static_cast<int>(
+      kPersistentSlotWorkerOffsets[worker + 1]);
+  if (threadIdx.x == 0) {
+    int cursor = schedule_begin;
+#pragma unroll
+    for (int slot = 0; slot < kPersistentSlotCount; ++slot) {
+      if (cursor < schedule_end) {
+        admit_persistent_slot(
+            slot, cursor,
+            slot_task, slot_row, slot_column,
+            slot_next, slot_state);
+        ++cursor;
+      } else {
+        slot_state[slot] = kSlotEmpty;
+      }
+    }
+    control[kCursor] = cursor;
+    control[kCompleted] = 0;
+    control[kSelected] = -1;
+    control[kTotal] = schedule_end - schedule_begin;
+    control[kReady] = 0;
+  }
+  __syncthreads();
+
+  const int thread = static_cast<int>(threadIdx.x);
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  const int row_base =
+      ((warp >> 1) * 4 + (lane >> 3)) * 4;
+  const int column_base =
+      ((warp & 1) * 8 + (lane & 7)) * 4;
+
+#pragma unroll 1
+  while (true) {
+    if (thread == 0) {
+      if (control[kCompleted] == control[kTotal]) {
+        control[kSelected] = -2;
+      } else {
+        int selected = -1;
+        int selected_task = kPersistentTasks;
+#pragma unroll
+        for (int slot = 0;
+             slot < kPersistentSlotCount; ++slot) {
+          if (slot_state[slot] == kSlotEmpty) {
+            continue;
+          }
+          const int row = slot_row[slot];
+          const int column = slot_column[slot];
+          const int next = slot_next[slot];
+          bool ready = false;
+          if (next < column) {
+            const int first =
+                persistent_task_index(row, next);
+            const int second =
+                persistent_task_index(column, next);
+            ready =
+                poll_flag(flags + first) != 0 &&
+                (first == second ||
+                 poll_flag(flags + second) != 0);
+          } else if (row == column) {
+            ready = true;
+          } else {
+            const int diagonal =
+                persistent_task_index(column, column);
+            ready = poll_flag(flags + diagonal) != 0;
+          }
+          if (ready && slot_task[slot] < selected_task) {
+            selected = slot;
+            selected_task = slot_task[slot];
+          }
+        }
+        if (selected >= 0) {
+          acquire_fence();
+        } else {
+          __nanosleep(64);
+        }
+        control[kSelected] = selected;
+      }
+    }
+    __syncthreads();
+
+    const int slot = control[kSelected];
+    if (slot == -2) {
+      break;
+    }
+    if (slot < 0) {
+      continue;
+    }
+
+    const int task = slot_task[slot];
+    const int tile_row = slot_row[slot];
+    const int tile_column = slot_column[slot];
+    int progress = slot_next[slot];
+    const int state = slot_state[slot];
+    float* tile =
+        accumulator_base + slot * kAccumulatorElements;
+    float value[4][4];
+
+    if (state == kSlotFresh) {
+      zero_persistent_mirror(
+          output, tile_row, tile_column);
+#pragma unroll
+      for (int local_row = 0;
+           local_row < 4; ++local_row) {
+#pragma unroll
+        for (int local_column = 0;
+             local_column < 4; ++local_column) {
+          value[local_row][local_column] = load_global(
+              input +
+              static_cast<int64_t>(
+                  tile_row * kPersistentTile +
+                  row_base + local_row) * kN +
+              tile_column * kPersistentTile +
+              column_base + local_column);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int local_row = 0;
+           local_row < 4; ++local_row) {
+#pragma unroll
+        for (int local_column = 0;
+             local_column < 4; ++local_column) {
+          value[local_row][local_column] =
+              tile[
+                  (row_base + local_row) * Tile<64>::ld +
+                  column_base + local_column];
+        }
+      }
+    }
+
+    if (progress < tile_column) {
+      int current_buffer = 0;
+      stage_persistent_history(
+          history_base,
+          history_base + kHistoryElements,
+          output,
+          tile_row, tile_column, progress);
+      wait_async_copies();
+      __syncthreads();
+
+#pragma unroll 1
+      while (progress < tile_column) {
+        bool prefetched = false;
+        if (progress + 1 < tile_column) {
+          const int first_dependency =
+              persistent_task_index(
+                  tile_row, progress + 1);
+          const int second_dependency =
+              persistent_task_index(
+                  tile_column, progress + 1);
+          prefetched = persistent_tiles_ready(
+              flags,
+              first_dependency,
+              second_dependency,
+              control + kReady);
+          if (prefetched) {
+            const int next_buffer = current_buffer ^ 1;
+            float* next_first =
+                history_base +
+                next_buffer * 2 * kHistoryElements;
+            stage_persistent_history(
+                next_first,
+                next_first + kHistoryElements,
+                output,
+                tile_row, tile_column, progress + 1);
+          }
+        }
+
+        float* current_first =
+            history_base +
+            current_buffer * 2 * kHistoryElements;
+        update_persistent_accumulator(
+            value,
+            current_first,
+            current_first + kHistoryElements,
+            row_base, column_base);
+        ++progress;
+        __syncthreads();
+
+        if (progress < tile_column) {
+          if (!prefetched) {
+            break;
+          }
+          wait_async_copies();
+          __syncthreads();
+          current_buffer ^= 1;
+        }
+      }
+    }
+
+#pragma unroll
+    for (int local_row = 0;
+         local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        tile[
+            (row_base + local_row) * Tile<64>::ld +
+            column_base + local_column] =
+            value[local_row][local_column];
+      }
+    }
+    __syncthreads();
+
+    if (progress < tile_column) {
+      if (thread == 0) {
+        slot_next[slot] = progress;
+        slot_state[slot] = kSlotParked;
+      }
+      __syncthreads();
+      continue;
+    }
+
+    if (tile_row != tile_column) {
+      const int diagonal_task =
+          persistent_task_index(
+              tile_column, tile_column);
+      const bool diagonal_ready =
+          persistent_tiles_ready(
+              flags,
+              diagonal_task,
+              diagonal_task,
+              control + kReady);
+      if (!diagonal_ready) {
+        if (thread == 0) {
+          slot_next[slot] = progress;
+          slot_state[slot] = kSlotParked;
+        }
+        __syncthreads();
+        continue;
+      }
+      stage_persistent_tile(
+          history_base,
+          output +
+              static_cast<int64_t>(
+                  tile_column * kPersistentTile) * kN +
+              tile_column * kPersistentTile);
+      commit_async_copies();
+      wait_async_copies();
+      __syncthreads();
+      persistent_trsm64(
+          tile, history_base, inverse_diagonal);
+    } else {
+      factor_compact<64>(
+          tile, inverse_diagonal, panel);
+    }
+
+    for (int linear = thread;
+         linear < kPersistentTile * kPersistentTile;
+         linear += kPersistentThreads) {
+      const int local_row = linear / kPersistentTile;
+      const int local_column =
+          linear - local_row * kPersistentTile;
+      const float result =
+          tile_row != tile_column ||
+                  local_column <= local_row
+              ? tile[
+                    local_row * Tile<64>::ld +
+                    local_column]
+              : 0.0f;
+      store_global(
+          output +
+              static_cast<int64_t>(
+                  tile_row * kPersistentTile + local_row) *
+                  kN +
+              tile_column * kPersistentTile + local_column,
+          result);
+    }
+    __syncthreads();
+    if (thread == 0) {
+      publish_flag(flags + task);
+    }
+    __syncthreads();
+
+    if (thread == 0) {
+      ++control[kCompleted];
+      const int cursor = control[kCursor];
+      if (cursor < schedule_end) {
+        admit_persistent_slot(
+            slot, cursor,
+            slot_task, slot_row, slot_column,
+            slot_next, slot_state);
+        control[kCursor] = cursor + 1;
+      } else {
+        slot_state[slot] = kSlotEmpty;
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <int Micro>
 __device__ __forceinline__ void load_x_tile(
     float* x_tile, const float* output, int begin, int tile_index) {
@@ -1351,6 +2282,38 @@ void copy_lower_kernel(
       value.y = column + 1 <= row ? loaded.y : 0.0f;
       value.z = column + 2 <= row ? loaded.z : 0.0f;
       value.w = 0.0f;
+    }
+    __stcg(reinterpret_cast<float4*>(output) + quad, value);
+  }
+}
+
+__global__ __launch_bounds__(256)
+void copy_xpotrf_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output) {
+  constexpr int64_t quads = static_cast<int64_t>(kN) * kN / 4;
+  constexpr int quads_per_row = kN / 4;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / quads_per_row);
+    const int column =
+        static_cast<int>(quad % quads_per_row) * 4;
+    const float4* source =
+        reinterpret_cast<const float4*>(input) + quad;
+    float4 value;
+    if (column >= row) {
+      value = __ldcg(source);
+    } else if (column + 3 < row) {
+      value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+      const float4 loaded = __ldcg(source);
+      value.x = column >= row ? loaded.x : 0.0f;
+      value.y = column + 1 >= row ? loaded.y : 0.0f;
+      value.z = column + 2 >= row ? loaded.z : 0.0f;
+      value.w = loaded.w;
     }
     __stcg(reinterpret_cast<float4*>(output) + quad, value);
   }
@@ -1678,6 +2641,84 @@ void launch_copy(const float* input, float* output) {
   config.gridDim = dim3(512, 1, 1);
   config.blockDim = dim3(256, 1, 1);
   cudaLaunchKernelEx(&config, copy_lower_kernel, input, output);
+}
+
+void launch_xpotrf_copy(const float* input, float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(512, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  cudaLaunchKernelEx(&config, copy_xpotrf_kernel, input, output);
+}
+
+void check_cusolver(cusolverStatus_t status, const char* role) {
+  TORCH_CHECK(
+      status == CUSOLVER_STATUS_SUCCESS,
+      role, " failed with cuSOLVER status ", static_cast<int>(status));
+}
+
+void ensure_xpotrf_state(
+    const at::Tensor& like, float* matrix) {
+  const int device = like.get_device();
+  if (gXpotrfHandle == nullptr) {
+    check_cusolver(
+        cusolverDnCreate(&gXpotrfHandle),
+        "create Xpotrf handle");
+  }
+  if (gXpotrfParams == nullptr) {
+    check_cusolver(
+        cusolverDnCreateParams(&gXpotrfParams),
+        "create Xpotrf parameters");
+  }
+  if (
+      gXpotrfDevice == device &&
+      gXpotrfDeviceWorkspace.defined() &&
+      gXpotrfInfo.defined()) {
+    return;
+  }
+  check_cusolver(
+      cusolverDnXpotrf_bufferSize(
+          gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+          static_cast<int64_t>(kN), CUDA_R_32F, matrix,
+          static_cast<int64_t>(kN), CUDA_R_32F,
+          &gXpotrfDeviceBytes, &gXpotrfHostBytes),
+      "query Xpotrf workspace");
+  gXpotrfDeviceWorkspace = at::empty(
+      {static_cast<int64_t>(gXpotrfDeviceBytes)},
+      like.options().dtype(at::kByte));
+  gXpotrfInfo = at::empty({1}, like.options().dtype(at::kInt));
+  gXpotrfHostWorkspace.resize(gXpotrfHostBytes);
+  gXpotrfDevice = device;
+}
+
+void prepare_xpotrf() {
+  auto probe = at::empty(
+      {static_cast<int64_t>(kN) * kN},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+  ensure_xpotrf_state(probe, probe.data_ptr<float>());
+}
+
+void launch_xpotrf(
+    const float* input, float* output,
+    const at::Tensor& like) {
+  launch_xpotrf_copy(input, output);
+  ensure_xpotrf_state(like, output);
+  void* device_workspace =
+      gXpotrfDeviceBytes == 0
+          ? nullptr
+          : gXpotrfDeviceWorkspace.data_ptr<uint8_t>();
+  void* host_workspace =
+      gXpotrfHostBytes == 0
+          ? nullptr
+          : gXpotrfHostWorkspace.data();
+  check_cusolver(
+      cusolverDnXpotrf(
+          gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+          static_cast<int64_t>(kN), CUDA_R_32F, output,
+          static_cast<int64_t>(kN), CUDA_R_32F,
+          device_workspace, gXpotrfDeviceBytes,
+          host_workspace, gXpotrfHostBytes,
+          gXpotrfInfo.data_ptr<int>()),
+      "run Xpotrf");
 }
 
 template <int Micro>
@@ -2103,6 +3144,20 @@ void check_output(
       output.device() == data.device(), "output device mismatch");
 }
 
+void check_xpotrf_output(
+    const at::Tensor& data, const at::Tensor& output) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(
+      output.scalar_type() == at::kFloat, "output must be float32");
+  TORCH_CHECK(output.sizes() == data.sizes(), "output shape mismatch");
+  TORCH_CHECK(
+      output.device() == data.device(), "output device mismatch");
+  TORCH_CHECK(
+      output.stride(0) == static_cast<int64_t>(kN) * kN &&
+      output.stride(1) == 1 && output.stride(2) == kN,
+      "Xpotrf output must use column-major matrix strides");
+}
+
 template <typename Kernel>
 void configure_dynamic(Kernel kernel, int dynamic_bytes) {
   cudaError_t status = cudaFuncSetAttribute(
@@ -2219,6 +3274,166 @@ void configure_recursive_leaf() {
             256, 0) >= 1,
         "fused left-looking leaf has no active CTA");
   }
+}
+
+void ensure_persistent_state() {
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "persistent device query failed: ",
+      cudaGetErrorString(status));
+  if (
+      gPersistentDevice == device &&
+      gPersistentFlags.defined()) {
+    return;
+  }
+  gPersistentFlags = at::empty(
+      {kPersistentTasks},
+      at::TensorOptions()
+          .dtype(at::kInt)
+          .device(at::Device(at::kCUDA, device)));
+  gPersistentDevice = device;
+}
+
+void configure_persistent() {
+  configure_dynamic(
+      persistent_ll64_static_kernel,
+      kPersistentDynamicBytes);
+  const cudaFuncAttributes attributes =
+      checked_attributes(persistent_ll64_static_kernel);
+  TORCH_CHECK(
+      attributes.maxThreadsPerBlock >= kPersistentThreads,
+      "persistent kernel exceeds its compiled thread limit");
+  TORCH_CHECK(
+      active_blocks(
+          persistent_ll64_static_kernel,
+          kPersistentThreads,
+          kPersistentDynamicBytes) == kPersistentBlocksPerSm,
+      "persistent kernel must have exactly two active CTAs per SM");
+
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "persistent device query failed: ",
+      cudaGetErrorString(status));
+  cudaDeviceProp properties{};
+  status = cudaGetDeviceProperties(&properties, device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "persistent property query failed: ",
+      cudaGetErrorString(status));
+  TORCH_CHECK(
+      properties.major == 10 && properties.minor == 0,
+      "persistent variant requires compute capability 10.0");
+  TORCH_CHECK(
+      properties.multiProcessorCount == kPersistentSms,
+      "persistent variant requires a 148-SM B200");
+  TORCH_CHECK(
+      properties.cooperativeLaunch != 0,
+      "persistent variant requires cooperative launch support");
+  TORCH_CHECK(
+      properties.sharedMemPerBlockOptin >=
+          kPersistentDynamicBytes,
+      "persistent variant requires 96 KiB dynamic shared memory");
+  ensure_persistent_state();
+}
+
+void launch_persistent(
+    const float* input, float* output) {
+  ensure_persistent_state();
+  int* flags = gPersistentFlags.data_ptr<int>();
+  cudaError_t status = cudaMemsetAsync(
+      flags, 0, kPersistentTasks * sizeof(int), nullptr);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "persistent flag reset failed: ",
+      cudaGetErrorString(status));
+  const float* input_argument = input;
+  float* output_argument = output;
+  int* flags_argument = flags;
+  void* arguments[] = {
+      &input_argument, &output_argument, &flags_argument};
+  status = cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(persistent_ll64_static_kernel),
+      dim3(kPersistentWorkers, 1, 1),
+      dim3(kPersistentThreads, 1, 1),
+      arguments, kPersistentDynamicBytes, nullptr);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "persistent cooperative launch failed: ",
+      cudaGetErrorString(status));
+}
+
+void configure_persistent_slots() {
+  configure_dynamic(
+      persistent_ll64_slots8_kernel,
+      kPersistentSlotDynamicBytes);
+  const cudaFuncAttributes attributes =
+      checked_attributes(persistent_ll64_slots8_kernel);
+  TORCH_CHECK(
+      attributes.maxThreadsPerBlock >= kPersistentThreads,
+      "slot kernel exceeds its compiled thread limit");
+  TORCH_CHECK(
+      active_blocks(
+          persistent_ll64_slots8_kernel,
+          kPersistentThreads,
+          kPersistentSlotDynamicBytes) == 1,
+      "slot kernel must have exactly one active CTA per SM");
+
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "slot device query failed: ",
+      cudaGetErrorString(status));
+  cudaDeviceProp properties{};
+  status = cudaGetDeviceProperties(&properties, device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "slot property query failed: ",
+      cudaGetErrorString(status));
+  TORCH_CHECK(
+      properties.major == 10 && properties.minor == 0,
+      "slot variant requires compute capability 10.0");
+  TORCH_CHECK(
+      properties.multiProcessorCount == kPersistentSms,
+      "slot variant requires a 148-SM B200");
+  TORCH_CHECK(
+      properties.cooperativeLaunch != 0,
+      "slot variant requires cooperative launch support");
+  TORCH_CHECK(
+      properties.sharedMemPerBlockOptin >=
+          kPersistentSlotDynamicBytes,
+      "slot variant requires 208 KiB dynamic shared memory");
+  ensure_persistent_state();
+}
+
+void launch_persistent_slots(
+    const float* input, float* output) {
+  ensure_persistent_state();
+  int* flags = gPersistentFlags.data_ptr<int>();
+  cudaError_t status = cudaMemsetAsync(
+      flags, 0, kPersistentTasks * sizeof(int), nullptr);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "slot flag reset failed: ",
+      cudaGetErrorString(status));
+  const float* input_argument = input;
+  float* output_argument = output;
+  int* flags_argument = flags;
+  void* arguments[] = {
+      &input_argument, &output_argument, &flags_argument};
+  status = cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(persistent_ll64_slots8_kernel),
+      dim3(kPersistentSlotWorkers, 1, 1),
+      dim3(kPersistentThreads, 1, 1),
+      arguments, kPersistentSlotDynamicBytes, nullptr);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "slot cooperative launch failed: ",
+      cudaGetErrorString(status));
 }
 
 void configure_variant(int variant) {
@@ -2395,6 +3610,125 @@ void write_hybrid_metadata(int64_t* rows, int id, int width) {
   row[28] = width == 64 ? kN / 64 : 0;
   row[30] = row[27] > 0 ? row[27] - 1 : 0;
   row[31] = row[28] > 0 ? row[28] - 1 : 0;
+}
+
+void write_xpotrf_metadata(int64_t* rows, int id, int batch) {
+  int64_t* row =
+      rows + static_cast<int64_t>(id) * kMetadataColumns;
+  const cudaFuncAttributes copy =
+      checked_attributes(copy_xpotrf_kernel);
+  row[0] = id;
+  row[1] = kLibraryLook;
+  row[2] = 64;
+  row[6] = 256;
+  row[15] = copy.numRegs;
+  row[17] = active_blocks(copy_xpotrf_kernel, 256, 0);
+  row[19] = 1 + batch;
+  row[21] = 64;
+  row[23] = 1;
+  row[24] = kFactorCusolver;
+}
+
+void write_persistent_metadata(int64_t* rows) {
+  constexpr int id = 17;
+  configure_persistent();
+  const cudaFuncAttributes factor =
+      checked_attributes(persistent_ll64_static_kernel);
+  int64_t* row =
+      rows + static_cast<int64_t>(id) * kMetadataColumns;
+  row[0] = id;
+  row[1] = kPersistentLook;
+  row[2] = kPersistentTile;
+  row[3] = kApplyPersistentTrsm;
+  row[4] = kMathFp32;
+  row[5] = kMathFp32;
+  row[6] = kPersistentThreads;
+  row[7] = factor.numRegs;
+  row[8] = factor.sharedSizeBytes;
+  row[9] = factor.localSizeBytes;
+  row[10] = kPersistentDynamicBytes;
+  row[11] = factor.numRegs;
+  row[12] = factor.sharedSizeBytes;
+  row[13] = factor.localSizeBytes;
+  row[14] = kPersistentDynamicBytes;
+  row[17] = active_blocks(
+      persistent_ll64_static_kernel,
+      kPersistentThreads,
+      kPersistentDynamicBytes);
+  row[18] = row[17];
+  row[19] = 2;
+  row[20] = 0;
+  row[21] = kPersistentTile;
+  row[22] = 1;
+  row[23] = 1;
+  row[24] = kFactorPersistent;
+  row[25] = kApplyPersistentTrsm;
+  row[26] = 0;
+  row[27] = 0;
+  row[28] = kPersistentTiles;
+  row[29] = 0;
+  row[30] = 0;
+  row[31] = kPersistentTasks - kPersistentTiles;
+  row[32] = 0;
+  row[33] = kPersistentWorkers;
+  row[34] = kPersistentTasks;
+  row[35] = 1;
+  row[36] =
+      (kPersistentWorkers + 1 + kPersistentTasks) *
+      static_cast<int>(sizeof(uint16_t));
+  row[37] = 154;
+  row[38] = 159;
+}
+
+void write_persistent_slots_metadata(int64_t* rows) {
+  constexpr int id = 18;
+  configure_persistent_slots();
+  const cudaFuncAttributes factor =
+      checked_attributes(persistent_ll64_slots8_kernel);
+  int64_t* row =
+      rows + static_cast<int64_t>(id) * kMetadataColumns;
+  row[0] = id;
+  row[1] = kPersistentLook;
+  row[2] = kPersistentTile;
+  row[3] = kApplyPersistentTrsm;
+  row[4] = kMathFp32;
+  row[5] = kMathFp32;
+  row[6] = kPersistentThreads;
+  row[7] = factor.numRegs;
+  row[8] = factor.sharedSizeBytes;
+  row[9] = factor.localSizeBytes;
+  row[10] = kPersistentSlotDynamicBytes;
+  row[11] = factor.numRegs;
+  row[12] = factor.sharedSizeBytes;
+  row[13] = factor.localSizeBytes;
+  row[14] = kPersistentSlotDynamicBytes;
+  row[17] = active_blocks(
+      persistent_ll64_slots8_kernel,
+      kPersistentThreads,
+      kPersistentSlotDynamicBytes);
+  row[18] = row[17];
+  row[19] = 2;
+  row[20] = 0;
+  row[21] = kPersistentTile;
+  row[22] = 1;
+  row[23] = 1;
+  row[24] = kFactorPersistent;
+  row[25] = kApplyPersistentTrsm;
+  row[26] = 0;
+  row[27] = 0;
+  row[28] = kPersistentTiles;
+  row[29] = 0;
+  row[30] = 0;
+  row[31] = kPersistentTasks - kPersistentTiles;
+  row[32] = 0;
+  row[33] = kPersistentSlotWorkers;
+  row[34] = kPersistentTasks;
+  row[35] = 1;
+  row[36] =
+      (kPersistentSlotWorkers + 1 + kPersistentTasks) *
+      static_cast<int>(sizeof(uint16_t));
+  row[37] = 308;
+  row[38] = 311;
 }
 
 template <int Id>
@@ -2641,7 +3975,19 @@ at::Tensor cholesky_b1n4096_leaf_metadata() {
 void cholesky_b1n4096_prepare(int64_t variant) {
   TORCH_CHECK(
       variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 15]");
+      "native variant must be in [1, 18]");
+  if (variant == 16) {
+    prepare_xpotrf();
+    return;
+  }
+  if (variant == 17) {
+    configure_persistent();
+    return;
+  }
+  if (variant == 18) {
+    configure_persistent_slots();
+    return;
+  }
   if (variant >= 8) {
     ensure_hybrid_state();
   }
@@ -2651,12 +3997,30 @@ void cholesky_b1n4096_prepare(int64_t variant) {
 void cholesky_b1n4096_out(
     const at::Tensor& data, at::Tensor output, int64_t variant) {
   check_input(data);
-  check_output(data, output);
   TORCH_CHECK(
       variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 15]");
+      "native variant must be in [1, 18]");
   c10::cuda::CUDAGuard device_guard(data.device());
   const int selected = static_cast<int>(variant);
+  if (selected == 16) {
+    check_xpotrf_output(data, output);
+    launch_xpotrf(
+        data.data_ptr<float>(), output.data_ptr<float>(), data);
+    return;
+  }
+  if (selected == 17) {
+    check_output(data, output);
+    launch_persistent(
+        data.data_ptr<float>(), output.data_ptr<float>());
+    return;
+  }
+  if (selected == 18) {
+    check_output(data, output);
+    launch_persistent_slots(
+        data.data_ptr<float>(), output.data_ptr<float>());
+    return;
+  }
+  check_output(data, output);
   if (selected == 8 || selected == 10) {
     launch_hybrid(
         data.data_ptr<float>(), output.data_ptr<float>(),
@@ -2703,7 +4067,13 @@ void cholesky_b1n4096_out(
 
 at::Tensor cholesky_b1n4096(
     const at::Tensor& data, int64_t variant) {
-  auto output = at::empty_like(data);
+  auto output =
+      variant == 16
+          ? at::empty_strided(
+                {1, kN, kN},
+                {static_cast<int64_t>(kN) * kN, 1, kN},
+                data.options())
+          : at::empty_like(data);
   cholesky_b1n4096_out(data, output, variant);
   return output;
 }
@@ -2728,10 +4098,16 @@ at::Tensor cholesky_b1n4096_metadata() {
   write_recursive_metadata<13>(rows);
   write_recursive_metadata<14>(rows);
   write_recursive_metadata<15>(rows);
+  write_xpotrf_metadata(rows, 16, 1);
+  write_persistent_metadata(rows);
+  write_persistent_slots_metadata(rows);
   return result;
 }
 """
 
+_CUDA_SOURCE = _CUDA_SOURCE.replace(
+    "__PERSISTENT_SCHEDULE__", _persistent_schedule_source()
+)
 
 
 @lru_cache(maxsize=1)
@@ -2768,7 +4144,7 @@ def _native_module():
                 "-gencode",
                 "arch=compute_100a,code=sm_100a",
             ],
-            extra_ldflags=["-lcublas"],
+            extra_ldflags=["-lcublas", "-lcusolver"],
             verbose=False,
         )
     finally:
@@ -2861,7 +4237,8 @@ def _run_variant(
         return _run_compiled_hybrid(data, out)
     module = _native_module()
     if variant not in _PREPARED_VARIANTS:
-        module.prepare(variant)
+        with torch.cuda.device(data.device):
+            module.prepare(variant)
         _PREPARED_VARIANTS.add(variant)
     module.profile(os.environ.get("CHOLESKY_PROFILE_NVTX") == "1")
     if out is None:

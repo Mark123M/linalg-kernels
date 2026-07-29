@@ -11,7 +11,7 @@ from torch.utils.cpp_extension import load_inline
 # The tuner replaces this exact line in retained candidate copies. Variant 2
 # 11 is the tracked default: it avoids cuSOLVER's pathological large-matrix
 # batched dispatch. See DESIGN.md for the registry and measurement record.
-_DEFAULT_VARIANT = 11  # POPCORN_VARIANT
+_DEFAULT_VARIANT = 12  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "torch_cusolver",
     "ll_nb512_m64_fused_split2_tf32",
@@ -25,10 +25,11 @@ _VARIANT_NAMES = (
     "hybrid_cpu_potrf64_compile",
     "hybrid_cpu_potrf128_aten",
     "torch_per_matrix_loop",
+    "native_xpotrf_lower_fused_copy",
 )
 _VARIANT_COUNT = len(_VARIANT_NAMES)
 _VARIANT_IDS = tuple(range(_VARIANT_COUNT))
-_NATIVE_VARIANTS = (1, 2, 3, 4, 5, 6, 7, 8, 10)
+_NATIVE_VARIANTS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12)
 
 _METADATA_COLUMNS = (
     "variant",
@@ -114,6 +115,7 @@ _CUDA_SOURCE = r"""
 #include <ATen/ops/linalg_cholesky_ex.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 #include <torch/extension.h>
@@ -121,6 +123,7 @@ _CUDA_SOURCE = r"""
 #include <array>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -129,7 +132,8 @@ constexpr int kN = 4096;
 constexpr int64_t kMatrixStride =
     static_cast<int64_t>(kN) * kN;
 constexpr int kPanelLd = 9;
-constexpr int kVariantCount = 11;
+constexpr int kLegacyVariantCount = 11;
+constexpr int kVariantCount = 13;
 constexpr int kMetadataColumns = 33;
 
 constexpr int kLeftLook = 0;
@@ -142,6 +146,8 @@ constexpr int kApplyWhole = 0;
 constexpr int kApplySplit2 = 1;
 constexpr int kDirectLook = 1;
 constexpr int kHybridLook = 2;
+constexpr int kLibraryLook = 4;
+constexpr int kFactorCusolver = 7;
 
 bool gProfileRanges = false;
 cudaEvent_t gPanelReady = nullptr;
@@ -151,6 +157,14 @@ at::Tensor gHostInfo64;
 at::Tensor gHostPanel128;
 at::Tensor gHostFactor128;
 at::Tensor gHostInfo128;
+cusolverDnHandle_t gXpotrfHandle = nullptr;
+cusolverDnParams_t gXpotrfParams = nullptr;
+at::Tensor gXpotrfDeviceWorkspace;
+at::Tensor gXpotrfInfo;
+std::vector<char> gXpotrfHostWorkspace;
+size_t gXpotrfDeviceBytes = 0;
+size_t gXpotrfHostBytes = 0;
+int gXpotrfDevice = -1;
 
 class ProfileRange {
  public:
@@ -275,13 +289,13 @@ constexpr std::array<int, sizeof...(Ids)> min_micro_of(
 }
 
 constexpr auto kVariantUsesFlags =
-    flags_usage_of(std::make_integer_sequence<int, kVariantCount>{});
+    flags_usage_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantUsesScratch =
-    scratch_usage_of(std::make_integer_sequence<int, kVariantCount>{});
+    scratch_usage_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantMicro =
-    micro_of(std::make_integer_sequence<int, kVariantCount>{});
+    micro_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 constexpr auto kVariantMinMicro =
-    min_micro_of(std::make_integer_sequence<int, kVariantCount>{});
+    min_micro_of(std::make_integer_sequence<int, kLegacyVariantCount>{});
 
 __device__ __forceinline__ int64_t matrix_index(
     int row, int column) {
@@ -1035,6 +1049,38 @@ void copy_lower_kernel(
   }
 }
 
+__global__ __launch_bounds__(256)
+void copy_xpotrf_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output) {
+  constexpr int64_t quads = static_cast<int64_t>(kN) * kN / 4;
+  constexpr int quads_per_row = kN / 4;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / quads_per_row);
+    const int column =
+        static_cast<int>(quad % quads_per_row) * 4;
+    const float4* source =
+        reinterpret_cast<const float4*>(input) + quad;
+    float4 value;
+    if (column >= row) {
+      value = __ldcg(source);
+    } else if (column + 3 < row) {
+      value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+      const float4 loaded = __ldcg(source);
+      value.x = column >= row ? loaded.x : 0.0f;
+      value.y = column + 1 >= row ? loaded.y : 0.0f;
+      value.z = column + 2 >= row ? loaded.z : 0.0f;
+      value.w = loaded.w;
+    }
+    __stcg(reinterpret_cast<float4*>(output) + quad, value);
+  }
+}
+
 template <int Micro>
 __global__ __launch_bounds__(256)
 void copy_back_kernel(
@@ -1234,6 +1280,93 @@ void launch_copy(const float* input, float* output) {
         &config, copy_lower_kernel,
         input + static_cast<int64_t>(batch) * kMatrixStride,
         output + static_cast<int64_t>(batch) * kMatrixStride);
+  }
+}
+
+void launch_xpotrf_copy(const float* input, float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(512, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  for (int batch = 0; batch < kBatch; ++batch) {
+    cudaLaunchKernelEx(
+        &config, copy_xpotrf_kernel,
+        input + static_cast<int64_t>(batch) * kMatrixStride,
+        output + static_cast<int64_t>(batch) * kMatrixStride);
+  }
+}
+
+void check_cusolver(cusolverStatus_t status, const char* role) {
+  TORCH_CHECK(
+      status == CUSOLVER_STATUS_SUCCESS,
+      role, " failed with cuSOLVER status ", static_cast<int>(status));
+}
+
+void ensure_xpotrf_state(
+    const at::Tensor& like, float* matrix) {
+  const int device = like.get_device();
+  if (gXpotrfHandle == nullptr) {
+    check_cusolver(
+        cusolverDnCreate(&gXpotrfHandle),
+        "create Xpotrf handle");
+  }
+  if (gXpotrfParams == nullptr) {
+    check_cusolver(
+        cusolverDnCreateParams(&gXpotrfParams),
+        "create Xpotrf parameters");
+  }
+  if (
+      gXpotrfDevice == device &&
+      gXpotrfDeviceWorkspace.defined() &&
+      gXpotrfInfo.defined()) {
+    return;
+  }
+  check_cusolver(
+      cusolverDnXpotrf_bufferSize(
+          gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+          static_cast<int64_t>(kN), CUDA_R_32F, matrix,
+          static_cast<int64_t>(kN), CUDA_R_32F,
+          &gXpotrfDeviceBytes, &gXpotrfHostBytes),
+      "query Xpotrf workspace");
+  gXpotrfDeviceWorkspace = at::empty(
+      {static_cast<int64_t>(gXpotrfDeviceBytes)},
+      like.options().dtype(at::kByte));
+  gXpotrfInfo = at::empty({1}, like.options().dtype(at::kInt));
+  gXpotrfHostWorkspace.resize(gXpotrfHostBytes);
+  gXpotrfDevice = device;
+}
+
+void prepare_xpotrf() {
+  auto probe = at::empty(
+      {kMatrixStride},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+  ensure_xpotrf_state(probe, probe.data_ptr<float>());
+}
+
+void launch_xpotrf(
+    const float* input, float* output,
+    const at::Tensor& like) {
+  launch_xpotrf_copy(input, output);
+  ensure_xpotrf_state(like, output);
+  void* device_workspace =
+      gXpotrfDeviceBytes == 0
+          ? nullptr
+          : gXpotrfDeviceWorkspace.data_ptr<uint8_t>();
+  void* host_workspace =
+      gXpotrfHostBytes == 0
+          ? nullptr
+          : gXpotrfHostWorkspace.data();
+  for (int batch = 0; batch < kBatch; ++batch) {
+    float* matrix =
+        output + static_cast<int64_t>(batch) * kMatrixStride;
+    check_cusolver(
+        cusolverDnXpotrf(
+            gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+            static_cast<int64_t>(kN), CUDA_R_32F, matrix,
+            static_cast<int64_t>(kN), CUDA_R_32F,
+            device_workspace, gXpotrfDeviceBytes,
+            host_workspace, gXpotrfHostBytes,
+            gXpotrfInfo.data_ptr<int>()),
+        "run Xpotrf");
   }
 }
 
@@ -1619,6 +1752,20 @@ void check_output(
       output.device() == data.device(), "output device mismatch");
 }
 
+void check_xpotrf_output(
+    const at::Tensor& data, const at::Tensor& output) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(
+      output.scalar_type() == at::kFloat, "output must be float32");
+  TORCH_CHECK(output.sizes() == data.sizes(), "output shape mismatch");
+  TORCH_CHECK(
+      output.device() == data.device(), "output device mismatch");
+  TORCH_CHECK(
+      output.stride(0) == kMatrixStride &&
+      output.stride(1) == 1 && output.stride(2) == kN,
+      "Xpotrf output must use column-major matrix strides");
+}
+
 template <typename Kernel>
 void configure_dynamic(Kernel kernel, int dynamic_bytes) {
   cudaError_t status = cudaFuncSetAttribute(
@@ -1872,6 +2019,23 @@ void write_hybrid_metadata(int64_t* rows, int id, int width) {
   row[31] = row[28] > 0 ? row[28] - 1 : 0;
 }
 
+void write_xpotrf_metadata(int64_t* rows, int id, int batch) {
+  int64_t* row =
+      rows + static_cast<int64_t>(id) * kMetadataColumns;
+  const cudaFuncAttributes copy =
+      checked_attributes(copy_xpotrf_kernel);
+  row[0] = id;
+  row[1] = kLibraryLook;
+  row[2] = 64;
+  row[6] = 256;
+  row[15] = copy.numRegs;
+  row[17] = active_blocks(copy_xpotrf_kernel, 256, 0);
+  row[19] = 1 + batch;
+  row[21] = 64;
+  row[23] = 1;
+  row[24] = kFactorCusolver;
+}
+
 }  // namespace
 
 void cholesky_b2n4096_profile(bool enabled) {
@@ -1925,8 +2089,12 @@ void cholesky_b2n4096_hybrid_finish(
 
 void cholesky_b2n4096_prepare(int64_t variant) {
   TORCH_CHECK(
-      variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 10]");
+      (variant >= 1 && variant <= 10) || variant == 12,
+      "native variant must be in [1, 10] or equal to 12");
+  if (variant == 12) {
+    prepare_xpotrf();
+    return;
+  }
   if (variant >= 8) {
     ensure_hybrid_state();
   }
@@ -1936,12 +2104,18 @@ void cholesky_b2n4096_prepare(int64_t variant) {
 void cholesky_b2n4096_out(
     const at::Tensor& data, at::Tensor output, int64_t variant) {
   check_input(data);
-  check_output(data, output);
   TORCH_CHECK(
-      variant >= 1 && variant < kVariantCount,
-      "native variant must be in [1, 10]");
+      (variant >= 1 && variant <= 10) || variant == 12,
+      "native variant must be in [1, 10] or equal to 12");
   c10::cuda::CUDAGuard device_guard(data.device());
   const int selected = static_cast<int>(variant);
+  if (selected == 12) {
+    check_xpotrf_output(data, output);
+    launch_xpotrf(
+        data.data_ptr<float>(), output.data_ptr<float>(), data);
+    return;
+  }
+  check_output(data, output);
   if (selected == 8 || selected == 10) {
     launch_hybrid(
         data.data_ptr<float>(), output.data_ptr<float>(),
@@ -1986,7 +2160,13 @@ void cholesky_b2n4096_out(
 
 at::Tensor cholesky_b2n4096(
     const at::Tensor& data, int64_t variant) {
-  auto output = at::empty_like(data);
+  auto output =
+      variant == 12
+          ? at::empty_strided(
+                {kBatch, kN, kN},
+                {kMatrixStride, 1, kN},
+                data.options())
+          : at::empty_like(data);
   cholesky_b2n4096_out(data, output, variant);
   return output;
 }
@@ -2006,6 +2186,7 @@ at::Tensor cholesky_b2n4096_metadata() {
   write_hybrid_metadata(rows, 8, 64);
   write_hybrid_metadata(rows, 9, 64);
   write_hybrid_metadata(rows, 10, 128);
+  write_xpotrf_metadata(rows, 12, kBatch);
   return result;
 }
 """
@@ -2046,7 +2227,7 @@ def _native_module():
                 "-gencode",
                 "arch=compute_100a,code=sm_100a",
             ],
-            extra_ldflags=["-lcublas"],
+            extra_ldflags=["-lcublas", "-lcusolver"],
             verbose=False,
         )
     finally:
@@ -2154,7 +2335,8 @@ def _run_variant(
         return _run_compiled_hybrid(data, out)
     module = _native_module()
     if variant not in _PREPARED_VARIANTS:
-        module.prepare(variant)
+        with torch.cuda.device(data.device):
+            module.prepare(variant)
         _PREPARED_VARIANTS.add(variant)
     module.profile(os.environ.get("CHOLESKY_PROFILE_NVTX") == "1")
     if out is None:

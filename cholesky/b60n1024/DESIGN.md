@@ -402,3 +402,95 @@ use a `cutlass_` prefix.
 The 2026-07-28 runner autotune retained variant 9. Median mean time was
 2.200835 ms for variant 10 versus 2.201686 ms for variant 9, which was faster
 but below the 0.5% promotion gate.
+
+## Persistent CPU--GPU lookahead experiment
+
+Variants 11, 12, and 13 are append-only hybrid candidates; variant 9 remains
+the tracked default. The 2026-07-29 variant-9 Systems trace has a 2.207 ms
+kernel span with no kernel overlap. Factor work totals 1.017 ms, including
+four approximately 150 us width-128 factors. Those launches contain only 60
+blocks for 148 SMs, so a partial CPU split cannot remove their single GPU
+wave. All three hybrid candidates therefore send all 60 width-128 diagonal
+tiles to the CPU and retain GPU-only width-64 and width-32 tails.
+
+One 256-thread cooperative kernel owns the complete factorization. Its
+296-block grid is constrained to two resident blocks on each B200 SM. It
+reuses the precise shape-local factor and solve routines, the TF32 Tensor
+Core rank-128 update, and lower-only FP32 tail updates. The hybrid update
+uses warp-level `mma.sync.m16n8k8` with TF32 inputs and FP32 accumulators;
+it deliberately avoids TCGen05 because that instruction class reserves an
+SM-wide virtual resource and limits a kernel entry to one resident CTA.
+After each panel
+solve, the three 64x64 tiles forming the next 128x128 diagonal are updated
+first and packed directly into mapped pinned storage. The CPU begins POTRF
+after that generation is published while the resident grid processes all
+other lower trailing tiles. The CPU factor is consumed only after the
+trailing work and CPU generation have both completed.
+
+Ready, completed, abort, and final generations occupy separate cache lines.
+The GPU uses system-scope PTX acquire/release loads and stores; the CPU uses
+matching C++ acquire/release operations. No atomic read-modify-write is used.
+The wait binding releases the GIL, has a 30-second failure bound, and the
+abort generation lets every cooperative block leave the scheduler before
+exit. Panel and factor buffers are cacheable pinned tensors of shape
+`(60,128,128)`.
+
+Variant 11 compiles fixed-shape `cholesky_ex`; variant 12 compiles a
+four-step blocked-32 recurrence containing batched POTRF, triangular solve,
+and matrix-product updates. Both use full-graph static Inductor
+`max-autotune`, warm before timing, and use at most 60 CPUs from the process
+affinity. Profiling emits separate CPU wait, POTRF, and publish NVTX ranges
+for every outer panel.
+
+Variant 13 keeps exactly the same persistent GPU work and mapped-memory
+protocol, but replaces the opaque batched PyTorch POTRF with a native outer
+batch loop. The extension is built with OpenMP enabled, so
+`at::parallel_for(0, 60, 1)` assigns independent matrices to the PyTorch CPU
+team. Each worker sets its MKL-local thread count to one, copies one packed
+lower panel directly into the mapped factor buffer, and invokes the exported
+single-matrix FP32 LAPACK Cholesky routine. The input is row-major and only
+its lower triangle is populated, so it is reinterpreted as column-major and
+factored with `uplo=U`; the resulting row-major lower factor is precisely the
+triangle consumed by the GPU. The binding releases the GIL and returns the
+first failing one-based batch index. Its NVTX role is `mkl_outer`.
+
+This third backend is deliberately a native comparison rather than another
+Inductor graph. Inspection of the generated variant-11 graph showed that
+`torch.compile` delegates the whole operation to the opaque
+`aten.linalg_cholesky_ex` CPU operator. That operator iterates over the batch
+internally, so compilation does not create matrix-level parallelism. Variants
+11 and 12 remain the warmed `torch.compile` controls required to distinguish
+the scheduling change from the GPU pipeline.
+
+The first variant-11 Modal preflight on 2026-07-29 rejected the kernel
+before launch: the 124-register binary admitted only one resident block per
+SM instead of the required two. A kernel-local `__maxnreg__(120)` ceiling
+reduced the compiled entry to 119 registers per thread with zero stack and
+zero local memory, but the repeated preflight still reported one. Cubin
+metadata then identified the actual limiter as
+`EIATTR_TCGEN05_1CTA_USED`, not registers. The persistent update was changed
+to warp-level TF32 MMA, removing that entry attribute. The resulting binary
+uses 96 registers per thread with zero stack and zero local memory. Register
+allocation admits two blocks, while 76 KiB dynamic shared memory plus the
+per-block reservation admits two but not three, so the static residency is
+exactly two. Both native and cutlass-renamed extensions compile with this
+revision.
+
+The repeated variant-11 B200 run succeeded and confirmed two resident blocks
+per SM, but regressed to a 28.319 ms persistent-kernel span. Its four CPU
+POTRF ranges measured 6.197, 6.022, 5.837, and 5.461 ms, totaling 23.516 ms;
+CPU wait ranges added 2.624 ms. This identifies the compiled CPU solver, not
+the mapped-memory handshake, as the dominant limiter. The GPU and CPU ranges
+did overlap, correctness passed with a scaled residual of `0.6594 < 16`, and
+the trace contained one persistent launch rather than a chain of small
+launches.
+
+The native backend passed a local fixed-shape numerical check with zero
+failure status, zero upper triangle for the packed input convention, and a
+maximum relative reconstruction residual below `2.0e-7`. Local compilation
+also confirmed the OpenMP outer path and one-thread MKL control entry. No
+B200 timing claim is made for variant 13 yet. Its required next evidence is a
+variant-13 Modal preflight and Systems report showing all four `mkl_outer`
+ranges and their overlap with the persistent kernel. Promotion still
+requires every public row to pass and at least a 0.5% median-mean gain over
+variant 9.

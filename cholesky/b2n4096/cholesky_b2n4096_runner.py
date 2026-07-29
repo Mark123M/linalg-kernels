@@ -43,6 +43,7 @@ VARIANT_NAMES = (
     "hybrid_cpu_potrf64_compile",
     "hybrid_cpu_potrf128_aten",
     "torch_per_matrix_loop",
+    "native_xpotrf_lower_fused_copy",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(

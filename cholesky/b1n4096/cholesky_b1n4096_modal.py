@@ -10,7 +10,9 @@ Examples:
     .venv/bin/python -m modal run cholesky/b1n4096/cholesky_b1n4096_modal.py \
         --panel-ncu-configs 32,57
     .venv/bin/python -m modal run cholesky/b1n4096/cholesky_b1n4096_modal.py \
-        --ncu-variant 0
+        --ncu-variant 17
+    .venv/bin/python -m modal run cholesky/b1n4096/cholesky_b1n4096_modal.py \
+        --ncu-variant 18
 
 The default ``--variant -1`` resolves to the tracked ``_DEFAULT_VARIANT``.
 Input construction, extension compilation, preparation, warmup, and
@@ -560,7 +562,16 @@ def _worker_profile(requested: int) -> None:
     variant = _resolve_variant(solution, requested)
     name = _variant_name(solution, variant)
     data = _make_input()
-    output = torch.empty_like(data)
+    output = (
+        torch.empty_strided(
+            data.shape,
+            (N * N, 1, N),
+            dtype=data.dtype,
+            device=data.device,
+        )
+        if name == "native_xpotrf_lower_fused_copy"
+        else torch.empty_like(data)
+    )
     solution._run_variant(data, variant, output)
     torch.cuda.synchronize()
 
@@ -880,10 +891,24 @@ def profile_variant_ncu(
     solution = _load_solution()
     variant = _resolve_variant(solution, requested_variant)
     name = _variant_name(solution, variant)
-    if variant != 0:
+    if variant not in (0, 17, 18):
         raise ValueError(
-            "the full-factorization NCU endpoint currently targets "
-            "variant 0's cuSOLVER kernel"
+            "the full-factorization NCU endpoint targets variants 0, 17, and 18"
+        )
+    if variant == 0:
+        kernel_pattern = "getrf_wo_pivot"
+        target_description = (
+            "Torch/cuSOLVER fused getrf_wo_pivot factorization kernel"
+        )
+    elif variant == 17:
+        kernel_pattern = "persistent_ll64_static_kernel"
+        target_description = (
+            "static 296-worker persistent FP32 factorization kernel"
+        )
+    else:
+        kernel_pattern = "persistent_ll64_slots8_kernel"
+        target_description = (
+            "148-worker persistent FP32 kernel with eight shared slots"
         )
     output_dir = (
         Path("/cache/ncu") / run_name / f"v{variant}_{name}"
@@ -927,7 +952,7 @@ def profile_variant_ncu(
         "--kernel-name-base",
         "demangled",
         "--kernel-name",
-        "regex:getrf_wo_pivot",
+        f"regex:{kernel_pattern}",
         "--launch-count",
         "1",
         "--set",
@@ -973,7 +998,7 @@ def profile_variant_ncu(
     report_path = report_base.with_suffix(".ncu-rep")
     if not report_path.is_file() or report_path.stat().st_size == 0:
         raise RuntimeError(
-            "ncu completed without the cuSOLVER getrf_wo_pivot report"
+            f"ncu completed without the {kernel_pattern} report"
         )
     for artifact_name, extra in (
         ("ncu-details.txt", ()),
@@ -1008,8 +1033,8 @@ def profile_variant_ncu(
                     "no metric is silently substituted."
                 ),
                 "target": (
-                    "Torch/cuSOLVER fused getrf_wo_pivot factorization "
-                    "kernel for exact shape (1,4096,4096)"
+                    f"{target_description} for exact shape "
+                    "(1,4096,4096)"
                 ),
             },
             indent=2,
@@ -1327,7 +1352,7 @@ def main(
                 print(f"downloaded {local_path}")
         return
     if ncu_variant != -2:
-        run_name = f"b{BATCH}_n{N}_torch_ncu_{_timestamp()}"
+        run_name = f"b{BATCH}_n{N}_variant_ncu_{_timestamp()}"
         resolved_variant, name, remote_paths = profile_variant_ncu.remote(
             ncu_variant, run_name
         )

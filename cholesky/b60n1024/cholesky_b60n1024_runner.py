@@ -42,6 +42,9 @@ VARIANT_NAMES = (
     "staged_p128_to_p64_at_r512_tf32",
     "staged_p128_p64_p32_at_r512_r128_tf32",
     "staged_p128_p64_p32_at_r512_r128_tf32_cutlass_names",
+    "hybrid_persistent_p128_cpu_lapack",
+    "hybrid_persistent_p128_cpu_blocked32",
+    "hybrid_persistent_p128_cpu_mkl_outer",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -120,7 +123,7 @@ def _variant_source(source: str, variant: int) -> str:
         )
     ast.parse(rendered)
     rejected = "stream"
-    if rejected in rendered:
+    if rejected in rendered.casefold():
         raise RuntimeError(
             f"rendered submission contains rejected token: {rejected}"
         )

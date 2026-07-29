@@ -47,6 +47,9 @@ VARIANT_NAMES = (
     "ll_nb256_leaf256_fused_ll_ib32_lb8_trsm",
     "ll_nb512_rec128_fused_ll_ib32_lb32_inverse_gemm",
     "ll_nb512_rec128_fused_ll_ib32_lb32_fp32",
+    "native_xpotrf_lower_fused_copy",
+    "persistent_ll64_static296_fp32",
+    "persistent_ll64_slots8_colmajor_fp32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
 DEFAULT_MARKER = re.compile(
@@ -443,12 +446,13 @@ def _atomic_promote(
 
 def _autotune(args: argparse.Namespace) -> Path:
     variants = _parse_variants(args.variants)
+    reference_variant = _tracked_default()
     if args.rounds <= 0 or args.max_workers <= 0:
         raise ValueError("rounds and max-workers must be positive")
-    if not args.no_promote and BASELINE_VARIANT not in variants:
+    if not args.no_promote and reference_variant not in variants:
         raise ValueError(
-            f"promotion requires current default {BASELINE_VARIANT} in "
-            "the sweep so the 0.5% gate uses a contemporaneous baseline"
+            f"promotion requires current default {reference_variant} in "
+            "the sweep so the 0.5% gate uses a contemporaneous reference"
         )
     help_text = _preflight_output(args.popcorn)
     _cli_id()
@@ -560,9 +564,11 @@ def _autotune(args: argparse.Namespace) -> Path:
         )
     )
     summary_path = run_dir / "summary.json"
-    native_ranking = [
+    candidate_ranking = [
         item for item in ranking
-        if item["variant"] != BASELINE_VARIANT
+        if item["variant"] not in (
+            BASELINE_VARIANT, reference_variant
+        )
     ]
     baseline = next(
         (
@@ -571,22 +577,29 @@ def _autotune(args: argparse.Namespace) -> Path:
         ),
         None,
     )
+    reference = next(
+        (
+            item for item in ranking
+            if item["variant"] == reference_variant
+        ),
+        None,
+    )
     promotion = "disabled"
     promoted_variant: int | None = None
     threshold: decimal.Decimal | None = None
     winner: dict[str, Any] | None = (
-        native_ranking[0] if native_ranking else None
+        candidate_ranking[0] if candidate_ranking else None
     )
     if not args.no_promote:
-        if baseline is None:
-            promotion = "retained_default_baseline_failed"
+        if reference is None:
+            promotion = "retained_default_reference_failed"
         elif winner is None:
-            promotion = "retained_default_no_native_winner"
+            promotion = "retained_default_no_candidate_winner"
         else:
-            baseline_mean = decimal.Decimal(
-                baseline["median_mean_ns"]
+            reference_mean = decimal.Decimal(
+                reference["median_mean_ns"]
             )
-            threshold = baseline_mean * PROMOTION_RATIO
+            threshold = reference_mean * PROMOTION_RATIO
             winner_mean = decimal.Decimal(
                 winner["median_mean_ns"]
             )
@@ -623,6 +636,8 @@ def _autotune(args: argparse.Namespace) -> Path:
             "ranking": ranking,
             "best_native": winner,
             "baseline": baseline,
+            "promotion_reference": reference,
+            "reference_variant": reference_variant,
             "promotion_ratio": str(PROMOTION_RATIO),
             "promotion_threshold_ns": (
                 str(threshold) if threshold is not None else None
@@ -633,7 +648,8 @@ def _autotune(args: argparse.Namespace) -> Path:
         },
     )
     print(
-        f"best_native={winner} baseline={baseline} "
+        f"best_candidate={winner} reference={reference} "
+        f"baseline={baseline} "
         f"promotion={promotion}",
         flush=True,
     )
