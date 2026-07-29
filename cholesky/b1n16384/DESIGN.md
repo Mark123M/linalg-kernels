@@ -198,3 +198,24 @@ use a `cutlass_` prefix.
 The 2026-07-28 runner autotune retained variant 0. Median mean time was
 15.128629 ms for variant 0 versus 15.161088 ms for variant 7, so the
 cutlass-named clone was rejected.
+
+## Full-grid 64-square wavefront experiment
+
+Append-only variants 8 and 9 schedule all 32,896 lower 64-square tiles in one
+ordinary grid. Each 256-thread CTA waits for lower-ID history tiles, applies
+the complete left-looking update, runs FP32 POTRF64 or TRSM64, stores the
+result, zeros its upper mirror, and release-publishes completion.
+
+ID 8 uses the bank-conflict-free scalar FP32 mapping measured in the
+corrected b1n4096 persistent experiment. ID 9 changes only the history update
+to 16-by-16-by-8 TF32 WMMA with explicit conversion and FP32 accumulation.
+Three padded 64-by-68 buffers consume 52,224 shared bytes. CUDA 13.1
+`sm_100a` compilation succeeds with zero stack and spills; FP32/TF32 use
+128/158 registers per thread.
+
+The flag protocol is also used by the prior full-grid QR winner at
+`references/qr-kernels/gaunernst.py`. CUDA does not promise ordinary block
+ordering, so these are B200-specific experiments. No B200 correctness,
+no-hang, or timing result exists yet, and variant 0 remains the default.
+Promotion requires exact-shape property checks, 100 repeated launches, and
+the existing 0.5% three-round gate.

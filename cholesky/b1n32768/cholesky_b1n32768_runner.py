@@ -34,6 +34,7 @@ TARGET_BENCHMARK_INDEX = 14
 DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
 CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 API_TIMEOUT_SECONDS = 30
+PROMOTION_RATIO = decimal.Decimal("0.995")
 VARIANT_NAMES = (
     "ll_nb1024_strsm_fp32_all",
     "ll_nb1024_strsm_tf32_big",
@@ -54,8 +55,11 @@ VARIANT_NAMES = (
     "ll_nb1024_m128_to_m64_at_r8192_tf32",
     "ll_nb1024_m128_m64_m32_at_r8192_r1024_tf32",
     "ll_nb1024_invgemm_tf32_cutlass_names",
+    "tilegrid64_fp32",
+    "tilegrid64_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
+WAVEFRONT_VARIANTS = (19, 20)
 DEFAULT_MARKER = re.compile(
     r"^_DEFAULT_VARIANT = (\d+)  # POPCORN_VARIANT$", re.MULTILINE
 )
@@ -132,7 +136,7 @@ def _variant_source(source: str, variant: int) -> str:
         )
     ast.parse(rendered)
     rejected = "stream"
-    if rejected in rendered:
+    if rejected in rendered.lower():
         raise RuntimeError(
             f"rendered submission contains rejected token: {rejected}"
         )
@@ -464,6 +468,20 @@ def _atomic_promote(
 
 def _autotune(args: argparse.Namespace) -> Path:
     variants = _parse_variants(args.variants)
+    current_default = _tracked_default()
+    if current_default not in variants:
+        raise ValueError(
+            f"promotion requires current default {current_default} in "
+            "the sweep so the 0.5% gate has a contemporaneous baseline"
+        )
+    if (
+        any(variant in WAVEFRONT_VARIANTS for variant in variants)
+        and not args.wavefront_validated
+    ):
+        raise ValueError(
+            "wavefront promotion requires --wavefront-validated after "
+            "the six-case, 100-repeat B200 validation"
+        )
     if args.rounds <= 0:
         raise ValueError("--rounds must be positive")
     if args.max_workers <= 0:
@@ -601,9 +619,28 @@ def _autotune(args: argparse.Namespace) -> Path:
         f"winner_v{winner:02d}_{VARIANT_NAMES[winner]}.py"
     )
     shutil.copy2(submissions[winner], winner_source)
-    promotion = _atomic_promote(
-        source_path, source, source_hash, winner
+    baseline = next(
+        (
+            item for item in ranking
+            if item["variant"] == current_default
+        ),
+        None,
     )
+    winner_mean = decimal.Decimal(ranking[0]["median_mean_ns"])
+    threshold: decimal.Decimal | None = None
+    if baseline is None:
+        promotion = "retained_default_baseline_failed"
+    elif winner == current_default:
+        promotion = "retained_default_still_fastest"
+    else:
+        baseline_mean = decimal.Decimal(baseline["median_mean_ns"])
+        threshold = baseline_mean * PROMOTION_RATIO
+        if winner_mean <= threshold:
+            promotion = _atomic_promote(
+                source_path, source, source_hash, winner
+            )
+        else:
+            promotion = "retained_default_below_required_gain"
     _write_json(
         summary_path,
         {
@@ -624,6 +661,10 @@ def _autotune(args: argparse.Namespace) -> Path:
             "ranking": ranking,
             "winner": winner,
             "winner_source": str(winner_source),
+            "baseline_variant": current_default,
+            "promotion_threshold_ns": (
+                str(threshold) if threshold is not None else None
+            ),
             "promotion": promotion,
         },
     )
@@ -856,7 +897,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     autotune.add_argument("--variants", default="all")
     autotune.add_argument("--rounds", type=int, default=3)
-    autotune.add_argument("--max-workers", type=int, default=4)
+    autotune.add_argument("--max-workers", type=int, default=1)
+    autotune.add_argument(
+        "--wavefront-validated",
+        action="store_true",
+        help="confirm the six-case, 100-repeat B200 gate passed",
+    )
     ncu = actions.add_parser(
         "ncu",
         help="capture hosted Brev B200 Nsight Compute reports",

@@ -45,8 +45,11 @@ VARIANT_NAMES = (
     "ll_nb512_m64_to_m32_at_r1024_tf32",
     "ll_nb512_m64_to_m32_at_r2048_tf32",
     "ll_nb512_m64_microfused_split2_tf32_cutlass_names",
+    "tilegrid64_fp32",
+    "tilegrid64_tf32",
 )
 VARIANT_COUNT = len(VARIANT_NAMES)
+WAVEFRONT_VARIANTS = (14, 15)
 DEFAULT_MARKER = re.compile(
     r"^_DEFAULT_VARIANT = (\d+)  # POPCORN_VARIANT$", re.MULTILINE
 )
@@ -122,7 +125,7 @@ def _variant_source(source: str, variant: int) -> str:
         )
     ast.parse(rendered)
     rejected = "stream"
-    if rejected in rendered:
+    if rejected in rendered.lower():
         raise RuntimeError(
             f"rendered submission contains rejected token: {rejected}"
         )
@@ -433,6 +436,14 @@ def _atomic_promote(
 
 def _autotune(args: argparse.Namespace) -> Path:
     variants = _parse_variants(args.variants)
+    if (
+        any(variant in WAVEFRONT_VARIANTS for variant in variants)
+        and not args.wavefront_validated
+    ):
+        raise ValueError(
+            "wavefront promotion requires --wavefront-validated after "
+            "the six-case, 100-repeat B200 validation"
+        )
     if args.rounds <= 0 or args.max_workers <= 0:
         raise ValueError("rounds and max-workers must be positive")
     if BASELINE_VARIANT not in variants:
@@ -829,7 +840,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     autotune.add_argument("--variants", default="all")
     autotune.add_argument("--rounds", type=int, default=3)
-    autotune.add_argument("--max-workers", type=int, default=4)
+    autotune.add_argument("--max-workers", type=int, default=1)
+    autotune.add_argument(
+        "--wavefront-validated",
+        action="store_true",
+        help="confirm the six-case, 100-repeat B200 gate passed",
+    )
     ncu = actions.add_parser(
         "ncu",
         help="capture hosted Brev B200 Nsight Compute reports",

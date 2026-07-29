@@ -417,3 +417,27 @@ use a `cutlass_` prefix.
 The 2026-07-28 runner autotune retained variant 11. Median mean time was
 3.265403 ms for variant 13 versus 3.270027 ms for variant 11, which was faster
 but below the 0.5% promotion gate.
+
+## Full-grid 64-square wavefront experiment
+
+Append-only variants 14--16 implement the variant-16 native-solver principle
+from `b1n4096`: one fixed 256-thread CTA per lower 64-square tile, complete
+left-looking history consumption, CTA-local POTRF64 or TRSM64, and
+device-scope flag publication. There are 528 tasks per matrix and 4,224 CTAs
+for this batch.
+
+ID 14 is scalar FP32. ID 15 replaces only the history update with TF32 WMMA
+and FP32 accumulation. Both use task-major batch interleaving, so adjacent
+CTAs operate on independent matrices at the same DAG position. ID 16 is the
+arithmetic-identical TF32 batch-major control.
+
+The three 64-by-68 shared buffers occupy 52,224 bytes. CUDA 13.1 `sm_100a`
+compilation succeeds with zero stack and spills: FP32 uses 128 registers per
+thread and TF32 uses 158. The release/acquire pattern is corroborated by the
+past full-grid QR winner in `references/qr-kernels/gaunernst.py`.
+
+No B200 correctness, repeated no-hang, or timing result exists yet. Ordinary
+block ordering is not guaranteed by CUDA, so IDs 14--16 remain experimental
+and variant 11 stays the default. Promotion requires exact-shape property
+validation, at least 100 repeated launches, and a three-round median no
+greater than `0.995` times the contemporaneous variant-11 median.

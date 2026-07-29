@@ -1,9 +1,9 @@
-"""Modal B200 Nsight Systems launcher for the b1n8192 Cholesky variants.
+"""Modal B200 Nsight Systems launcher for the b2n2048 Cholesky variants.
 
 Examples:
-    .venv/bin/python -m modal run cholesky/b1n8192/cholesky_b1n8192_modal.py
-    .venv/bin/python -m modal run cholesky/b1n8192/cholesky_b1n8192_modal.py --variant 8
-    .venv/bin/python -m modal run cholesky/b1n8192/cholesky_b1n8192_modal.py \
+    .venv/bin/python -m modal run cholesky/b2n2048/cholesky_b2n2048_modal.py
+    .venv/bin/python -m modal run cholesky/b2n2048/cholesky_b2n2048_modal.py --variant 5
+    .venv/bin/python -m modal run cholesky/b2n2048/cholesky_b2n2048_modal.py \
         --output profiles/cholesky_nsys
 
 The default ``--variant -1`` resolves to the tracked ``_DEFAULT_VARIANT``.
@@ -27,15 +27,15 @@ from typing import Any
 import modal
 
 
-BATCH = 1
-N = 8192
-SEED = 48192
+BATCH = 2
+N = 2048
+SEED = 44048
 LOW_RANK = 32
 
-LOCAL_SOLUTION = "cholesky/b1n8192/cholesky_b1n8192.py"
-LOCAL_SCRIPT = "cholesky/b1n8192/cholesky_b1n8192_modal.py"
-REMOTE_SOLUTION = "/workspace/cholesky_b1n8192.py"
-REMOTE_SCRIPT = "/workspace/cholesky_b1n8192_modal.py"
+LOCAL_SOLUTION = "cholesky/b2n2048/cholesky_b2n2048.py"
+LOCAL_SCRIPT = "cholesky/b2n2048/cholesky_b2n2048_modal.py"
+REMOTE_SOLUTION = "/workspace/cholesky_b2n2048.py"
+REMOTE_SCRIPT = "/workspace/cholesky_b2n2048_modal.py"
 
 CUDA_IMAGE = "nvidia/cuda:13.3.0-devel-ubuntu24.04"
 CUDA_UPDATE_PACKAGES = (
@@ -119,9 +119,9 @@ else:
     nsys_image = _mount_sources(_nsys_base_image())
     validation_image = _mount_sources(_base_image())
 
-app = modal.App("cholesky-b1n8192-nsys-b200", image=nsys_image)
+app = modal.App("cholesky-b2n2048-nsys-b200", image=nsys_image)
 cache_volume = modal.Volume.from_name(
-    "cholesky-b1n8192-cache", create_if_missing=True
+    "cholesky-b2n2048-cache", create_if_missing=True
 )
 
 
@@ -613,7 +613,7 @@ def main(
     output_root = (
         Path(output)
         if output
-        else _repo_root() / "cholesky/b1n8192/artifacts/nsys"
+        else _repo_root() / "cholesky/b2n2048/artifacts/nsys"
     )
     destination = output_root / run_name / f"v{resolved_variant}_{name}"
     for remote_path in remote_paths:

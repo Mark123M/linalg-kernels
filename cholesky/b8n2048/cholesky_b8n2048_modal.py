@@ -114,8 +114,10 @@ def _mount_sources(image: modal.Image) -> modal.Image:
 
 if _WORKER_PROCESS:
     nsys_image = modal.Image.debian_slim()
+    validation_image = modal.Image.debian_slim()
 else:
     nsys_image = _mount_sources(_nsys_base_image())
+    validation_image = _mount_sources(_base_image())
 
 app = modal.App("cholesky-b8n2048-nsys-b200", image=nsys_image)
 cache_volume = modal.Volume.from_name(
@@ -187,6 +189,51 @@ def _make_input():
     data = factors @ factors.transpose(1, 2)
     data.mul_(1.0 / LOW_RANK)
     data.diagonal(dim1=1, dim2=2).add_(4.0)
+    return data.contiguous()
+
+
+def _make_validation_input(case: str, seed: int):
+    import torch
+
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    if case == "diagonal":
+        values = torch.logspace(
+            0.0, 0.7, N, device="cuda", dtype=torch.float32
+        )
+        return torch.diag_embed(values.expand(BATCH, -1)).contiguous()
+    if case == "tridiagonal":
+        data = torch.zeros(
+            (BATCH, N, N), device="cuda", dtype=torch.float32
+        )
+        data.diagonal(dim1=1, dim2=2).fill_(2.5)
+        data.diagonal(offset=1, dim1=1, dim2=2).fill_(-0.5)
+        data.diagonal(offset=-1, dim1=1, dim2=2).fill_(-0.5)
+        return data
+
+    factors = torch.randn(
+        (BATCH, N, LOW_RANK),
+        dtype=torch.float32,
+        device="cuda",
+        generator=generator,
+    )
+    if case == "spectrum":
+        weights = torch.logspace(
+            0.0, -0.7, LOW_RANK,
+            device="cuda", dtype=torch.float32,
+        )
+        factors.mul_(weights)
+    data = factors @ factors.transpose(1, 2)
+    data.mul_(1.0 / LOW_RANK)
+    damping = 0.75 if case == "lowrank" else 4.0
+    data.diagonal(dim1=1, dim2=2).add_(damping)
+    if case == "rowscale":
+        scales = torch.logspace(
+            -0.35, 0.35, N,
+            device="cuda", dtype=torch.float32,
+        )
+        data.mul_(scales.view(1, N, 1))
+        data.mul_(scales.view(1, 1, N))
     return data.contiguous()
 
 
@@ -483,12 +530,85 @@ def profile_nsys(
     )
 
 
+@app.function(
+    image=validation_image,
+    gpu="B200",
+    timeout=1200,
+    volumes={"/cache": cache_volume},
+)
+def validate_wavefront(
+    requested_variant: int,
+    repeats: int = 100,
+) -> dict[str, Any]:
+    import torch
+
+    if repeats < 100:
+        raise ValueError("wavefront validation requires at least 100 repeats")
+    Path("/cache/tmp").mkdir(parents=True, exist_ok=True)
+    solution = _load_solution()
+    variant = _resolve_variant(solution, requested_variant)
+    cases = (
+        "dense",
+        "spectrum",
+        "diagonal",
+        "lowrank",
+        "rowscale",
+        "tridiagonal",
+    )
+    validations: dict[str, Any] = {}
+    for case_index, case in enumerate(cases):
+        data = _make_validation_input(case, SEED + case_index)
+        factor = solution._run_variant(data, variant)
+        torch.cuda.synchronize()
+        reference = torch.linalg.cholesky_ex(
+            data, check_errors=False
+        ).L
+        reference_scaled = _scaled_reconstruction_residual(
+            data, reference
+        )
+        validations[case] = _validate_factor(
+            data, factor, reference_scaled
+        )
+        if not validations[case]["passed"]:
+            raise RuntimeError(
+                f"variant {variant} failed {case} validation"
+            )
+
+    data = _make_validation_input("dense", SEED + 100)
+    output = torch.empty_like(data)
+    solution._run_variant(data, variant, output)
+    torch.cuda.synchronize()
+    for _ in range(repeats):
+        solution._run_variant(data, variant, output)
+    torch.cuda.synchronize()
+    payload = {
+        "shape": [BATCH, N, N],
+        "variant": variant,
+        "name": _variant_name(solution, variant),
+        "repeats": repeats,
+        "cases": validations,
+        "metadata": _metadata(solution, variant),
+        "environment": _environment(),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    return payload
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
 @app.local_entrypoint()
-def main(variant: int = -1, output: str = "") -> None:
+def main(
+    variant: int = -1,
+    output: str = "",
+    validate: bool = False,
+    repeats: int = 100,
+) -> None:
+    if validate:
+        payload = validate_wavefront.remote(variant, repeats)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
     run_name, resolved_variant, name, remote_paths = profile_nsys.remote(variant)
     output_root = (
         Path(output)
