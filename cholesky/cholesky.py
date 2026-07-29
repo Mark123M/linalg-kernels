@@ -32,10 +32,25 @@ submission:
   (60, 1024, 1024)  b60n1024 variant 9
       staged_p128_p64_p32_at_r512_r128_tf32: the same staged schedule sized
       for 1024x1024, narrowing to 64 columns at R=512 and 32 at R=128.
-  (8, 2048, 2048)   b8n2048  variant 11
-      ll_m128_to_m64_at_r1024_tf32: left-looking 128-column panels with one
-      fast-TF32 strided-batched GEMM of the history per panel, narrowing to
-      64-column panels at R=1024.
+  (4, 1024, 1024)   b4n1024  variant 2
+      tilegrid64_tf32_interleaved: full-grid wavefront, one 256-thread CTA
+      per lower 64-square tile, TF32 WMMA history update with FP32
+      accumulation, task-major batch interleaving.
+  (2, 2048, 2048)   b2n2048  variant 1
+      tilegrid64_fp32_interleaved: the same wavefront with a scalar FP32 FMA
+      history update.
+  (8, 2048, 2048)   b8n2048  variant 15
+      tilegrid64_tf32_interleaved: the same wavefront as b4n1024, sized for
+      this shape. All three wavefront shapes share one CUDA source; only
+      kBatch, kN, and the TF32 switch differ.
+  (1, 4096, 4096)   b1n4096  variant 16
+      native_xpotrf_lower_fused_copy: one vectorized triangle copy feeding a
+      direct cusolverDnXpotrf call, returned through a column-major-strided
+      view so no second pass is needed.
+  (2, 4096, 4096)   b2n4096  variant 12
+      native_xpotrf_lower_fused_copy: the same path looped over the two
+      matrices, which avoids cuSOLVER's pathological batched dispatch at this
+      size. Both 4096 shapes share one CUDA source.
   (1, 8192, 8192)   b1n8192  variant 8
       ll_nb512_m64_microfused_split2_tf32: left-looking 512-column panels
       with a fused producer/consumer 64-wide micro block; the inverse
@@ -47,10 +62,6 @@ submission:
       cutlass-named clone of the same schedule at n=32768. Both large-N
       shapes share one CUDA source; only the 32768 module renames its kernel
       entry points.
-
-  (2, 4096, 4096)   b2n4096  variant 11
-      torch_per_matrix_loop: no custom kernel. cuSOLVER's batched POTRF is
-      pathological at this shape, so each matrix is factored on its own.
 
 Every other benchmark and test shape uses
 torch.linalg.cholesky_ex(..., check_errors=False).L.
@@ -3435,58 +3446,67 @@ def _module_b60n1024():
 
 
 # ---------------------------------------------------------------------------
-# (8, 2048, 2048) - b8n2048 variant 11
+# Full-grid 64-square wavefront - one CUDA source shared by three shapes
+#   (4, 1024, 1024)  b4n1024 variant 2   tilegrid64_tf32_interleaved
+#   (2, 2048, 2048)  b2n2048 variant 1   tilegrid64_fp32_interleaved
+#   (8, 2048, 2048)  b8n2048 variant 15  tilegrid64_tf32_interleaved
+#
+# One fixed 256-thread CTA per lower 64-square tile. Each CTA consumes the
+# complete left-looking history for its tile, then runs either a CTA-local
+# POTRF64 (diagonal tile) or a TRSM64 against the already published diagonal
+# factor, and publishes a device-scope flag. Task-major batch interleaving
+# puts adjacent CTAs on independent matrices at the same DAG position.
 # ---------------------------------------------------------------------------
 
-_CPP_SOURCE_B8N2048 = r"""
+_CPP_SOURCE_WAVEFRONT = r"""
 #include <torch/extension.h>
 
-void cholesky_b8n2048_prepare();
-at::Tensor cholesky_b8n2048(const at::Tensor& data);
+void cholesky_wavefront_prepare();
+at::Tensor cholesky_wavefront(const at::Tensor& data);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("prepare", &cholesky_b8n2048_prepare,
-        "Configure the left-looking 8x2048 Cholesky kernels");
-  m.def("run", &cholesky_b8n2048, "Batched 8x2048 Cholesky");
+  m.def("prepare", &cholesky_wavefront_prepare,
+        "Configure the full-grid 64-square wavefront Cholesky kernel");
+  m.def("run", &cholesky_wavefront, "Batched full-grid wavefront Cholesky");
 }
 """
 
-_CUDA_SOURCE_B8N2048 = r"""
+_CUDA_SOURCE_WAVEFRONT = r"""
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <torch/extension.h>
 
 #include <cstdint>
 
 namespace {
 
-constexpr int kBatch = 8;
-constexpr int kN = 2048;
-constexpr int kLeaf = 128;
-constexpr int kRowTile = 64;
+namespace wmma = nvcuda::wmma;
+
+constexpr int kBatch = __KBATCH__;
+constexpr int kN = __KN__;
+constexpr bool kTf32 = __KTF32__;
+constexpr int kTile = 64;
+constexpr int kLd = 68;
+constexpr int kPanelLd = 9;
 constexpr int kThreads = 256;
+constexpr int kTiles = kN / kTile;
+constexpr int kTasks = kTiles * (kTiles + 1) / 2;
+constexpr int kDynamicBytes =
+    3 * kTile * kLd * static_cast<int>(sizeof(float));
 constexpr int64_t kMatrixStride = static_cast<int64_t>(kN) * kN;
 
-// Both panel widths share the width-128 tile leading dimension, so one set
-// of shared-tile helpers serves the 128-column body and the 64-column tail.
-template <int Width>
-constexpr int factor_bytes() {
-  return static_cast<int>(sizeof(float)) * (Width * (kLeaf + 1) + Width);
-}
+static_assert(kDynamicBytes == 52224);
 
-template <int RowTile, int Width>
-constexpr int solve_bytes() {
-  return static_cast<int>(sizeof(float)) *
-      (Width * (Width + 1) + RowTile * (Width + 4) + Width);
-}
+at::Tensor gFlags;
+int gFlagDevice = -1;
 
-static_assert(factor_bytes<128>() == 66560);
-static_assert(factor_bytes<64>() == 33280);
-static_assert((solve_bytes<64, 128>()) == 100352);
-static_assert((solve_bytes<64, 64>()) == 34304);
+__device__ __forceinline__ int64_t matrix_index(
+    int batch, int row, int column) {
+  return static_cast<int64_t>(batch) * kMatrixStride +
+      static_cast<int64_t>(row) * kN + column;
+}
 
 __device__ __forceinline__ float load_global(const float* pointer) {
   return __ldcg(pointer);
@@ -3499,464 +3519,924 @@ __device__ __forceinline__ void store_global(
 
 __device__ __forceinline__ float& tile_at(
     float* tile, int row, int column) {
-  return tile[row * (kLeaf + 1) + column];
+  return tile[row * kLd + column];
 }
 
-__device__ __forceinline__ void root_pair(
-    float value, float& diagonal, float& inverse) {
-  diagonal = __fsqrt_rn(value);
-  inverse = __fdiv_rn(1.0f, diagonal);
+__device__ __forceinline__ const float& tile_at(
+    const float* tile, int row, int column) {
+  return tile[row * kLd + column];
 }
 
-// Unblocked 32x32 right-looking factor executed by warp 0.
-__device__ __forceinline__ void potf2_32(
-    float* tile, float* inverse_diagonal, int begin) {
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp = static_cast<int>(threadIdx.x) >> 5;
-  if (warp == 0) {
+__device__ __forceinline__ void publish_flag(int* flag) {
+  asm volatile(
+      "st.release.gpu.global.u32 [%0], %1;"
+      :: "l"(flag), "r"(1) : "memory");
+}
+
+__device__ __forceinline__ int poll_flag(const int* flag) {
+  int value;
+  asm volatile(
+      "ld.global.relaxed.gpu.L1::no_allocate.u32 %0, [%1];"
+      : "=r"(value) : "l"(flag));
+  return value;
+}
+
+__device__ __forceinline__ void acquire_fence() {
+  asm volatile("fence.acquire.gpu;" ::: "memory");
+}
+
+__device__ __forceinline__ uint32_t shared_address(
+    const void* pointer) {
+  return static_cast<uint32_t>(
+      __cvta_generic_to_shared(const_cast<void*>(pointer)));
+}
+
+__device__ __forceinline__ void copy_async_16(
+    void* destination, const void* source) {
+  const uint32_t address = shared_address(destination);
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;"
+      :: "r"(address), "l"(source) : "memory");
+}
+
+__device__ __forceinline__ void commit_async_copies() {
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void wait_async_copies() {
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+__device__ __forceinline__ int task_index(int row, int column) {
+  return column * (2 * kTiles - column + 1) / 2 +
+      row - column;
+}
+
+__device__ __forceinline__ void decode_task(
+    int task, int& row, int& column) {
+  int first = 0;
+  int count = kTiles;
+  column = 0;
 #pragma unroll 1
-    for (int local_column = 0; local_column < 32; ++local_column) {
-      const int column = begin + local_column;
-      float inverse = 0.0f;
-      if (lane == local_column) {
-        float diagonal;
-        root_pair(tile_at(tile, column, column), diagonal, inverse);
-        tile_at(tile, column, column) = diagonal;
-        inverse_diagonal[column] = inverse;
-      }
-      inverse = __shfl_sync(0xffffffffu, inverse, local_column);
-      if (lane > local_column) {
-        const int row = begin + lane;
-        tile_at(tile, row, column) *= inverse;
-      }
-      __syncwarp();
-      if (lane > local_column) {
-        const int row = begin + lane;
-        const float left = tile_at(tile, row, column);
-#pragma unroll 4
-        for (int target_local = local_column + 1;
-             target_local <= lane; ++target_local) {
-          const int target = begin + target_local;
-          tile_at(tile, row, target) = fmaf(
-              -left, tile_at(tile, target, column),
-              tile_at(tile, row, target));
-        }
-      }
-      __syncwarp();
+  while (task >= first + count) {
+    first += count;
+    --count;
+    ++column;
+  }
+  row = column + task - first;
+}
+
+__device__ __forceinline__ void wait_for_pair(
+    const int* flags, int first, int second) {
+  if (threadIdx.x == 0) {
+    while (
+        poll_flag(flags + first) == 0 ||
+        (second != first && poll_flag(flags + second) == 0)) {
+      __nanosleep(64);
     }
+    acquire_fence();
   }
   __syncthreads();
 }
 
-// Shared-tile triangular solve, one Width-lane subgroup per row.
-template <int Rows, int Columns, int Width>
-__device__ __forceinline__ void local_trsm(
-    float* tile, const float* inverse_diagonal,
-    int row_begin, int column_begin) {
-  const int lane = static_cast<int>(threadIdx.x) & (Width - 1);
-  const int row_index = static_cast<int>(threadIdx.x) / Width;
-  if (row_index < Rows) {
-    const int row = row_begin + row_index;
+__device__ __forceinline__ void stage_plain(
+    float* destination, const float* source) {
+  constexpr int kChunksPerRow = kTile / 4;
+  constexpr int kChunks = kTile * kChunksPerRow;
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kThreads) {
+    const int row = chunk / kChunksPerRow;
+    const int column = (chunk - row * kChunksPerRow) * 4;
+    copy_async_16(
+        destination + row * kLd + column,
+        source + static_cast<int64_t>(row) * kN + column);
+  }
+}
+
+__device__ __forceinline__ void stage_swizzled(
+    float* destination, const float* source) {
+  constexpr int kChunksPerRow = kTile / 4;
+  constexpr int kChunks = kTile * kChunksPerRow;
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kThreads) {
+    const int row = chunk / kChunksPerRow;
+    const int logical_group = chunk - row * kChunksPerRow;
+    const int logical_column = logical_group * 4;
+    const int physical_group = logical_group ^ (row >> 2);
+    copy_async_16(
+        destination + row * kLd + physical_group * 4,
+        source +
+            static_cast<int64_t>(row) * kN + logical_column);
+  }
+}
+
+__device__ __forceinline__ float load_shared(
+    uint32_t base, int index) {
+  float value;
+  const uint32_t address =
+      base + static_cast<uint32_t>(index * sizeof(float));
+  asm volatile(
+      "ld.shared.f32 %0, [%1];"
+      : "=f"(value) : "r"(address));
+  return value;
+}
+
+__device__ __forceinline__ int swizzled_index(
+    int row, int column) {
+  const int physical_group =
+      (column >> 2) ^ (row >> 2);
+  return row * kLd + physical_group * 4 + (column & 3);
+}
+
+__device__ __forceinline__ void scalar_update(
+    float value[4][4],
+    const float* first, const float* second,
+    int row_base, int column_base) {
+  const uint32_t first_base = shared_address(first);
+  const uint32_t second_base = shared_address(second);
+#pragma unroll
+  for (int k = 0; k < kTile; ++k) {
+    float left[4];
+    float right[4];
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      left[item] = load_shared(
+          first_base, swizzled_index(row_base + item, k));
+      right[item] = load_shared(
+          second_base, swizzled_index(column_base + item, k));
+    }
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        value[local_row][local_column] = fmaf(
+            -left[local_row], right[local_column],
+            value[local_row][local_column]);
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ void factor64(
+    float* tile, float* inverse_diagonal, float* panel) {
+  constexpr int kGroup = 8;
+  constexpr unsigned kFullMask = 0xffffffffu;
+  const int thread = static_cast<int>(threadIdx.x);
+  const int lane = thread & 31;
 #pragma unroll 1
-    for (int local_column = 0; local_column < Columns; ++local_column) {
-      const int column = column_begin + local_column;
-      float partial = 0.0f;
-#pragma unroll 4
-      for (int k = lane; k < local_column; k += Width) {
-        partial = fmaf(
-            tile_at(tile, row, column_begin + k),
-            tile_at(tile, column, column_begin + k), partial);
+  for (int base = 0; base < kTile; base += kGroup) {
+    if (thread < 32) {
+#pragma unroll
+      for (int column = 0; column < kGroup; ++column) {
+        if (lane == 0) {
+          const float diagonal = __fsqrt_rn(
+              tile_at(tile, base + column, base + column));
+          tile_at(tile, base + column, base + column) = diagonal;
+          inverse_diagonal[base + column] =
+              __fdiv_rn(1.0f, diagonal);
+        }
+        __syncwarp(kFullMask);
+        const int row = column + 1 + lane;
+        if (row < kGroup) {
+          tile_at(tile, base + row, base + column) *=
+              inverse_diagonal[base + column];
+        }
+        __syncwarp(kFullMask);
+        if (row < kGroup) {
+          const float left =
+              tile_at(tile, base + row, base + column);
+#pragma unroll
+          for (int target = column + 1; target <= row; ++target) {
+            tile_at(tile, base + row, base + target) = fmaf(
+                -left,
+                tile_at(tile, base + target, base + column),
+                tile_at(tile, base + row, base + target));
+          }
+        }
+        __syncwarp(kFullMask);
+      }
+    }
+    __syncthreads();
+
+    const int solve_row = base + kGroup + thread;
+    if (solve_row < kTile) {
+      float solved[kGroup];
+#pragma unroll
+      for (int column = 0; column < kGroup; ++column) {
+        float value =
+            tile_at(tile, solve_row, base + column);
+#pragma unroll
+        for (int prior = 0; prior < column; ++prior) {
+          value = fmaf(
+              -solved[prior],
+              tile_at(tile, base + column, base + prior),
+              value);
+        }
+        solved[column] =
+            value * inverse_diagonal[base + column];
       }
 #pragma unroll
-      for (int offset = Width / 2; offset > 0; offset >>= 1) {
-        partial += __shfl_down_sync(
-            0xffffffffu, partial, offset, Width);
+      for (int column = 0; column < kGroup; ++column) {
+        tile_at(tile, solve_row, base + column) =
+            solved[column];
+        panel[solve_row * kPanelLd + column] =
+            solved[column];
       }
-      if (lane == 0) {
-        tile_at(tile, row, column) =
-            (tile_at(tile, row, column) - partial) *
-            inverse_diagonal[column];
-      }
-      __syncwarp();
     }
-  }
-  __syncthreads();
-}
+    __syncthreads();
 
-// Symmetric rank-K update of one diagonal block inside the shared tile.
-template <int Size, int K>
-__device__ __forceinline__ void local_update(
-    float* tile, int target, int panel) {
-  constexpr int elements = Size * Size;
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < elements; linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Size;
-    const int column = linear % Size;
-    if (column <= row) {
-      float value = tile_at(tile, target + row, target + column);
-#pragma unroll 4
-      for (int k = 0; k < K; ++k) {
-        value = fmaf(
-            -tile_at(tile, target + row, panel + k),
-            tile_at(tile, target + column, panel + k), value);
+    const int update_row = base + kGroup + (thread >> 2);
+    const int quarter = thread & 3;
+    if (update_row < kTile) {
+      float solved[kGroup];
+#pragma unroll
+      for (int column = 0; column < kGroup; ++column) {
+        solved[column] =
+            panel[update_row * kPanelLd + column];
       }
-      tile_at(tile, target + row, target + column) = value;
+      const int first = base + kGroup;
+      for (int target = first + quarter * 4;
+           target <= update_row; target += 16) {
+        if (target + 3 <= update_row) {
+          float value0 = tile_at(tile, update_row, target);
+          float value1 = tile_at(tile, update_row, target + 1);
+          float value2 = tile_at(tile, update_row, target + 2);
+          float value3 = tile_at(tile, update_row, target + 3);
+#pragma unroll
+          for (int column = 0; column < kGroup; ++column) {
+            const float left = solved[column];
+            value0 = fmaf(
+                -left,
+                panel[target * kPanelLd + column], value0);
+            value1 = fmaf(
+                -left,
+                panel[(target + 1) * kPanelLd + column],
+                value1);
+            value2 = fmaf(
+                -left,
+                panel[(target + 2) * kPanelLd + column],
+                value2);
+            value3 = fmaf(
+                -left,
+                panel[(target + 3) * kPanelLd + column],
+                value3);
+          }
+          tile_at(tile, update_row, target) = value0;
+          tile_at(tile, update_row, target + 1) = value1;
+          tile_at(tile, update_row, target + 2) = value2;
+          tile_at(tile, update_row, target + 3) = value3;
+        } else {
+          for (int single = target;
+               single <= update_row; ++single) {
+            float value = tile_at(tile, update_row, single);
+#pragma unroll
+            for (int column = 0; column < kGroup; ++column) {
+              value = fmaf(
+                  -solved[column],
+                  panel[single * kPanelLd + column],
+                  value);
+            }
+            tile_at(tile, update_row, single) = value;
+          }
+        }
+      }
     }
-  }
-  __syncthreads();
-}
-
-// Leaf factor of the Width x Width diagonal block already updated by the
-// left-looking history GEMM.
-template <int Width>
-__global__ __launch_bounds__(kThreads)
-void factor_kernel(float* __restrict__ output, int begin) {
-  static_assert(Width == 128 || Width == 64);
-  extern __shared__ __align__(16) float work[];
-  float* tile = work;
-  float* inverse_diagonal = tile + Width * (kLeaf + 1);
-  const int matrix_index = static_cast<int>(blockIdx.x);
-  float* matrix = output + static_cast<int64_t>(matrix_index) * kMatrixStride;
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < Width * Width;
-       linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Width;
-    const int column = linear % Width;
-    tile_at(tile, row, column) =
-        column <= row
-            ? load_global(matrix + (begin + row) * kN + begin + column)
-            : 0.0f;
-  }
-  __syncthreads();
-  potf2_32(tile, inverse_diagonal, 0);
-  local_trsm<32, 32, 4>(tile, inverse_diagonal, 32, 0);
-  local_update<32, 32>(tile, 32, 0);
-  potf2_32(tile, inverse_diagonal, 32);
-  if constexpr (Width == 128) {
-    local_trsm<64, 64, 4>(tile, inverse_diagonal, 64, 0);
-    local_update<64, 64>(tile, 64, 0);
-    potf2_32(tile, inverse_diagonal, 64);
-    local_trsm<32, 32, 4>(tile, inverse_diagonal, 96, 64);
-    local_update<32, 32>(tile, 96, 64);
-    potf2_32(tile, inverse_diagonal, 96);
-  }
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < Width * Width;
-       linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Width;
-    const int column = linear % Width;
-    if (column <= row) {
-      store_global(
-          matrix + (begin + row) * kN + begin + column,
-          tile_at(tile, row, column));
-    }
+    __syncthreads();
   }
 }
 
-// One RowTile-row block of the panel below the leaf, solved against the
-// factored diagonal by four-lane subgroups.
-template <int RowTile, int Width>
-__global__ __launch_bounds__(kThreads)
-void solve_kernel(
-    float* __restrict__ output, int begin, int row_tiles) {
-  static_assert(Width == 128 || Width == 64);
-  constexpr int kDiagonalLd = Width + 1;
-  constexpr int kPanelLd = Width + 4;
-  extern __shared__ __align__(16) float work[];
-  float* diagonal = work;
-  float* panel = diagonal + Width * kDiagonalLd;
-  float* inverse_diagonal = panel + RowTile * kPanelLd;
-  const int matrix_index = static_cast<int>(blockIdx.x) / row_tiles;
-  const int row_tile = static_cast<int>(blockIdx.x) % row_tiles;
-  const int row_begin = begin + Width + row_tile * RowTile;
-  float* matrix = output + static_cast<int64_t>(matrix_index) * kMatrixStride;
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < Width * Width;
-       linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Width;
-    const int column = linear % Width;
-    diagonal[row * kDiagonalLd + column] =
-        column <= row
-            ? load_global(matrix + (begin + row) * kN + begin + column)
-            : 0.0f;
-  }
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < RowTile * Width;
-       linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Width;
-    const int column = linear % Width;
-    panel[row * kPanelLd + column] = load_global(
-        matrix + (row_begin + row) * kN + begin + column);
+__device__ __forceinline__ void trsm64(
+    float* tile, const float* diagonal,
+    float* inverse_diagonal) {
+  const int thread = static_cast<int>(threadIdx.x);
+  if (thread < kTile) {
+    inverse_diagonal[thread] = __fdiv_rn(
+        1.0f, diagonal[thread * kLd + thread]);
   }
   __syncthreads();
-  if (static_cast<int>(threadIdx.x) < Width) {
-    const int column = static_cast<int>(threadIdx.x);
-    inverse_diagonal[column] =
-        __fdiv_rn(1.0f, diagonal[column * kDiagonalLd + column]);
-  }
-  __syncthreads();
-  const int lane = static_cast<int>(threadIdx.x) & 3;
-  const int row = static_cast<int>(threadIdx.x) >> 2;
-  if (row < RowTile) {
 #pragma unroll 1
-    for (int column = 0; column < Width; ++column) {
-      float partial = 0.0f;
-#pragma unroll 4
-      for (int k = lane; k < column; k += 4) {
-        partial = fmaf(
-            panel[row * kPanelLd + k],
-            diagonal[column * kDiagonalLd + k], partial);
+  for (int base = 0; base < kTile; base += 8) {
+    if (thread < kTile) {
+      const int row = thread;
+      float solved[8];
+#pragma unroll
+      for (int column = 0; column < 8; ++column) {
+        float current =
+            tile_at(tile, row, base + column);
+#pragma unroll
+        for (int prior = 0; prior < column; ++prior) {
+          current = fmaf(
+              -solved[prior],
+              diagonal[
+                  (base + column) * kLd + base + prior],
+              current);
+        }
+        solved[column] =
+            current * inverse_diagonal[base + column];
+        tile_at(tile, row, base + column) = solved[column];
       }
-      partial += __shfl_down_sync(0xffffffffu, partial, 2, 4);
-      partial += __shfl_down_sync(0xffffffffu, partial, 1, 4);
-      if (lane == 0) {
-        panel[row * kPanelLd + column] =
-            (panel[row * kPanelLd + column] - partial) *
-            inverse_diagonal[column];
-      }
-      __syncwarp();
     }
+    __syncthreads();
+
+    const int row = thread >> 2;
+    const int lane = thread & 3;
+    for (int target = base + 8 + lane;
+         target < kTile; target += 4) {
+      float current = tile_at(tile, row, target);
+#pragma unroll
+      for (int column = 0; column < 8; ++column) {
+        current = fmaf(
+            -tile_at(tile, row, base + column),
+            diagonal[
+                target * kLd + base + column],
+            current);
+      }
+      tile_at(tile, row, target) = current;
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ void zero_mirror(
+    float* output, int batch, int row, int column) {
+  if (row == column) {
+    return;
+  }
+  constexpr int kChunksPerRow = kTile / 4;
+  constexpr int kChunks = kTile * kChunksPerRow;
+  const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  for (int chunk = static_cast<int>(threadIdx.x);
+       chunk < kChunks; chunk += kThreads) {
+    const int local_row = chunk / kChunksPerRow;
+    const int local_column =
+        (chunk - local_row * kChunksPerRow) * 4;
+    float4* destination = reinterpret_cast<float4*>(
+        output +
+        matrix_index(
+            batch,
+            column * kTile + local_row,
+            row * kTile + local_column));
+    *destination = zero;
+  }
+}
+
+template <bool Tf32>
+__global__ __launch_bounds__(kThreads, 1)
+void tilegrid64_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int* __restrict__ all_flags) {
+  const int linear = static_cast<int>(blockIdx.x);
+  const int batch = linear % kBatch;
+  const int task = linear / kBatch;
+  int tile_row;
+  int tile_column;
+  decode_task(task, tile_row, tile_column);
+  int* flags = all_flags + batch * kTasks;
+
+  extern __shared__ __align__(16) float shared_floats[];
+  float* first = shared_floats;
+  float* second = first + kTile * kLd;
+  float* tile = second + kTile * kLd;
+  float* inverse = second;
+  float* panel = second + kTile;
+
+  zero_mirror(output, batch, tile_row, tile_column);
+
+  if constexpr (!Tf32) {
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread >> 5;
+    const int lane = thread & 31;
+    const int row_base =
+        ((warp >> 1) * 4 + (lane >> 3)) * 4;
+    const int column_base =
+        ((warp & 1) * 8 + (lane & 7)) * 4;
+    float value[4][4];
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        value[local_row][local_column] = load_global(
+            input +
+            matrix_index(
+                batch,
+                tile_row * kTile + row_base + local_row,
+                tile_column * kTile +
+                    column_base + local_column));
+      }
+    }
+
+#pragma unroll 1
+    for (int history = 0;
+         history < tile_column; ++history) {
+      wait_for_pair(
+          flags,
+          task_index(tile_row, history),
+          task_index(tile_column, history));
+      stage_swizzled(
+          first,
+          output +
+              matrix_index(
+                  batch, tile_row * kTile,
+                  history * kTile));
+      stage_swizzled(
+          second,
+          output +
+              matrix_index(
+                  batch, tile_column * kTile,
+                  history * kTile));
+      commit_async_copies();
+      wait_async_copies();
+      __syncthreads();
+      scalar_update(
+          value, first, second, row_base, column_base);
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int local_row = 0; local_row < 4; ++local_row) {
+#pragma unroll
+      for (int local_column = 0;
+           local_column < 4; ++local_column) {
+        tile_at(
+            tile, row_base + local_row,
+            column_base + local_column) =
+            value[local_row][local_column];
+      }
+    }
+    __syncthreads();
+  } else {
+    stage_plain(
+        tile,
+        input +
+            matrix_index(
+                batch, tile_row * kTile,
+                tile_column * kTile));
+    commit_async_copies();
+    wait_async_copies();
+    __syncthreads();
+
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int fragment_column = warp & 3;
+    const int first_fragment_row = warp >> 2;
+    const int second_fragment_row = first_fragment_row + 2;
+    wmma::fragment<
+        wmma::accumulator, 16, 16, 8, float> accumulator0;
+    wmma::fragment<
+        wmma::accumulator, 16, 16, 8, float> accumulator1;
+    wmma::load_matrix_sync(
+        accumulator0,
+        tile + first_fragment_row * 16 * kLd +
+            fragment_column * 16,
+        kLd, wmma::mem_row_major);
+    wmma::load_matrix_sync(
+        accumulator1,
+        tile + second_fragment_row * 16 * kLd +
+            fragment_column * 16,
+        kLd, wmma::mem_row_major);
+
+#pragma unroll 1
+    for (int history = 0;
+         history < tile_column; ++history) {
+      wait_for_pair(
+          flags,
+          task_index(tile_row, history),
+          task_index(tile_column, history));
+      stage_plain(
+          first,
+          output +
+              matrix_index(
+                  batch, tile_row * kTile,
+                  history * kTile));
+      stage_plain(
+          second,
+          output +
+              matrix_index(
+                  batch, tile_column * kTile,
+                  history * kTile));
+      commit_async_copies();
+      wait_async_copies();
+      __syncthreads();
+
+#pragma unroll
+      for (int k = 0; k < kTile; k += 8) {
+        wmma::fragment<
+            wmma::matrix_a, 16, 16, 8,
+            wmma::precision::tf32,
+            wmma::row_major> left0;
+        wmma::fragment<
+            wmma::matrix_a, 16, 16, 8,
+            wmma::precision::tf32,
+            wmma::row_major> left1;
+        wmma::fragment<
+            wmma::matrix_b, 16, 16, 8,
+            wmma::precision::tf32,
+            wmma::col_major> right;
+        wmma::load_matrix_sync(
+            left0,
+            first + first_fragment_row * 16 * kLd + k,
+            kLd);
+        wmma::load_matrix_sync(
+            left1,
+            first + second_fragment_row * 16 * kLd + k,
+            kLd);
+        wmma::load_matrix_sync(
+            right,
+            second + fragment_column * 16 * kLd + k,
+            kLd);
+#pragma unroll
+        for (int item = 0;
+             item < left0.num_elements; ++item) {
+          left0.x[item] =
+              -wmma::__float_to_tf32(left0.x[item]);
+          left1.x[item] =
+              -wmma::__float_to_tf32(left1.x[item]);
+        }
+#pragma unroll
+        for (int item = 0;
+             item < right.num_elements; ++item) {
+          right.x[item] =
+              wmma::__float_to_tf32(right.x[item]);
+        }
+        wmma::mma_sync(
+            accumulator0, left0, right, accumulator0);
+        wmma::mma_sync(
+            accumulator1, left1, right, accumulator1);
+      }
+      __syncthreads();
+    }
+
+    wmma::store_matrix_sync(
+        tile + first_fragment_row * 16 * kLd +
+            fragment_column * 16,
+        accumulator0, kLd, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        tile + second_fragment_row * 16 * kLd +
+            fragment_column * 16,
+        accumulator1, kLd, wmma::mem_row_major);
+    __syncthreads();
+  }
+
+  if (tile_row == tile_column) {
+    factor64(tile, inverse, panel);
+  } else {
+    const int diagonal_task =
+        task_index(tile_column, tile_column);
+    wait_for_pair(flags, diagonal_task, diagonal_task);
+    stage_plain(
+        first,
+        output +
+            matrix_index(
+                batch, tile_column * kTile,
+                tile_column * kTile));
+    commit_async_copies();
+    wait_async_copies();
+    __syncthreads();
+    trsm64(tile, first, inverse);
+  }
+
+  for (int linear_item = static_cast<int>(threadIdx.x);
+       linear_item < kTile * kTile;
+       linear_item += kThreads) {
+    const int local_row = linear_item / kTile;
+    const int local_column =
+        linear_item - local_row * kTile;
+    const float result =
+        tile_row != tile_column ||
+                local_column <= local_row
+            ? tile_at(tile, local_row, local_column)
+            : 0.0f;
+    store_global(
+        output +
+            matrix_index(
+                batch,
+                tile_row * kTile + local_row,
+                tile_column * kTile + local_column),
+        result);
   }
   __syncthreads();
-  for (int linear = static_cast<int>(threadIdx.x);
-       linear < RowTile * Width;
-       linear += static_cast<int>(blockDim.x)) {
-    const int row = linear / Width;
-    const int column = linear % Width;
-    store_global(
-        matrix + (row_begin + row) * kN + begin + column,
-        panel[row * kPanelLd + column]);
+  if (threadIdx.x == 0) {
+    publish_flag(flags + task);
   }
-}
-
-__global__ __launch_bounds__(kThreads)
-void copy_lower_kernel(
-    const float* __restrict__ input, float* __restrict__ output) {
-  constexpr int ctas_per_matrix = 32;
-  const int matrix_index = static_cast<int>(blockIdx.x) / ctas_per_matrix;
-  const int rank = static_cast<int>(blockIdx.x) % ctas_per_matrix;
-  const int64_t base = static_cast<int64_t>(matrix_index) * kMatrixStride;
-  for (int linear = rank * static_cast<int>(blockDim.x) +
-                    static_cast<int>(threadIdx.x);
-       linear < kN * kN;
-       linear += ctas_per_matrix * static_cast<int>(blockDim.x)) {
-    const int row = linear / kN;
-    const int column = linear % kN;
-    store_global(
-        output + base + linear,
-        column <= row ? input[base + linear] : 0.0f);
-  }
-}
-
-// The history GEMM writes the full square, so restore exact upper zeros.
-__global__ __launch_bounds__(kThreads)
-void zero_upper_kernel(float* __restrict__ output) {
-  constexpr int ctas_per_matrix = 16;
-  const int matrix_index = static_cast<int>(blockIdx.x) / ctas_per_matrix;
-  const int rank = static_cast<int>(blockIdx.x) % ctas_per_matrix;
-  const int64_t base = static_cast<int64_t>(matrix_index) * kMatrixStride;
-  for (int linear = rank * static_cast<int>(blockDim.x) +
-                    static_cast<int>(threadIdx.x);
-       linear < kN * kN;
-       linear += ctas_per_matrix * static_cast<int>(blockDim.x)) {
-    const int row = linear / kN;
-    const int column = linear % kN;
-    if (column > row) {
-      store_global(output + base + linear, 0.0f);
-    }
-  }
-}
-
-void check_cublas(cublasStatus_t status, const char* role) {
-  TORCH_CHECK(
-      status == CUBLAS_STATUS_SUCCESS,
-      role, " failed with cuBLAS status ", static_cast<int>(status));
-}
-
-// Selects high-performance cuBLAS math for the history GEMMs and restores
-// the caller's handle state afterwards.
-class CublasStateGuard {
- public:
-  explicit CublasStateGuard(cublasHandle_t handle)
-      : handle_(handle) {
-    check_cublas(
-        cublasGetMathMode(handle_, &math_mode_),
-        "query cuBLAS math mode");
-    check_cublas(
-        cublasGetAtomicsMode(handle_, &atomics_mode_),
-        "query cuBLAS atomics mode");
-    check_cublas(
-        cublasGetPointerMode(handle_, &pointer_mode_),
-        "query cuBLAS pointer mode");
-    check_cublas(
-        cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH),
-        "select cuBLAS math mode");
-    check_cublas(
-        cublasSetAtomicsMode(handle_, CUBLAS_ATOMICS_ALLOWED),
-        "enable cuBLAS atomics");
-    check_cublas(
-        cublasSetPointerMode(handle_, CUBLAS_POINTER_MODE_HOST),
-        "select host scalar pointers");
-  }
-
-  ~CublasStateGuard() {
-    cublasSetPointerMode(handle_, pointer_mode_);
-    cublasSetAtomicsMode(handle_, atomics_mode_);
-    cublasSetMathMode(handle_, math_mode_);
-  }
-
-  CublasStateGuard(const CublasStateGuard&) = delete;
-  CublasStateGuard& operator=(const CublasStateGuard&) = delete;
-
- private:
-  cublasHandle_t handle_;
-  cublasMath_t math_mode_{};
-  cublasAtomicsMode_t atomics_mode_{};
-  cublasPointerMode_t pointer_mode_{};
-};
-
-// One fast-TF32 strided-batched GEMM of the accumulated history.
-void launch_gemm_update(
-    cublasHandle_t handle, float* output,
-    int target_row, int target_column,
-    int rows, int columns, int panel_begin, int rank) {
-  if (rows == 0 || columns == 0 || rank == 0) {
-    return;
-  }
-  const float alpha = -1.0f;
-  const float beta = 1.0f;
-  const float* column_panel = output + target_column * kN + panel_begin;
-  const float* row_panel = output + target_row * kN + panel_begin;
-  float* destination = output + target_row * kN + target_column;
-  check_cublas(
-      cublasGemmStridedBatchedEx(
-          handle, CUBLAS_OP_T, CUBLAS_OP_N,
-          columns, rows, rank,
-          &alpha,
-          column_panel, CUDA_R_32F, kN, kMatrixStride,
-          row_panel, CUDA_R_32F, kN, kMatrixStride,
-          &beta,
-          destination, CUDA_R_32F, kN, kMatrixStride,
-          kBatch,
-          CUBLAS_COMPUTE_32F_FAST_TF32,
-          CUBLAS_GEMM_DEFAULT),
-      "strided batched update");
-}
-
-// Left-looking panel of the given width: apply the accumulated history to
-// the trailing columns, factor the leaf, then solve the column below it.
-template <int Width>
-void left_panel(cublasHandle_t handle, float* output, int begin) {
-  constexpr int kRows = Width == 128 ? kRowTile : Width;
-  if (begin > 0) {
-    launch_gemm_update(
-        handle, output, begin, begin, kN - begin, Width, 0, begin);
-  }
-  cudaLaunchConfig_t factor_config{};
-  factor_config.gridDim = dim3(kBatch, 1, 1);
-  factor_config.blockDim = dim3(kThreads, 1, 1);
-  factor_config.dynamicSmemBytes = factor_bytes<Width>();
-  cudaLaunchKernelEx(&factor_config, factor_kernel<Width>, output, begin);
-
-  const int trailing = kN - begin - Width;
-  if (trailing == 0) {
-    return;
-  }
-  const int row_tiles = trailing / kRows;
-  cudaLaunchConfig_t solve_config{};
-  solve_config.gridDim = dim3(kBatch * row_tiles, 1, 1);
-  solve_config.blockDim = dim3(kThreads, 1, 1);
-  solve_config.dynamicSmemBytes = (solve_bytes<kRows, Width>());
-  cudaLaunchKernelEx(
-      &solve_config, solve_kernel<kRows, Width>, output, begin, row_tiles);
-}
-
-void launch_copy(const float* input, float* output) {
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(kBatch * 32, 1, 1);
-  config.blockDim = dim3(kThreads, 1, 1);
-  cudaLaunchKernelEx(&config, copy_lower_kernel, input, output);
-}
-
-void launch_zero_upper(float* output) {
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(kBatch * 16, 1, 1);
-  config.blockDim = dim3(kThreads, 1, 1);
-  cudaLaunchKernelEx(&config, zero_upper_kernel, output);
-}
-
-void launch_all(const float* input, float* output) {
-  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-  CublasStateGuard guard(handle);
-  launch_copy(input, output);
-  // Width-128 panels while the trailing square still amortizes them, then a
-  // width-64 tail from R = 1024 down.
-  for (int begin = 0; begin < kN;) {
-    if (kN - begin > 1024) {
-      left_panel<128>(handle, output, begin);
-      begin += 128;
-    } else {
-      left_panel<64>(handle, output, begin);
-      begin += 64;
-    }
-  }
-  launch_zero_upper(output);
 }
 
 template <typename Kernel>
-void configure_dynamic(Kernel kernel, int dynamic_bytes) {
+void configure_dynamic(Kernel kernel) {
   cudaError_t status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      dynamic_bytes);
+      kDynamicBytes);
   TORCH_CHECK(
       status == cudaSuccess,
-      "dynamic shared-memory setup failed: ",
+      "wavefront dynamic shared-memory opt-in failed: ",
       cudaGetErrorString(status));
   status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   TORCH_CHECK(
       status == cudaSuccess,
-      "shared-memory carveout failed: ",
+      "wavefront shared-memory carveout failed: ",
       cudaGetErrorString(status));
+}
+
+void ensure_state() {
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "wavefront device query failed: ",
+      cudaGetErrorString(status));
+  if (gFlagDevice == device && gFlags.defined()) {
+    return;
+  }
+  gFlags = at::empty(
+      {kBatch, kTasks},
+      at::TensorOptions()
+          .dtype(at::kInt)
+          .device(at::Device(at::kCUDA, device)));
+  gFlagDevice = device;
 }
 
 }  // namespace
 
-void cholesky_b8n2048_prepare() {
-  configure_dynamic(factor_kernel<128>, factor_bytes<128>());
-  configure_dynamic(factor_kernel<64>, factor_bytes<64>());
-  configure_dynamic(solve_kernel<64, 128>, (solve_bytes<64, 128>()));
-  configure_dynamic(solve_kernel<64, 64>, (solve_bytes<64, 64>()));
+void cholesky_wavefront_prepare() {
+  configure_dynamic(tilegrid64_kernel<kTf32>);
+  ensure_state();
 }
 
-at::Tensor cholesky_b8n2048(const at::Tensor& data) {
+at::Tensor cholesky_wavefront(const at::Tensor& data) {
   TORCH_CHECK(data.is_cuda() && data.is_contiguous() &&
                   data.scalar_type() == at::kFloat,
               "input must be a contiguous float32 CUDA tensor");
   TORCH_CHECK(data.dim() == 3 && data.size(0) == kBatch &&
                   data.size(1) == kN && data.size(2) == kN,
-              "native path requires shape (8, 2048, 2048)");
+              "wavefront path shape mismatch");
   c10::cuda::CUDAGuard device_guard(data.device());
   auto output = at::empty_like(data);
-  launch_all(data.data_ptr<float>(), output.data_ptr<float>());
-  const cudaError_t status = cudaPeekAtLastError();
-  TORCH_CHECK(status == cudaSuccess,
-              "Cholesky launch failed: ", cudaGetErrorString(status));
+  ensure_state();
+  int* flags = gFlags.data_ptr<int>();
+  cudaError_t status = cudaMemsetAsync(
+      flags, 0,
+      static_cast<size_t>(kBatch) * kTasks * sizeof(int), nullptr);
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "wavefront flag reset failed: ", cudaGetErrorString(status));
+  tilegrid64_kernel<kTf32>
+      <<<kBatch * kTasks, kThreads, kDynamicBytes>>>(
+          data.data_ptr<float>(), output.data_ptr<float>(), flags);
+  status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "wavefront launch failed: ", cudaGetErrorString(status));
   return output;
 }
 """
 
 
-@lru_cache(maxsize=1)
-def _module_b8n2048():
+def _wavefront_cuda_source(batch, n, tf32):
+    return (
+        _CUDA_SOURCE_WAVEFRONT
+        .replace("__KBATCH__", str(batch))
+        .replace("__KN__", str(n))
+        .replace("__KTF32__", "true" if tf32 else "false"))
+
+
+def _build_wavefront(name, batch, n, tf32):
     module = _build(
-        "cholesky_b8n2048", _CPP_SOURCE_B8N2048, _CUDA_SOURCE_B8N2048,
+        name, _CPP_SOURCE_WAVEFRONT, _wavefront_cuda_source(batch, n, tf32),
         extra_cuda_flags=(
             "-DNDEBUG", "--restrict",
-            "-Xptxas=--allow-expensive-optimizations=true"),
-        extra_ldflags=("-lcublas",))
+            "-Xptxas=--allow-expensive-optimizations=true"))
     module.prepare()
     return module
+
+
+@lru_cache(maxsize=1)
+def _module_b4n1024():
+    return _build_wavefront("cholesky_b4n1024", 4, 1024, True)
+
+
+@lru_cache(maxsize=1)
+def _module_b2n2048():
+    return _build_wavefront("cholesky_b2n2048", 2, 2048, False)
+
+
+@lru_cache(maxsize=1)
+def _module_b8n2048():
+    return _build_wavefront("cholesky_b8n2048", 8, 2048, True)
+
+
+# ---------------------------------------------------------------------------
+# Native cuSOLVER Xpotrf - one CUDA source shared by two shapes
+#   (1, 4096, 4096)  b1n4096 variant 16  native_xpotrf_lower_fused_copy
+#   (2, 4096, 4096)  b2n4096 variant 12  native_xpotrf_lower_fused_copy
+#
+# cuSOLVER is column-major, so a row-major (b, r, c) buffer is already the
+# transpose. One vectorized copy keeps the physical upper triangle - the
+# column-major lower triangle Xpotrf reads - and zeros the rest. The factor
+# is returned through a column-major-strided view, which presents the
+# physical column-major factor as the required logical row-major lower
+# triangle without a second pass over the matrix.
+# ---------------------------------------------------------------------------
+
+_CPP_SOURCE_XPOTRF4096 = r"""
+#include <torch/extension.h>
+
+void cholesky_xpotrf4096_prepare();
+at::Tensor cholesky_xpotrf4096(const at::Tensor& data);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("prepare", &cholesky_xpotrf4096_prepare,
+        "Create the Xpotrf handle, parameters, and workspaces");
+  m.def("run", &cholesky_xpotrf4096, "Batched 4096x4096 Cholesky");
+}
+"""
+
+_CUDA_SOURCE_XPOTRF4096 = r"""
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+#include <cusolverDn.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace {
+
+constexpr int kBatch = __KBATCH__;
+constexpr int kN = 4096;
+constexpr int64_t kMatrixStride = static_cast<int64_t>(kN) * kN;
+
+cusolverDnHandle_t gXpotrfHandle = nullptr;
+cusolverDnParams_t gXpotrfParams = nullptr;
+at::Tensor gXpotrfDeviceWorkspace;
+at::Tensor gXpotrfInfo;
+std::vector<char> gXpotrfHostWorkspace;
+size_t gXpotrfDeviceBytes = 0;
+size_t gXpotrfHostBytes = 0;
+int gXpotrfDevice = -1;
+
+__global__ __launch_bounds__(256)
+void copy_xpotrf_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output) {
+  constexpr int64_t quads = static_cast<int64_t>(kN) * kN / 4;
+  constexpr int quads_per_row = kN / 4;
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t quad = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       quad < quads; quad += stride) {
+    const int row = static_cast<int>(quad / quads_per_row);
+    const int column =
+        static_cast<int>(quad % quads_per_row) * 4;
+    const float4* source =
+        reinterpret_cast<const float4*>(input) + quad;
+    float4 value;
+    if (column >= row) {
+      value = __ldcg(source);
+    } else if (column + 3 < row) {
+      value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+      const float4 loaded = __ldcg(source);
+      value.x = column >= row ? loaded.x : 0.0f;
+      value.y = column + 1 >= row ? loaded.y : 0.0f;
+      value.z = column + 2 >= row ? loaded.z : 0.0f;
+      value.w = loaded.w;
+    }
+    __stcg(reinterpret_cast<float4*>(output) + quad, value);
+  }
+}
+
+void launch_xpotrf_copy(const float* input, float* output) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(512, 1, 1);
+  config.blockDim = dim3(256, 1, 1);
+  for (int batch = 0; batch < kBatch; ++batch) {
+    cudaLaunchKernelEx(
+        &config, copy_xpotrf_kernel,
+        input + static_cast<int64_t>(batch) * kMatrixStride,
+        output + static_cast<int64_t>(batch) * kMatrixStride);
+  }
+}
+
+void check_cusolver(cusolverStatus_t status, const char* role) {
+  TORCH_CHECK(
+      status == CUSOLVER_STATUS_SUCCESS,
+      role, " failed with cuSOLVER status ", static_cast<int>(status));
+}
+
+void ensure_xpotrf_state(
+    const at::Tensor& like, float* matrix) {
+  const int device = like.get_device();
+  if (gXpotrfHandle == nullptr) {
+    check_cusolver(
+        cusolverDnCreate(&gXpotrfHandle),
+        "create Xpotrf handle");
+  }
+  if (gXpotrfParams == nullptr) {
+    check_cusolver(
+        cusolverDnCreateParams(&gXpotrfParams),
+        "create Xpotrf parameters");
+  }
+  if (
+      gXpotrfDevice == device &&
+      gXpotrfDeviceWorkspace.defined() &&
+      gXpotrfInfo.defined()) {
+    return;
+  }
+  check_cusolver(
+      cusolverDnXpotrf_bufferSize(
+          gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+          static_cast<int64_t>(kN), CUDA_R_32F, matrix,
+          static_cast<int64_t>(kN), CUDA_R_32F,
+          &gXpotrfDeviceBytes, &gXpotrfHostBytes),
+      "query Xpotrf workspace");
+  gXpotrfDeviceWorkspace = at::empty(
+      {static_cast<int64_t>(gXpotrfDeviceBytes)},
+      like.options().dtype(at::kByte));
+  gXpotrfInfo = at::empty({1}, like.options().dtype(at::kInt));
+  gXpotrfHostWorkspace.resize(gXpotrfHostBytes);
+  gXpotrfDevice = device;
+}
+
+void launch_xpotrf(
+    const float* input, float* output,
+    const at::Tensor& like) {
+  launch_xpotrf_copy(input, output);
+  ensure_xpotrf_state(like, output);
+  void* device_workspace =
+      gXpotrfDeviceBytes == 0
+          ? nullptr
+          : gXpotrfDeviceWorkspace.data_ptr<uint8_t>();
+  void* host_workspace =
+      gXpotrfHostBytes == 0
+          ? nullptr
+          : gXpotrfHostWorkspace.data();
+  for (int batch = 0; batch < kBatch; ++batch) {
+    float* matrix =
+        output + static_cast<int64_t>(batch) * kMatrixStride;
+    check_cusolver(
+        cusolverDnXpotrf(
+            gXpotrfHandle, gXpotrfParams, CUBLAS_FILL_MODE_LOWER,
+            static_cast<int64_t>(kN), CUDA_R_32F, matrix,
+            static_cast<int64_t>(kN), CUDA_R_32F,
+            device_workspace, gXpotrfDeviceBytes,
+            host_workspace, gXpotrfHostBytes,
+            gXpotrfInfo.data_ptr<int>()),
+        "run Xpotrf");
+  }
+}
+
+}  // namespace
+
+void cholesky_xpotrf4096_prepare() {
+  auto probe = at::empty(
+      {kMatrixStride},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+  ensure_xpotrf_state(probe, probe.data_ptr<float>());
+}
+
+at::Tensor cholesky_xpotrf4096(const at::Tensor& data) {
+  TORCH_CHECK(data.is_cuda() && data.is_contiguous() &&
+                  data.scalar_type() == at::kFloat,
+              "input must be a contiguous float32 CUDA tensor");
+  TORCH_CHECK(data.dim() == 3 && data.size(0) == kBatch &&
+                  data.size(1) == kN && data.size(2) == kN,
+              "Xpotrf path shape mismatch");
+  c10::cuda::CUDAGuard device_guard(data.device());
+  auto output = at::empty_strided(
+      {kBatch, kN, kN}, {kMatrixStride, 1, kN}, data.options());
+  launch_xpotrf(
+      data.data_ptr<float>(), output.data_ptr<float>(), data);
+  const cudaError_t status = cudaPeekAtLastError();
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "Xpotrf launch failed: ", cudaGetErrorString(status));
+  return output;
+}
+"""
+
+
+def _build_xpotrf4096(name, batch):
+    module = _build(
+        name, _CPP_SOURCE_XPOTRF4096,
+        _CUDA_SOURCE_XPOTRF4096.replace("__KBATCH__", str(batch)),
+        extra_cuda_flags=("-DNDEBUG", "--restrict"),
+        extra_ldflags=("-lcublas", "-lcusolver"))
+    module.prepare()
+    return module
+
+
+@lru_cache(maxsize=1)
+def _module_b1n4096():
+    return _build_xpotrf4096("cholesky_b1n4096", 1)
+
+
+@lru_cache(maxsize=1)
+def _module_b2n4096():
+    return _build_xpotrf4096("cholesky_b2n4096", 2)
 
 
 # ---------------------------------------------------------------------------
@@ -5365,30 +5845,21 @@ _SPECIALIZATIONS = {
     (64, 256, 256): _module_b64n256,
     (16, 512, 512): _module_b16n512,
     (640, 512, 512): _module_b640n512,
+    (4, 1024, 1024): _module_b4n1024,
     (60, 1024, 1024): _module_b60n1024,
+    (2, 2048, 2048): _module_b2n2048,
     (8, 2048, 2048): _module_b8n2048,
+    (1, 4096, 4096): _module_b1n4096,
+    (2, 4096, 4096): _module_b2n4096,
     (1, 8192, 8192): _module_b1n8192,
     (1, 16384, 16384): _module_b1n16384,
     (1, 32768, 32768): _module_b1n32768,
 }
 
-# cuSOLVER's batched POTRF is built for many small matrices and is
-# pathological at n=4096: the batched call costs 11.177 ms while the
-# single-matrix path factors the same n in 1.528 ms. Factoring each matrix
-# on its own keeps every call on the fast path.
-_PER_MATRIX_SHAPES = frozenset({(2, 4096, 4096)})
-
 
 def custom_kernel(data: input_t) -> output_t:
     if data.is_cuda and data.dtype == torch.float32 and data.is_contiguous():
-        shape = tuple(data.shape)
-        specialization = _SPECIALIZATIONS.get(shape)
+        specialization = _SPECIALIZATIONS.get(tuple(data.shape))
         if specialization is not None:
             return specialization().run(data)
-        if shape in _PER_MATRIX_SHAPES:
-            factor = torch.empty_like(data)
-            for index in range(data.shape[0]):
-                factor[index] = torch.linalg.cholesky_ex(
-                    data[index], check_errors=False).L
-            return factor
     return torch.linalg.cholesky_ex(data, check_errors=False).L
