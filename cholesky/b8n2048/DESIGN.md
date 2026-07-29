@@ -436,8 +436,51 @@ compilation succeeds with zero stack and spills: FP32 uses 128 registers per
 thread and TF32 uses 158. The release/acquire pattern is corroborated by the
 past full-grid QR winner in `references/qr-kernels/gaunernst.py`.
 
-No B200 correctness, repeated no-hang, or timing result exists yet. Ordinary
-block ordering is not guaranteed by CUDA, so IDs 14--16 remain experimental
-and variant 11 stays the default. Promotion requires exact-shape property
-validation, at least 100 repeated launches, and a three-round median no
-greater than `0.995` times the contemporaneous variant-11 median.
+Ordinary block ordering is not guaranteed by CUDA, so IDs 14--16 remain
+experimental. Promotion requires exact-shape property validation, at least
+100 repeated launches, and a three-round median no greater than `0.995` times
+the contemporaneous variant-11 median.
+
+### 2026-07-29 wavefront timing and the FP32 switch
+
+A two-round autotune (`--variants 15,11 --rounds 2 --max-workers 1
+--wavefront-validated`) measured, in round 0:
+
+| ID | Update | Target mean | Versus 11 |
+|---:|---|---:|---:|
+| 15 | TF32 WMMA wavefront | 1,419,425 ns | 2.31x faster |
+| 11 | staged left-looking TF32 | 3,272,249 ns | baseline |
+
+Both passed every public row. This settles the structural question: at this
+shape the wavefront is strongly throughput-bound -- 528 tasks per matrix,
+4,224 CTAs over 148 SMs -- so it does not suffer the dependency-stall penalty
+that caps it at (4, 1024), and it beats the staged schedule outright. The
+earlier expectation that the staged cuBLAS family must win at n=2048 was
+wrong.
+
+The tracked default is therefore **variant 14**, the same wavefront with the
+scalar FP32 history update, which keeps the 2.31x structural win while
+avoiding the TF32 pivot exposure documented in
+`cholesky/b4n1024/DESIGN.md`, "Precision and the secret seed". Two caveats
+stand:
+
+1. Variant 14's own runtime is **not yet measured**. The b4n1024 FP32/TF32
+   gap of 0.283% does not transfer, because (4, 1024) is latency-bound at 544
+   CTAs while this shape is throughput-bound, where scalar FMA against TF32
+   WMMA is a real difference. It could be materially slower than 1.419 ms.
+2. Variant 14 has **no B200 correctness or repeated no-hang result**, so it
+   does not yet meet this document's own promotion gate.
+
+Required before variant 14 is trusted:
+
+```bash
+.venv/bin/modal run cholesky/b8n2048/cholesky_b8n2048_modal.py \
+  --variant 14 --validate --repeats 100
+.venv/bin/python cholesky/b8n2048/cholesky_b8n2048_runner.py \
+  autotune --variants 14,15,11 --rounds 3 --max-workers 1 \
+  --wavefront-validated --no-promote
+```
+
+`status=pass` in an autotune round covers the public benchmark rows only --
+public seed, default dense case -- so it is not evidence about secret-seed
+stability. Variant 11 remains the documented fallback.

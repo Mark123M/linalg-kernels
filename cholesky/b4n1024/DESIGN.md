@@ -2,9 +2,11 @@
 
 ## Status
 
-The tracked default is variant 2, the task-major batch-interleaved TF32
-wavefront. Variants 1--3 add the experimental full-grid 64-square wavefront
-requested for this shape:
+The tracked default is variant 1, the task-major batch-interleaved **FP32**
+wavefront. Variant 2 was briefly the default and was reverted on 2026-07-29
+after it was implicated in secret-seed validation failures; see
+"Precision and the secret seed" below. Variants 1--3 add the experimental
+full-grid 64-square wavefront requested for this shape:
 
 | ID | Update | Grid order |
 |---:|---|---|
@@ -72,6 +74,34 @@ therefore advanced to the official performance comparison with a documented
 accuracy tradeoff. Their identical arithmetic provides a clean timing control
 for whether interleaving the four independent matrix DAGs hides
 dependency-wait latency.
+
+## Precision and the secret seed
+
+Variant 2 was reverted as the default on 2026-07-29. The table above is not
+evidence that TF32 is safe on the graded inputs, because
+`cholesky_b4n1024_modal.py` generates `factors @ factors.T / LOW_RANK` with
+`.diagonal().add_(4.0)`: a diagonally dominant Wishart matrix whose hardest
+case spans only `logspace(-0.35, 0.35)`, so kappa is roughly 10--100. Every
+benchmark row instead carries `cond=2`, a symmetric row/column dynamic-range
+control worth about 1e4 on the matrix, so kappa(A) >= 1e4.
+
+TF32's unit roundoff is `2^-11 = 4.9e-4`, which puts `u * kappa` near 5 --
+at or past the Cholesky backward-stability boundary. Past that boundary a
+trailing pivot can become non-positive on unlucky data, and the unguarded
+`__fsqrt_rn` in `factor64` then returns NaN, failing the checker on
+finiteness or positive-diagonal rather than on tolerance. FP32's `2^-24`
+keeps `u * kappa` near 6e-4, four orders of margin.
+
+`references/popcorn-eval/consts.py` documents that private/leaderboard
+evaluation re-runs the same shapes "on a secret seed", and `eval.py` combines
+that seed into every case's seed. Shapes and cases are unchanged, so only the
+data differs -- exactly the signature of a conditionally stable
+factorization: it passes on one seed and fails on another. Variant 1 costs
+0.283% (527,187 ns versus 525,692 ns) and is already validated over six
+property cases and 100 consecutive launches, so the tradeoff is not close.
+
+Reinstating variant 2 would require measuring its residual on genuine
+`cond=2` benchmark inputs, not on the harness's damped Wishart matrices.
 
 ## Direct Popcorn performance
 

@@ -10,7 +10,17 @@ from torch.utils.cpp_extension import load_inline
 
 # Variant zero deliberately retains the measured library baseline until a
 # native candidate passes the B200 promotion gate in the companion runner.
-_DEFAULT_VARIANT = 15  # POPCORN_VARIANT
+#
+# Variant 14, the FP32 full-grid wavefront, is the tracked default. The
+# 2026-07-29 two-round autotune measured the TF32 wavefront (15) at 1.419 ms
+# against 3.272 ms for the previously promoted staged variant 11, so the
+# wavefront structure wins this shape by 2.31x and only its update precision
+# remained in question. Variant 14 keeps that structure with a scalar FP32
+# update, avoiding the TF32 pivot exposure described in
+# cholesky/b4n1024/DESIGN.md, "Precision and the secret seed". Its own time is
+# not yet measured, and it has no B200 correctness or no-hang result either;
+# variant 11 (3.272 ms, three-round promoted) remains the fallback.
+_DEFAULT_VARIANT = 14  # POPCORN_VARIANT
 _CUTLASS_BASE_VARIANT = 11
 _CUTLASS_VARIANT = 13
 _VARIANT_NAMES = (

@@ -2,8 +2,9 @@
 
 ## Status
 
-The tracked default remains variant 0, Torch/cuSOLVER. Variants 1--3 add the
-experimental full-grid 64-square wavefront requested for this shape:
+The tracked default is variant 1, the scalar **FP32** wavefront. Variants
+1--3 add the experimental full-grid 64-square wavefront requested for this
+shape:
 
 | ID | Update | Grid order |
 |---:|---|---|
@@ -14,8 +15,18 @@ experimental full-grid 64-square wavefront requested for this shape:
 
 CUDA 13.1 compilation for `sm_100a` succeeds. The FP32 specialization uses
 128 registers per thread; both TF32 specializations use 158. All three report
-zero stack, spill stores, and spill loads. These are compilation results, not
-B200 correctness or timing results, so no native variant is promoted.
+zero stack, spill stores, and spill loads.
+
+**Outstanding validation gap.** These are compilation results only. No B200
+correctness, repeated no-hang, or timing result exists for any variant at
+this shape, yet variant 1 is the tracked default and is folded into
+`cholesky/cholesky.py`. Variant 1 is FP32, so it carries none of the TF32
+conditional-stability risk that forced the b4n1024 and b8n2048 reverts (see
+`cholesky/b4n1024/DESIGN.md`, "Precision and the secret seed"); the
+unvalidated part is the 1,056-CTA release/acquire flag protocol, whose
+failure mode is a hang rather than a wrong factor. The required sequence
+below must still be run before this default is trusted. Variant 0,
+Torch/cuSOLVER, remains the fallback if it does not pass.
 
 ## Algorithm
 

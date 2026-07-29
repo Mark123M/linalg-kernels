@@ -7,7 +7,16 @@ from task import input_t, output_t
 from torch.utils.cpp_extension import load_inline
 
 
-_DEFAULT_VARIANT = 2  # POPCORN_VARIANT
+# Variant 1 (FP32) is the tracked default rather than the 0.283%-faster TF32
+# variant 2. At cond=2 the benchmark inputs carry roughly 1e4 of symmetric
+# dynamic range, so TF32's 2^-11 unit roundoff puts u*kappa near 1 -- the
+# Cholesky backward-stability boundary, where a trailing pivot can turn
+# non-positive on unlucky data and __fsqrt_rn yields NaN. The measured TF32
+# residuals (289x cuSOLVER on dense, 453x on low-rank) were gathered on the
+# diagonally-dominant Wishart inputs this shape's Modal harness generates,
+# which are two to three orders of magnitude better conditioned than the
+# graded inputs, so they understate the risk. FP32 keeps u*kappa near 6e-4.
+_DEFAULT_VARIANT = 1  # POPCORN_VARIANT
 _VARIANT_NAMES = (
     "torch_baseline",
     "tilegrid64_fp32_interleaved",
